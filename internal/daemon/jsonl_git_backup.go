@@ -310,7 +310,7 @@ func (d *Daemon) exportTableToJsonl(table, query, dir, dataDir string) (int, err
 	}
 	// Always set cmd.Dir to prevent stray .doltcfg/ creation (GH#2537).
 	cmd.Dir = dataDir
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -417,7 +417,7 @@ func (d *Daemon) hasGitRemote(gitRepo, name string) bool {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "remote", "get-url", name)
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	return cmd.Run() == nil
 }
 
@@ -427,7 +427,7 @@ func (d *Daemon) currentGitBranch(gitRepo string) string {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "rev-parse", "--abbrev-ref", "HEAD")
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if err := cmd.Run(); err != nil {
@@ -442,7 +442,7 @@ func (d *Daemon) runGitCmd(dir string, timeout time.Duration, args ...string) er
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", dir}, args...)...)
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -466,7 +466,7 @@ func (d *Daemon) escalate(source, message string) {
 		fmt.Sprintf("%s: %s", source, message))
 	cmd.Dir = d.config.TownRoot
 	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon")
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		d.logger.Printf("jsonl_git_backup: escalation failed: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
@@ -542,7 +542,7 @@ func previousCommitLineCount(gitRepo, relPath string) (int, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "show", "HEAD:"+filepath.ToSlash(relPath))
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	// stderr intentionally not captured — "does not exist" is an expected case.

@@ -281,7 +281,7 @@ func (dm *dogMol) runBd(args ...string) (string, error) {
 
 	cmd := exec.CommandContext(ctx, bdPath, args...)
 	cmd.Dir = dm.townRoot
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

@@ -862,7 +862,7 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bd", "show", issueID, "--json") //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	cmd.Dir = bdWorkDir
 	output, err := cmd.Output()
 	if err != nil {
@@ -960,7 +960,7 @@ func (m *SessionManager) hookIssue(issueID, agentID, workDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), constants.BdCommandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bd", "update", issueID, "--status=hooked", "--assignee="+agentID) //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	cmd.Dir = bdWorkDir
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {

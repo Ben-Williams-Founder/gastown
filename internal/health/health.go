@@ -147,7 +147,7 @@ func JSONLGitFreshness(gitRepo string) (time.Time, error) {
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", "-C", gitRepo, "log", "-1", "--format=%ci")
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		return time.Time{}, err

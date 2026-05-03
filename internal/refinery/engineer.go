@@ -942,7 +942,7 @@ func (e *Engineer) runTests(ctx context.Context) ProcessResult {
 		// is intentional for flexibility (pipes, env vars, etc).
 		_, _ = fmt.Fprintf(e.output, "[Engineer] Executing test command: %s\n", e.config.TestCommand)
 		cmd := exec.CommandContext(ctx, "sh", "-c", e.config.TestCommand) //nolint:gosec // G204: TestCommand is from trusted rig config
-		util.SetDetachedProcessGroup(cmd)
+		util.SetProcessGroup(cmd)
 		cmd.Dir = e.workDir
 		var stdout, stderr bytes.Buffer
 		cmd.Stdout = &stdout
@@ -992,7 +992,7 @@ func (e *Engineer) runGate(ctx context.Context, name string, gate *GateConfig) G
 	}
 
 	cmd := exec.CommandContext(gateCtx, "sh", "-c", gate.Cmd) //nolint:gosec // G204: Gate commands are from trusted rig config
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	cmd.Dir = e.workDir
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout

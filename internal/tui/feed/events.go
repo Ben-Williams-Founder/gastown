@@ -36,7 +36,7 @@ func NewBdActivitySource(workDir string) (*BdActivitySource, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	cmd := exec.CommandContext(ctx, "bd", "activity", "--follow")
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	cmd.Dir = workDir
 
 	stdout, err := cmd.StdoutPipe()

@@ -207,7 +207,7 @@ func (d *Daemon) runScheduledMaintenance() {
 	cmd := exec.CommandContext(d.ctx, d.gtPath, "maintain", "--force",
 		"--threshold", strconv.Itoa(threshold))
 	cmd.Dir = d.config.TownRoot
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		d.logger.Printf("scheduled_maintenance: gt maintain failed: %v\nOutput: %s", err, string(output))

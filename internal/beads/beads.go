@@ -488,7 +488,7 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 	// causing prefix mismatches. Use explicit beadsDir if set, otherwise
 	// resolve from working directory.
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
 	cmd.Env = runEnv
@@ -512,7 +512,7 @@ func (b *Beads) run(args ...string) (_ []byte, retErr error) {
 		stdout.Reset()
 		stderr.Reset()
 		cmd = exec.CommandContext(ctx, "bd", retryArgs...) //nolint:gosec // G204: bd is a trusted internal tool
-		util.SetDetachedProcessGroup(cmd)
+		util.SetProcessGroup(cmd)
 		cmd.Dir = b.workDir
 		cmd.Env = runEnv
 		cmd.Env = append(cmd.Env, telemetry.OTELEnvForSubprocess()...)
@@ -554,7 +554,7 @@ func (b *Beads) runWithRouting(args ...string) (_ []byte, retErr error) { //noli
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "bd", fullArgs...) //nolint:gosec // G204: bd is a trusted internal tool
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	cmd.Dir = b.workDir
 
 	cmd.Env = runEnv

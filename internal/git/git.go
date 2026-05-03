@@ -129,7 +129,7 @@ func (g *Git) runWithTimeout(timeout time.Duration, args ...string) (_ string, _
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "git", args...)
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
 	}
@@ -173,7 +173,7 @@ func (g *Git) runWithEnvAndTimeout(args []string, extraEnv []string, timeout tim
 	if cancel != nil {
 		defer cancel()
 	}
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 
 	if g.workDir != "" {
 		cmd.Dir = g.workDir
@@ -2543,7 +2543,7 @@ func (g *Git) PushSubmoduleCommit(submodulePath, sha, remote string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", "-C", absPath, "push", remote, sha+":refs/heads/"+defaultBranch)
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {

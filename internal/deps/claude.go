@@ -45,7 +45,7 @@ func CheckClaudeCode() (ClaudeCodeStatus, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, "--version")
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return ClaudeCodeExecFailed, ""

@@ -47,7 +47,7 @@ func CheckBeads() (BeadsStatus, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bd", "version")
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 	output, err := cmd.Output()
 	if err != nil {
 		return BeadsUnknown, ""

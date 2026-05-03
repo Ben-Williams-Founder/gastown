@@ -222,7 +222,7 @@ func (d *Daemon) testRigMainBranch(rigName, rigPath string, timeout time.Duratio
 	// Fetch latest main
 	fetchCmd := exec.CommandContext(ctx, "git", "fetch", "origin", defaultBranch)
 	fetchCmd.Dir = bareRepoPath
-	util.SetDetachedProcessGroup(fetchCmd)
+	util.SetProcessGroup(fetchCmd)
 	if output, err := fetchCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git fetch failed: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
@@ -230,7 +230,7 @@ func (d *Daemon) testRigMainBranch(rigName, rigPath string, timeout time.Duratio
 	// Create temporary worktree at origin/<default_branch>
 	addCmd := exec.CommandContext(ctx, "git", "worktree", "add", "--detach", worktreePath, "origin/"+defaultBranch)
 	addCmd.Dir = bareRepoPath
-	util.SetDetachedProcessGroup(addCmd)
+	util.SetProcessGroup(addCmd)
 	if output, err := addCmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git worktree add failed: %v (%s)", err, strings.TrimSpace(string(output)))
 	}
@@ -273,7 +273,7 @@ func (d *Daemon) runCommandOnWorktree(ctx context.Context, rigName, workDir, lab
 	cmd := exec.CommandContext(ctx, "sh", "-c", command) //nolint:gosec // G204: command is from trusted rig config
 	cmd.Dir = workDir
 	cmd.Env = append(os.Environ(), "CI=true") // Signal test environment
-	util.SetDetachedProcessGroup(cmd)
+	util.SetProcessGroup(cmd)
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
