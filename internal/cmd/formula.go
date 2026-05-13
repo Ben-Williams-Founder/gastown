@@ -483,10 +483,11 @@ func executeConvoyFormula(f *formula.Formula, formulaName, targetRig string) err
 
 	createArgs := []string{
 		"create",
-		"--type=convoy",
+		"--type=task",
 		"--id=" + convoyID,
 		"--title=" + convoyTitle,
 		"--description=" + description,
+		"--labels=gt:convoy",
 	}
 	if beads.NeedsForceForID(convoyID) {
 		createArgs = append(createArgs, "--force")
@@ -775,10 +776,11 @@ func executeWorkflowFormula(f *formula.Formula, formulaName, targetRig string) e
 
 	createArgs := []string{
 		"create",
-		"--type=convoy", // reuse convoy type for workflow tracking
+		"--type=task",
 		"--id=" + workflowID,
 		"--title=" + workflowTitle,
 		"--description=" + description,
+		"--labels=gt:convoy,gt:workflow",
 	}
 	if beads.NeedsForceForID(workflowID) {
 		createArgs = append(createArgs, "--force")
