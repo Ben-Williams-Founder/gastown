@@ -58,7 +58,6 @@ func TestFreshInstallRigPolecatHookIntegration(t *testing.T) {
 	runFreshSetupCmd(t, hqPath, env, gtBinary, "rig", "add", rigName, repoURL, "--prefix", prefix, "--branch", "main")
 
 	rigPath := filepath.Join(hqPath, rigName)
-	rigWorktree := filepath.Join(rigPath, "mayor", "rig")
 	assertFreshSetupRoute(t, hqPath, "hq-", ".")
 	assertFreshSetupRoute(t, hqPath, "hq-cv-", ".")
 	assertFreshSetupRoutePathExists(t, hqPath, prefix+"-")
@@ -69,14 +68,14 @@ func TestFreshInstallRigPolecatHookIntegration(t *testing.T) {
 	polecatWorktree := filepath.Join(rigPath, "polecats", polecatName, rigName)
 	assertBeadsRedirectResolves(t, filepath.Join(polecatWorktree, ".beads"))
 
-	issue := createFreshSetupIssue(t, rigWorktree, env, "Fresh setup hook smoke")
+	issue := createFreshSetupIssue(t, rigPath, env, "Fresh setup hook smoke")
 	if !strings.HasPrefix(issue.ID, prefix+"-") {
 		t.Fatalf("created issue ID %q does not use rig prefix %q", issue.ID, prefix+"-")
 	}
 
 	agentID := rigName + "/polecats/" + polecatName
-	runFreshSetupCmd(t, rigWorktree, env, "bd", "update", issue.ID, "--status=hooked", "--assignee="+agentID)
-	shown := showFreshSetupIssue(t, rigWorktree, env, issue.ID)
+	runFreshSetupCmd(t, rigPath, env, "bd", "update", issue.ID, "--status=hooked", "--assignee="+agentID)
+	shown := showFreshSetupIssue(t, rigPath, env, issue.ID)
 	if shown.Status != beads.StatusHooked || shown.Assignee != agentID {
 		t.Fatalf("issue hook state = status %q assignee %q, want status %q assignee %q",
 			shown.Status, shown.Assignee, beads.StatusHooked, agentID)
