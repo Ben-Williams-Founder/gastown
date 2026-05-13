@@ -65,6 +65,36 @@ var fetcherGetSessionEnv = func(sessionName, key string) (string, error) {
 func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Buffer, error) {
 	// bd v0.59+ requires --flat for list --json to produce JSON output
 	args = beads.InjectFlatForListJSON(args)
+	key := bdCmdCacheKey(beadsDir, args)
+
+	f.bdCacheMu.Lock()
+	if out, ok := f.cachedBdOutputLocked(key, time.Now()); ok {
+		f.bdCacheMu.Unlock()
+		return bytes.NewBuffer(out), nil
+	}
+	if f.bdInflight == nil {
+		f.bdInflight = make(map[string]*bdCmdInflight)
+	}
+	if call, ok := f.bdInflight[key]; ok {
+		f.bdCacheMu.Unlock()
+		<-call.done
+		if call.err != nil {
+			return nil, call.err
+		}
+		return bytes.NewBuffer(copyBytes(call.stdout)), nil
+	}
+	call := &bdCmdInflight{done: make(chan struct{})}
+	f.bdInflight[key] = call
+	f.bdCacheMu.Unlock()
+
+	stdout, err := f.runBdCmdUncached(beadsDir, args...)
+	f.finishBdCmd(key, call, stdout, err)
+	return stdout, err
+}
+
+func (f *LiveConvoyFetcher) runBdCmdUncached(beadsDir string, args ...string) (*bytes.Buffer, error) {
+	release := f.acquireBdSlot()
+	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), f.cmdTimeout)
 	defer cancel()
@@ -90,6 +120,91 @@ func (f *LiveConvoyFetcher) runBdCmd(beadsDir string, args ...string) (*bytes.Bu
 		return nil, err
 	}
 	return &stdout, nil
+}
+
+type bdCmdCacheEntry struct {
+	stdout    []byte
+	expiresAt time.Time
+}
+
+type bdCmdInflight struct {
+	done   chan struct{}
+	stdout []byte
+	err    error
+}
+
+const (
+	// Dashboard fetches run many panels concurrently; cap live bd processes so a
+	// browser refresh cannot overwhelm Dolt with connection churn. See GH#2618.
+	defaultBdMaxConcurrent = 4
+	defaultBdCacheTTL      = 5 * time.Second
+)
+
+func bdCmdCacheKey(beadsDir string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, beadsDir)
+	parts = append(parts, args...)
+	return strings.Join(parts, "\x00")
+}
+
+func (f *LiveConvoyFetcher) cachedBdOutputLocked(key string, now time.Time) ([]byte, bool) {
+	if f.bdCacheTTL <= 0 || f.bdCache == nil {
+		return nil, false
+	}
+	entry, ok := f.bdCache[key]
+	if !ok {
+		return nil, false
+	}
+	if now.After(entry.expiresAt) {
+		delete(f.bdCache, key)
+		return nil, false
+	}
+	return copyBytes(entry.stdout), true
+}
+
+func (f *LiveConvoyFetcher) finishBdCmd(key string, call *bdCmdInflight, stdout *bytes.Buffer, err error) {
+	var out []byte
+	if stdout != nil {
+		out = copyBytes(stdout.Bytes())
+	}
+
+	f.bdCacheMu.Lock()
+	if err == nil && stdout != nil && f.bdCacheTTL > 0 {
+		if f.bdCache == nil {
+			f.bdCache = make(map[string]bdCmdCacheEntry)
+		}
+		now := time.Now()
+		for k, entry := range f.bdCache {
+			if now.After(entry.expiresAt) {
+				delete(f.bdCache, k)
+			}
+		}
+		f.bdCache[key] = bdCmdCacheEntry{stdout: out, expiresAt: now.Add(f.bdCacheTTL)}
+	}
+	if current := f.bdInflight[key]; current == call {
+		call.stdout = out
+		call.err = err
+		close(call.done)
+		delete(f.bdInflight, key)
+	}
+	f.bdCacheMu.Unlock()
+}
+
+func (f *LiveConvoyFetcher) acquireBdSlot() func() {
+	if f.bdConcurrency == nil || cap(f.bdConcurrency) == 0 {
+		return func() {}
+	}
+	f.bdConcurrency <- struct{}{}
+	return func() { <-f.bdConcurrency }
+}
+
+func copyBytes(in []byte) []byte {
+	if in == nil {
+		return nil
+	}
+	out := make([]byte, len(in))
+	copy(out, in)
+	return out
 }
 
 // fetchCircuitBreaker tracks consecutive failures for a fetch operation
@@ -144,6 +259,14 @@ type LiveConvoyFetcher struct {
 
 	// bdBin is the bd binary name or path. Defaults to "bd" if empty.
 	bdBin string
+
+	// bd command coalescing/cache prevents dashboard refreshes from spawning
+	// duplicate bd subprocesses and caps total concurrent bd work.
+	bdCacheMu     sync.Mutex
+	bdCache       map[string]bdCmdCacheEntry
+	bdInflight    map[string]*bdCmdInflight
+	bdCacheTTL    time.Duration
+	bdConcurrency chan struct{}
 
 	// registry is a prefix registry built from the town's rigs.json.
 	// Used for parsing tmux session names instead of relying on the
@@ -210,6 +333,8 @@ func NewLiveConvoyFetcher() (*LiveConvoyFetcher, error) {
 		cmdTimeout:              config.ParseDurationOrDefault(webCfg.CmdTimeout, 15*time.Second),
 		ghCmdTimeout:            config.ParseDurationOrDefault(webCfg.GhCmdTimeout, 10*time.Second),
 		tmuxCmdTimeout:          config.ParseDurationOrDefault(webCfg.TmuxCmdTimeout, 2*time.Second),
+		bdCacheTTL:              defaultBdCacheTTL,
+		bdConcurrency:           make(chan struct{}, defaultBdMaxConcurrent),
 		staleThreshold:          config.ParseDurationOrDefault(workerCfg.StaleThreshold, 5*time.Minute),
 		stuckThreshold:          config.ParseDurationOrDefault(workerCfg.StuckThreshold, constants.GUPPViolationTimeout),
 		heartbeatFreshThreshold: config.ParseDurationOrDefault(workerCfg.HeartbeatFreshThreshold, 5*time.Minute),

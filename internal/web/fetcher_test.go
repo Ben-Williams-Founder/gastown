@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -573,6 +574,115 @@ esac
 			t.Fatalf("expected timeout error, got: %v", err)
 		}
 	})
+}
+
+func TestRunBdCmd_CachesSuccessfulOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	counterPath := filepath.Join(t.TempDir(), "count")
+	script := fmt.Sprintf(`#!/bin/sh
+printf x >> %q
+printf 'cached output'
+`, counterPath)
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+
+	f := &LiveConvoyFetcher{
+		cmdTimeout: 30 * time.Second,
+		bdBin:      bdPath,
+		bdCacheTTL: time.Minute,
+	}
+	beadsDir := t.TempDir()
+
+	first, err := f.runBdCmd(beadsDir, "list", "--json")
+	if err != nil {
+		t.Fatalf("first runBdCmd: %v", err)
+	}
+	if _, err := first.ReadByte(); err != nil {
+		t.Fatalf("consume first buffer byte: %v", err)
+	}
+
+	second, err := f.runBdCmd(beadsDir, "list", "--json")
+	if err != nil {
+		t.Fatalf("second runBdCmd: %v", err)
+	}
+	if got := second.String(); got != "cached output" {
+		t.Fatalf("cached output = %q, want %q", got, "cached output")
+	}
+
+	count, err := os.ReadFile(counterPath)
+	if err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	if got := len(count); got != 1 {
+		t.Fatalf("bd executions = %d, want 1", got)
+	}
+}
+
+func TestRunBdCmd_CoalescesConcurrentDuplicateCalls(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-based command test")
+	}
+
+	binDir := t.TempDir()
+	bdPath := filepath.Join(binDir, "bd")
+	counterPath := filepath.Join(t.TempDir(), "count")
+	script := fmt.Sprintf(`#!/bin/sh
+printf x >> %q
+sleep 0.2
+printf 'coalesced output'
+`, counterPath)
+	if err := os.WriteFile(bdPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+
+	f := &LiveConvoyFetcher{
+		cmdTimeout: 30 * time.Second,
+		bdBin:      bdPath,
+		bdCacheTTL: time.Minute,
+	}
+	beadsDir := t.TempDir()
+
+	const callers = 8
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	var wg sync.WaitGroup
+	wg.Add(callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			stdout, err := f.runBdCmd(beadsDir, "list", "--json")
+			if err != nil {
+				errs <- err
+				return
+			}
+			if got := stdout.String(); got != "coalesced output" {
+				errs <- fmt.Errorf("output = %q, want coalesced output", got)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	count, err := os.ReadFile(counterPath)
+	if err != nil {
+		t.Fatalf("read counter: %v", err)
+	}
+	if got := len(count); got != 1 {
+		t.Fatalf("bd executions = %d, want 1", got)
+	}
 }
 
 func withMayorFetcherHooks(t *testing.T, sessionEnv func(sessionName, key string) (string, error), runCmdFunc func(time.Duration, string, ...string) (*bytes.Buffer, error)) {
