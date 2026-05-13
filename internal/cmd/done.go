@@ -1085,6 +1085,22 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 
+		var githubPR string
+		settingsPath := filepath.Join(townRoot, rigName, "settings", "config.json")
+		if settings, settingsErr := config.LoadRigSettings(settingsPath); settingsErr == nil && doneNeedsGitHubPR(settings) {
+			githubPR, err = ensureGitHubPRForDone(context.Background(), cwd, g, branch, target, issueID, worker, sourceIssueForNoMerge)
+			if err != nil {
+				mrFailed = true
+				errMsg := fmt.Sprintf("GitHub PR creation failed: %v", err)
+				doneErrors = append(doneErrors, errMsg)
+				style.PrintWarning("%s\nBranch is pushed but GitHub PR is not ready. Witness will be notified.", errMsg)
+				goto notifyWitness
+			}
+			if githubPR != "" {
+				fmt.Printf("%s GitHub PR ready: %s\n", style.Bold.Render("✓"), githubPR)
+			}
+		}
+
 		// Get source issue for priority inheritance
 		var priority int
 		if donePriority >= 0 {
@@ -1149,6 +1165,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			title := fmt.Sprintf("Merge: %s", issueID)
 			description := fmt.Sprintf("branch: %s\ntarget: %s\nsource_issue: %s\nrig: %s",
 				branch, target, issueID, rigName)
+			if githubPR != "" {
+				description += fmt.Sprintf("\ngithub_pr: %s", githubPR)
+			}
 			if commitSHA != "" {
 				description += fmt.Sprintf("\ncommit_sha: %s", commitSHA)
 			}
@@ -1463,6 +1482,106 @@ func pushSubmoduleChanges(g *git.Git, defaultBranch string) {
 			fmt.Printf("%s Submodule %s pushed\n", style.Bold.Render("✓"), sc.Path)
 		}
 	}
+}
+
+var runDoneGH = func(ctx context.Context, cwd string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", args...)
+	cmd.Dir = cwd
+	out, err := cmd.CombinedOutput()
+	trimmed := strings.TrimSpace(string(out))
+	if err != nil {
+		if trimmed != "" {
+			return "", fmt.Errorf("gh %s failed: %s: %w", strings.Join(args, " "), trimmed, err)
+		}
+		return "", fmt.Errorf("gh %s failed: %w", strings.Join(args, " "), err)
+	}
+	return trimmed, nil
+}
+
+func doneNeedsGitHubPR(settings *config.RigSettings) bool {
+	if settings == nil || settings.MergeQueue == nil || settings.MergeQueue.MergeStrategy != "pr" {
+		return false
+	}
+	provider := settings.MergeQueue.VCSProvider
+	return provider == "" || provider == "github"
+}
+
+func ensureGitHubPRForDone(ctx context.Context, cwd string, g *git.Git, branch, target, issueID, worker string, sourceIssue *beads.Issue) (string, error) {
+	prNumber, err := g.FindPRNumber(branch)
+	if err != nil {
+		return "", fmt.Errorf("checking existing GitHub PR for %s: %w", branch, err)
+	}
+	if prNumber != 0 {
+		return githubPRURL(ctx, cwd, prNumber)
+	}
+
+	diffStat := ""
+	if stat, diffErr := g.DiffStat("origin/" + target + "...HEAD"); diffErr == nil {
+		diffStat = stat
+	}
+	body := buildDonePRBody(sourceIssue, issueID, worker, diffStat)
+	out, err := runDoneGH(ctx, cwd,
+		"pr", "create",
+		"--base", target,
+		"--head", branch,
+		"--title", donePRTitle(sourceIssue, issueID),
+		"--body", body,
+	)
+	if err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+func githubPRURL(ctx context.Context, cwd string, prNumber int) (string, error) {
+	out, err := runDoneGH(ctx, cwd, "pr", "view", strconv.Itoa(prNumber), "--json", "url", "--jq", ".url")
+	if err != nil {
+		return fmt.Sprintf("#%d", prNumber), nil
+	}
+	if out == "" {
+		return fmt.Sprintf("#%d", prNumber), nil
+	}
+	return out, nil
+}
+
+func donePRTitle(sourceIssue *beads.Issue, issueID string) string {
+	if sourceIssue != nil && strings.TrimSpace(sourceIssue.Title) != "" {
+		if issueID != "" {
+			return fmt.Sprintf("%s (%s)", sourceIssue.Title, issueID)
+		}
+		return sourceIssue.Title
+	}
+	if issueID != "" {
+		return issueID
+	}
+	return "Polecat work"
+}
+
+func buildDonePRBody(sourceIssue *beads.Issue, issueID, worker, diffStat string) string {
+	var body strings.Builder
+	body.WriteString("## Summary\n\n")
+	if sourceIssue != nil && sourceIssue.Description != "" {
+		var cleanDesc []string
+		for _, line := range strings.Split(sourceIssue.Description, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "attached_") || strings.HasPrefix(trimmed, "dispatched_by:") || strings.HasPrefix(trimmed, "formula_vars:") {
+				continue
+			}
+			cleanDesc = append(cleanDesc, line)
+		}
+		if desc := strings.TrimSpace(strings.Join(cleanDesc, "\n")); desc != "" {
+			body.WriteString(desc)
+			body.WriteString("\n\n")
+		}
+	}
+	if strings.TrimSpace(diffStat) != "" {
+		body.WriteString("## Changes\n\n```\n")
+		body.WriteString(diffStat)
+		body.WriteString("```\n\n")
+	}
+	body.WriteString("---\n")
+	body.WriteString(fmt.Sprintf("*Polecat: %s | Issue: %s*\n", worker, issueID))
+	return body.String()
 }
 
 func noteVerifiedPushFailure(cwd, issueID, branch, commit string, verifyErr error) {
