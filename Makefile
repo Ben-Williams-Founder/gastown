@@ -1,4 +1,4 @@
-.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag check-install-path clean test test-e2e-container check-up-to-date
+.PHONY: build desktop-build desktop-run install safe-install check-forward-only check-version-tag check-install-path clean test test-makefile test-e2e-container check-up-to-date
 
 BINARY := gt
 BINARY_DESKTOP := gt-desktop
@@ -179,8 +179,11 @@ check-version-tag:
 clean:
 	rm -f $(BUILD_DIR)/$(BINARY)
 
-test:
+test: test-makefile
 	go test ./...
+
+test-makefile:
+	bash scripts/check-install-path_test.sh
 
 # Run e2e tests in isolated container (the only supported way to run them)
 test-e2e-container:
