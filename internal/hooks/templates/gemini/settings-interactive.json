@@ -1,7 +1,4 @@
 {
-  "context": {
-    "fileName": "AGENTS.md"
-  },
   "hooks": {
     "BeforeTool": [
       {

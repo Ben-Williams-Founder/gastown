@@ -67,13 +67,7 @@ func ensureGeminiContextFile(workDir string) error {
 		return nil
 	}
 
-	if _, err := os.Stat(filepath.Join(workDir, "AGENTS.md")); err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return fmt.Errorf("checking AGENTS.md: %w", err)
-	}
-
+	agentsPath := filepath.Join(workDir, "AGENTS.md")
 	geminiPath := filepath.Join(workDir, "GEMINI.md")
 	info, err := os.Lstat(geminiPath)
 	if err == nil {
@@ -88,22 +82,37 @@ func ensureGeminiContextFile(workDir string) error {
 		if target == "AGENTS.md" {
 			return nil
 		}
-		if _, err := os.Stat(geminiPath); err == nil {
+		if !pointsToAgentsMD(target) {
 			return nil
-		} else if !os.IsNotExist(err) {
-			return fmt.Errorf("checking GEMINI.md symlink target: %w", err)
+		}
+		if _, err := os.Stat(agentsPath); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return fmt.Errorf("checking AGENTS.md: %w", err)
 		}
 		if err := os.Remove(geminiPath); err != nil {
-			return fmt.Errorf("removing broken GEMINI.md symlink: %w", err)
+			return fmt.Errorf("removing non-canonical GEMINI.md symlink: %w", err)
 		}
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("checking GEMINI.md: %w", err)
+	}
+
+	if _, err := os.Stat(agentsPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("checking AGENTS.md: %w", err)
 	}
 
 	if err := os.Symlink("AGENTS.md", geminiPath); err != nil {
 		return fmt.Errorf("creating GEMINI.md symlink: %w", err)
 	}
 	return nil
+}
+
+func pointsToAgentsMD(target string) bool {
+	return filepath.Base(filepath.Clean(target)) == "AGENTS.md"
 }
 
 type startupPromptSession interface {
