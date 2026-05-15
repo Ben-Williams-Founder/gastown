@@ -342,16 +342,3 @@ func runSlingFormula(ctx context.Context, args []string) error {
 
 	return nil
 }
-
-func cleanupStandaloneWispAfterHookFailure(wispRootID, hookDir string) {
-	if wispRootID == "" || hookDir == "" {
-		return
-	}
-	bd := beads.New(hookDir)
-	if _, err := forceCloseDescendants(bd, wispRootID); err != nil {
-		fmt.Printf("%s Could not close formula wisp descendants %s after hook failure: %v\n", style.Dim.Render("Warning:"), wispRootID, err)
-	}
-	if err := bd.ForceCloseWithReason("sling rollback: hook failed", wispRootID); err != nil {
-		fmt.Printf("%s Could not close formula wisp %s after hook failure: %v\n", style.Dim.Render("Warning:"), wispRootID, err)
-	}
-}
