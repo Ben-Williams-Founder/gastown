@@ -12,6 +12,8 @@ type CommandMeta struct {
 	Safe bool
 	// Confirm commands require user confirmation before execution
 	Confirm bool
+	// Hidden commands can run from direct API requests but are omitted from the command palette
+	Hidden bool
 	// Desc is a short description shown in the command palette
 	Desc string
 	// Category groups commands in the palette UI
@@ -81,7 +83,8 @@ var AllowedCommands = map[string]CommandMeta{
 	"deacon start":   {Confirm: true, Desc: "Start deacon", Category: "Agents"},
 
 	// Polecat actions
-	"polecat identity add": {Confirm: true, Desc: "Create polecat identity", Category: "Polecats", Args: "<rig> [name]", ArgType: "rigs"},
+	"polecat add":          {Confirm: true, Hidden: true, Desc: "Add polecat", Category: "Polecats", Args: "<rig> <name>", ArgType: "rigs"},
+	"polecat identity add": {Confirm: true, Desc: "Create polecat identity", Category: "Polecats", Args: "<rig> <name>", ArgType: "rigs"},
 	"polecat remove":       {Confirm: true, Desc: "Remove polecat", Category: "Polecats", Args: "<rig>/<name>", ArgType: "polecats"},
 
 	// Work assignment
@@ -190,6 +193,9 @@ func SanitizeArgs(args []string) []string {
 func GetCommandList() []CommandInfo {
 	commands := make([]CommandInfo, 0, len(AllowedCommands))
 	for name, meta := range AllowedCommands {
+		if meta.Hidden {
+			continue
+		}
 		commands = append(commands, CommandInfo{
 			Name:     name,
 			Desc:     meta.Desc,
