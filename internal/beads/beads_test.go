@@ -3165,10 +3165,71 @@ func TestNewIsolatedWithPort(t *testing.T) {
 }
 
 func TestInitPassesServerFlag(t *testing.T) {
-	b := NewIsolatedWithPort(t.TempDir(), 19999)
-	err := b.Init("covertest")
-	if err == nil {
-		t.Fatal("expected error (no bd/dolt server), got nil")
+	if runtime.GOOS == "windows" {
+		t.Skip("uses Unix shell script bd stub")
+	}
+
+	bdAllowStaleMu.Lock()
+	prevPath := bdAllowStalePath
+	prevResult := bdAllowStaleResult
+	bdAllowStaleMu.Unlock()
+	ResetBdAllowStaleCacheForTest()
+	t.Cleanup(func() {
+		bdAllowStaleMu.Lock()
+		bdAllowStalePath = prevPath
+		bdAllowStaleResult = prevResult
+		bdAllowStaleMu.Unlock()
+	})
+
+	stubDir := t.TempDir()
+	logPath := filepath.Join(stubDir, "bd.log")
+	stubPath := filepath.Join(stubDir, "bd")
+	script := `#!/bin/sh
+if [ "$1" = "--allow-stale" ]; then
+  echo "Error: unknown flag: --allow-stale" >&2
+  exit 0
+fi
+if [ "$1" != "init" ]; then
+  echo "unexpected args=$*" > "$MOCK_BD_LOG"
+  exit 2
+fi
+{
+  printf 'args=%s\n' "$*"
+  printf 'BEADS_DIR=%s\n' "$BEADS_DIR"
+  printf 'GT_DOLT_PORT=%s\n' "$GT_DOLT_PORT"
+  printf 'BEADS_DOLT_PORT=%s\n' "$BEADS_DOLT_PORT"
+  printf 'BEADS_DOLT_AUTO_START=%s\n' "$BEADS_DOLT_AUTO_START"
+} > "$MOCK_BD_LOG"
+exit 0
+`
+	if err := os.WriteFile(stubPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("write bd stub: %v", err)
+	}
+	t.Setenv("PATH", stubDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("MOCK_BD_LOG", logPath)
+
+	workDir := t.TempDir()
+	b := NewIsolatedWithPort(workDir, 19999)
+	if err := b.Init("covertest"); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	log := string(data)
+	checks := []string{
+		"args=init --prefix covertest --quiet --server --server-port 19999",
+		"BEADS_DIR=" + filepath.Join(workDir, ".beads"),
+		"GT_DOLT_PORT=19999",
+		"BEADS_DOLT_PORT=19999",
+		"BEADS_DOLT_AUTO_START=0",
+	}
+	for _, check := range checks {
+		if !strings.Contains(log, check) {
+			t.Fatalf("bd init stub log missing %q:\n%s", check, log)
+		}
 	}
 }
 

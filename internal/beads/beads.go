@@ -724,6 +724,7 @@ func (b *Beads) buildRunEnv() []string {
 		if b.serverPort > 0 {
 			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
 			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
+			env = append(env, "BEADS_DOLT_AUTO_START=0")
 		}
 		return env
 	}
@@ -741,6 +742,7 @@ func (b *Beads) buildRoutingEnv() []string {
 		if b.serverPort > 0 {
 			env = append(env, fmt.Sprintf("GT_DOLT_PORT=%d", b.serverPort))
 			env = append(env, fmt.Sprintf("BEADS_DOLT_PORT=%d", b.serverPort))
+			env = append(env, "BEADS_DOLT_AUTO_START=0")
 		}
 		return env
 	}
