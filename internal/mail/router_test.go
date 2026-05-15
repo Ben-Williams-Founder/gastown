@@ -1822,7 +1822,7 @@ func TestEnqueueReplyReminder_Basic(t *testing.T) {
 		From:    "gastown/witness",
 		To:      "gastown/crew/alice",
 		Subject: "status check",
-		Type:    TypeNotification,
+		Type:    TypeTask,
 	}
 	sessionID := "gt-gastown-crew-alice"
 
@@ -1937,6 +1937,26 @@ func TestEnqueueReplyReminder_SkipsReply(t *testing.T) {
 	pending, _ := nudge.Pending(townRoot, "gt-gastown-crew-alice")
 	if pending != 0 {
 		t.Errorf("TypeReply should not enqueue a reminder, got %d", pending)
+	}
+}
+
+// TestEnqueueReplyReminder_SkipsNotification verifies informational mail does
+// not create reply pressure. Convoy completion mail is TypeNotification by
+// default and should not require Mayor acknowledgements.
+func TestEnqueueReplyReminder_SkipsNotification(t *testing.T) {
+	townRoot := t.TempDir()
+	r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+	msg := &Message{
+		From:    "gastown/refinery",
+		To:      "mayor/",
+		Subject: "Convoy landed: hq-cv-123",
+		Type:    TypeNotification,
+	}
+	r.enqueueReplyReminder(msg, "gt-mayor")
+
+	pending, _ := nudge.Pending(townRoot, "gt-mayor")
+	if pending != 0 {
+		t.Errorf("TypeNotification should not enqueue a reminder, got %d", pending)
 	}
 }
 

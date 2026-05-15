@@ -1588,9 +1588,10 @@ func (r *Router) GetMailbox(address string) (*Mailbox, error) {
 //     the next turn boundary.
 //  3. For the overseer (human operator), always use a visible banner.
 //
-// After a successful notification, a deferred reply-reminder nudge is also
-// enqueued (after a configurable delay, default 30s) to prompt the recipient
-// to reply via gt mail send rather than in chat.
+// After a successful actionable notification, a deferred reply-reminder nudge
+// is also enqueued (after a configurable delay, default 30s) to prompt the
+// recipient to reply via gt mail send rather than in chat. Informational
+// notifications are delivered without reply pressure.
 //
 // Supports mayor/, deacon/, rig/crew/name, rig/polecats/name, and rig/name addresses.
 // Respects agent DND/muted state - skips notification if recipient has DND enabled.
@@ -1732,13 +1733,14 @@ func prioritySeverityLabel(priority Priority) string {
 // Skipped when:
 //   - No town root (can't use nudge queue)
 //   - Message type is TypeReply (recipient is already replying)
+//   - Message type is TypeNotification (informational FYI, no reply required)
 //   - Configured delay is zero or negative (feature disabled)
 func (r *Router) enqueueReplyReminder(msg *Message, sessionID string) {
 	if r.townRoot == "" {
 		return
 	}
-	if msg.Type == TypeReply {
-		return // Already a reply — reminder would be redundant
+	if msg.Type == TypeReply || msg.Type == TypeNotification {
+		return
 	}
 	delay := config.LoadOperationalConfig(r.townRoot).GetMailConfig().ReplyReminderDelayD()
 	if delay <= 0 {
