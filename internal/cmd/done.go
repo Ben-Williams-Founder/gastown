@@ -981,7 +981,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					ghCmd.Dir = cwd
 					prOutput, prErr := ghCmd.Output()
 					if prErr != nil {
-						style.PrintWarning("could not create GitHub PR: %v", prErr)
+						return fmt.Errorf("creating GitHub PR for no-merge work: %w", prErr)
 					} else {
 						prURL = strings.TrimSpace(string(prOutput))
 						fmt.Printf("%s GitHub PR created: %s\n", style.Bold.Render("✓"), prURL)
