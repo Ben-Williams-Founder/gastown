@@ -18,11 +18,12 @@ import (
 
 func TestValidateCommand(t *testing.T) {
 	tests := []struct {
-		name      string
-		command   string
-		wantErr   bool
-		wantSafe  bool
-		errSubstr string
+		name        string
+		command     string
+		wantErr     bool
+		wantSafe    bool
+		wantConfirm bool
+		errSubstr   string
 	}{
 		// Allowed safe commands
 		{
@@ -52,22 +53,32 @@ func TestValidateCommand(t *testing.T) {
 
 		// Allowed but requires confirmation
 		{
-			name:     "mail send",
-			command:  "mail send foo bar",
-			wantErr:  false,
-			wantSafe: false,
+			name:        "mail send",
+			command:     "mail send foo bar",
+			wantErr:     false,
+			wantSafe:    false,
+			wantConfirm: true,
 		},
 		{
-			name:     "convoy create",
-			command:  "convoy create myconvoy",
-			wantErr:  false,
-			wantSafe: false,
+			name:        "convoy create",
+			command:     "convoy create myconvoy",
+			wantErr:     false,
+			wantSafe:    false,
+			wantConfirm: true,
 		},
 		{
-			name:     "polecat identity add",
-			command:  "polecat identity add gastown Toast",
-			wantErr:  false,
-			wantSafe: false,
+			name:        "polecat identity add",
+			command:     "polecat identity add gastown Toast",
+			wantErr:     false,
+			wantSafe:    false,
+			wantConfirm: true,
+		},
+		{
+			name:        "hidden deprecated polecat add",
+			command:     "polecat add gastown Toast",
+			wantErr:     false,
+			wantSafe:    false,
+			wantConfirm: true,
 		},
 
 		// Blocked patterns
@@ -104,12 +115,6 @@ func TestValidateCommand(t *testing.T) {
 			errSubstr: "not in whitelist",
 		},
 		{
-			name:      "deprecated polecat add",
-			command:   "polecat add gastown Toast",
-			wantErr:   true,
-			errSubstr: "not in whitelist",
-		},
-		{
 			name:      "empty command",
 			command:   "",
 			wantErr:   true,
@@ -142,6 +147,9 @@ func TestValidateCommand(t *testing.T) {
 			}
 			if meta.Safe != tt.wantSafe {
 				t.Errorf("ValidateCommand(%q) Safe = %v, want %v", tt.command, meta.Safe, tt.wantSafe)
+			}
+			if meta.Confirm != tt.wantConfirm {
+				t.Errorf("ValidateCommand(%q) Confirm = %v, want %v", tt.command, meta.Confirm, tt.wantConfirm)
 			}
 		})
 	}
@@ -284,6 +292,7 @@ func TestAPIHandler_Commands(t *testing.T) {
 	// Verify some expected commands are present
 	foundStatus := false
 	foundMailSend := false
+	foundPolecatIdentityAdd := false
 	for _, cmd := range resp.Commands {
 		if cmd.Name == "status" {
 			foundStatus = true
@@ -297,12 +306,24 @@ func TestAPIHandler_Commands(t *testing.T) {
 				t.Error("mail send should require confirmation")
 			}
 		}
+		if cmd.Name == "polecat add" {
+			t.Error("Deprecated polecat add should be hidden from command list")
+		}
+		if cmd.Name == "polecat identity add" {
+			foundPolecatIdentityAdd = true
+			if !cmd.Confirm {
+				t.Error("polecat identity add should require confirmation")
+			}
+		}
 	}
 	if !foundStatus {
 		t.Error("Expected 'status' in command list")
 	}
 	if !foundMailSend {
 		t.Error("Expected 'mail send' in command list")
+	}
+	if !foundPolecatIdentityAdd {
+		t.Error("Expected 'polecat identity add' in command list")
 	}
 }
 

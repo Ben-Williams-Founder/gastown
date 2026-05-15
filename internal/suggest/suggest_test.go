@@ -117,4 +117,7 @@ func TestFormatSuggestion(t *testing.T) {
 	if !strings.Contains(msg, "Create with:") {
 		t.Errorf("FormatSuggestion missing hint")
 	}
+	if !strings.Contains(msg, "gt polecat identity add") {
+		t.Errorf("FormatSuggestion missing identity add hint")
+	}
 }
