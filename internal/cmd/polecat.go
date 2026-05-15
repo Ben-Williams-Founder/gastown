@@ -1352,7 +1352,7 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 			fmt.Printf("  - Kill session: gt-%s-%s\n", p.rigName, p.polecatName)
 			fmt.Printf("  - Delete worktree: %s/polecats/%s\n", p.r.Path, p.polecatName)
 			fmt.Printf("  - Delete branch (if exists)\n")
-			fmt.Printf("  - Close agent bead: %s\n", polecatBeadIDForRig(p.r, p.rigName, p.polecatName))
+			fmt.Printf("  - Reset agent bead: %s\n", polecatBeadIDForRig(p.r, p.rigName, p.polecatName))
 
 			displayDryRunSafetyCheck(p)
 			fmt.Println()
@@ -1487,6 +1487,7 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	if err := mgr.RemoveWithOptions(polecatName, true, true, false); err != nil {
 		if errors.Is(err, polecat.ErrPolecatNotFound) {
 			fmt.Printf("  %s worktree already gone\n", style.Dim.Render("○"))
+			resetPolecatAgentBeadForReuse(r, rigName, polecatName)
 		} else {
 			return fmt.Errorf("worktree removal failed: %w", err)
 		}
@@ -1518,6 +1519,16 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	}
 
 	return nil
+}
+
+func resetPolecatAgentBeadForReuse(r *rig.Rig, rigName, polecatName string) {
+	agentBeadID := polecatBeadIDForRig(r, rigName, polecatName)
+	bd := beads.New(r.Path)
+	if err := bd.ForAgentBead().ResetAgentBeadForReuse(agentBeadID, "nuked"); err != nil {
+		fmt.Printf("  %s agent bead not found or already cleaned\n", style.Dim.Render("○"))
+	} else {
+		fmt.Printf("  %s reset agent bead %s\n", style.Success.Render("✓"), agentBeadID)
+	}
 }
 
 // nukeCleanupMolecules burns any molecule attached to a work bead during polecat nuke.
