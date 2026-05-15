@@ -3164,6 +3164,53 @@ func TestNewIsolatedWithPort(t *testing.T) {
 	}
 }
 
+func TestIsolatedWithPortOverridesInheritedDoltEnv(t *testing.T) {
+	t.Setenv("GT_DOLT_PORT", "3307")
+	t.Setenv("BEADS_DOLT_PORT", "3307")
+	t.Setenv("BEADS_DOLT_AUTO_START", "1")
+
+	b := NewIsolatedWithPort(t.TempDir(), 19999)
+	for _, env := range []struct {
+		name string
+		got  []string
+	}{
+		{name: "run", got: b.buildRunEnv()},
+		{name: "routing", got: b.buildRoutingEnv()},
+	} {
+		if got := countEnvPrefix(env.got, "GT_DOLT_PORT="); got != 1 {
+			t.Fatalf("%s env GT_DOLT_PORT count = %d, want 1: %v", env.name, got, env.got)
+		}
+		if got := countEnvPrefix(env.got, "BEADS_DOLT_PORT="); got != 1 {
+			t.Fatalf("%s env BEADS_DOLT_PORT count = %d, want 1: %v", env.name, got, env.got)
+		}
+		if got := countEnvPrefix(env.got, "BEADS_DOLT_AUTO_START="); got != 1 {
+			t.Fatalf("%s env BEADS_DOLT_AUTO_START count = %d, want 1: %v", env.name, got, env.got)
+		}
+		if !containsEnv(env.got, "GT_DOLT_PORT=19999") || !containsEnv(env.got, "BEADS_DOLT_PORT=19999") || !containsEnv(env.got, "BEADS_DOLT_AUTO_START=0") {
+			t.Fatalf("%s env missing isolated Dolt overrides: %v", env.name, env.got)
+		}
+	}
+}
+
+func countEnvPrefix(environ []string, prefix string) int {
+	count := 0
+	for _, env := range environ {
+		if strings.HasPrefix(env, prefix) {
+			count++
+		}
+	}
+	return count
+}
+
+func containsEnv(environ []string, want string) bool {
+	for _, env := range environ {
+		if env == want {
+			return true
+		}
+	}
+	return false
+}
+
 func TestInitPassesServerFlag(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses Unix shell script bd stub")
