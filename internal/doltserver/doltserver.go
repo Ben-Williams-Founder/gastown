@@ -719,6 +719,7 @@ func IsRunning(townRoot string) (bool, int, error) {
 				// More reliable than ps string matching (ZFC fix: gt-utuk).
 				if isDoltServerOnPort(config.Port) {
 					if doltProcessMatchesTown(townRoot, pid, config) {
+						_, _ = refreshPIDStateFromLiveInfo(townRoot, config, pid)
 						return true, pid, nil
 					}
 					// Port served by a different town's Dolt — fall through to stale cleanup
@@ -733,6 +734,7 @@ func IsRunning(townRoot string) (bool, int, error) {
 	// This catches externally-started dolt servers.
 	pid := findDoltServerOnPort(config.Port)
 	if pid > 0 && doltProcessMatchesTown(townRoot, pid, config) {
+		_, _ = refreshPIDStateFromLiveInfo(townRoot, config, pid)
 		return true, pid, nil
 	}
 
