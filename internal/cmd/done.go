@@ -134,8 +134,27 @@ func isRCAIssue(issue *beads.Issue) bool {
 	return false
 }
 
+func isRCAWorkIdentifier(issueID, branch string) bool {
+	text := strings.ToLower(issueID + "\n" + branch)
+	return strings.Contains(text, "rca")
+}
+
+func rcaEvidenceTarget(defaultBranch, explicitTarget string, issue *beads.Issue) string {
+	if explicitTarget != "" {
+		return explicitTarget
+	}
+	if issue != nil {
+		if af := beads.ParseAttachmentFields(issue); af != nil {
+			if bb := extractFormulaVar(af.FormulaVars, "base_branch"); bb != "" {
+				return bb
+			}
+		}
+	}
+	return defaultBranch
+}
+
 func isExplicitDocsOnlyIssue(issue *beads.Issue) bool {
-	text := strings.ToLower(issue.Title + "\n" + issue.Description + "\n" + issue.Notes)
+	text := strings.ToLower(issue.Title + "\n" + issue.Description)
 	if strings.Contains(text, "docs-only") || strings.Contains(text, "docs only") || strings.Contains(text, "documentation-only") || strings.Contains(text, "documentation only") {
 		return true
 	}
@@ -788,6 +807,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if stripped := stripOverlayCLAUDEmd(g, defaultBranch); stripped {
 			// Recalculate commits ahead since we added a cleanup commit
 			aheadCount, _ = g.CommitsAhead("origin/"+defaultBranch, "HEAD")
+		}
+
+		// RCA cleanup tasks must carry the evidence that distinguishes real fixes
+		// from comment-only/no-op completions before they enter the merge queue.
+		if issueID != "" {
+			bd := beads.New(cwd)
+			sourceIssue, showErr := bd.Show(issueID)
+			if showErr != nil {
+				if isRCAWorkIdentifier(issueID, branch) {
+					return fmt.Errorf("cannot validate RCA completion evidence for %s: %w", issueID, showErr)
+				}
+			} else if err := validateRCADoneEvidence(sourceIssue, g, rcaEvidenceTarget(defaultBranch, doneTarget, sourceIssue), branch); err != nil {
+				return err
+			}
 		}
 
 		// Determine merge strategy from convoy (gt-myofa.3)
