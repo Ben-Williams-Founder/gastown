@@ -178,6 +178,31 @@ func TestValidateRCAIssueEvidencePreservesDocsOnlyTasks(t *testing.T) {
 	}
 }
 
+func TestValidateRCAIssueEvidenceDoesNotTreatNotesAsDocsOnly(t *testing.T) {
+	issue := &beads.Issue{
+		ID:     "gt-rca-example",
+		Title:  "RCA cleanup: fix behavior",
+		Labels: []string{"rca-needed"},
+		Notes:  "Reproduced the failure. This was claimed as docs-only, with validation changed documentation.",
+	}
+
+	err := validateRCAIssueEvidence(issue, []string{"docs/rca.md"})
+	if err == nil || !strings.Contains(err.Error(), "docs-only/comment-only/no-op") {
+		t.Fatalf("err = %v, want docs-only implementation failure", err)
+	}
+}
+
+func TestRCAEvidenceTargetUsesFormulaBaseBranch(t *testing.T) {
+	issue := &beads.Issue{
+		Description: "formula_vars: base_branch=integration/rca-cleanup-2026-05-15",
+	}
+
+	got := rcaEvidenceTarget("main", "", issue)
+	if got != "integration/rca-cleanup-2026-05-15" {
+		t.Fatalf("target = %q, want integration/rca-cleanup-2026-05-15", got)
+	}
+}
+
 // TestDoneBeadsInitWithoutRedirect verifies that beads initialization works
 // normally when no redirect file exists.
 func TestDoneBeadsInitWithoutRedirect(t *testing.T) {
