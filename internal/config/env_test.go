@@ -1,11 +1,9 @@
 package config
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 )
 
@@ -1343,10 +1341,7 @@ func TestAgentEnv_EffortLevel(t *testing.T) {
 	})
 }
 
-func TestMaybeEmitEffortDeprecationNotice(t *testing.T) {
-	// Test the notice function with a local sync.Once so we can exercise the
-	// gating logic deterministically, independent of any package-level state
-	// already touched by prior tests.
+func TestEmitEffortDeprecationNotice(t *testing.T) {
 	cases := []struct {
 		name      string
 		shellVar  string
@@ -1361,7 +1356,6 @@ func TestMaybeEmitEffortDeprecationNotice(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("CLAUDE_CODE_EFFORT_LEVEL", tc.shellVar)
 			t.Setenv(effortPropagatedEnv, tc.sentinel)
-			var once sync.Once
 			r, w, err := os.Pipe()
 			if err != nil {
 				t.Fatalf("pipe: %v", err)
@@ -1369,15 +1363,7 @@ func TestMaybeEmitEffortDeprecationNotice(t *testing.T) {
 			origStderr := os.Stderr
 			os.Stderr = w
 			t.Cleanup(func() { os.Stderr = origStderr })
-			once.Do(func() {
-				shellEffort := os.Getenv("CLAUDE_CODE_EFFORT_LEVEL")
-				propagated := os.Getenv(effortPropagatedEnv) != ""
-				if shellEffort != "" && !propagated {
-					fmt.Fprintf(os.Stderr,
-						"notice: CLAUDE_CODE_EFFORT_LEVEL=%s env var is deprecated\n",
-						shellEffort)
-				}
-			})
+			emitEffortDeprecationNotice()
 			w.Close()
 			buf := make([]byte, 4096)
 			n, _ := r.Read(buf)
@@ -1385,6 +1371,14 @@ func TestMaybeEmitEffortDeprecationNotice(t *testing.T) {
 			gotPrint := strings.Contains(got, "deprecated")
 			if gotPrint != tc.wantPrint {
 				t.Errorf("notice printed=%v want=%v (stderr=%q)", gotPrint, tc.wantPrint, got)
+			}
+			// emitEffortDeprecationNotice must clear both vars from the
+			// process env so subsequent reads see a clean slate.
+			if v := os.Getenv("CLAUDE_CODE_EFFORT_LEVEL"); v != "" {
+				t.Errorf("CLAUDE_CODE_EFFORT_LEVEL should be unset, got %q", v)
+			}
+			if v := os.Getenv(effortPropagatedEnv); v != "" {
+				t.Errorf("%s should be unset, got %q", effortPropagatedEnv, v)
 			}
 		})
 	}

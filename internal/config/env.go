@@ -27,23 +27,28 @@ const effortPropagatedEnv = "GT_EFFORT_LEVEL_PROPAGATED"
 var effortDeprecationOnce sync.Once
 
 // maybeEmitEffortDeprecationNotice fires the deprecation notice for a
-// user-set CLAUDE_CODE_EFFORT_LEVEL at most once per process, then clears
-// both the env var and the propagation sentinel from the current process
-// env. The notice is suppressed when the sentinel is set, indicating the
-// env var was propagated by a parent gt rather than set by the user.
+// user-set CLAUDE_CODE_EFFORT_LEVEL at most once per process.
 func maybeEmitEffortDeprecationNotice() {
-	effortDeprecationOnce.Do(func() {
-		shellEffort := os.Getenv("CLAUDE_CODE_EFFORT_LEVEL")
-		propagated := os.Getenv(effortPropagatedEnv) != ""
-		os.Unsetenv("CLAUDE_CODE_EFFORT_LEVEL")
-		os.Unsetenv(effortPropagatedEnv)
-		if shellEffort != "" && !propagated {
-			fmt.Fprintf(os.Stderr,
-				"notice: CLAUDE_CODE_EFFORT_LEVEL=%s env var is deprecated and ignored; "+
-					"effort is resolved via role_effort in settings or `gt config cost-tier`.\n",
-				shellEffort)
-		}
-	})
+	effortDeprecationOnce.Do(emitEffortDeprecationNotice)
+}
+
+// emitEffortDeprecationNotice prints the deprecation notice when the
+// shell has CLAUDE_CODE_EFFORT_LEVEL set without the propagation sentinel
+// (i.e. the user set it, not a parent gt). Either way, it clears both
+// vars from the current process env so nested code paths see a clean
+// state. Split out from maybeEmitEffortDeprecationNotice so tests can
+// exercise the logic without the package-level sync.Once.
+func emitEffortDeprecationNotice() {
+	shellEffort := os.Getenv("CLAUDE_CODE_EFFORT_LEVEL")
+	propagated := os.Getenv(effortPropagatedEnv) != ""
+	os.Unsetenv("CLAUDE_CODE_EFFORT_LEVEL")
+	os.Unsetenv(effortPropagatedEnv)
+	if shellEffort != "" && !propagated {
+		fmt.Fprintf(os.Stderr,
+			"notice: CLAUDE_CODE_EFFORT_LEVEL=%s env var is deprecated and ignored; "+
+				"effort is resolved via role_effort in settings or `gt config cost-tier`.\n",
+			shellEffort)
+	}
 }
 
 // IdentityEnvVars are agent identity env vars that must not leak across
