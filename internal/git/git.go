@@ -697,6 +697,12 @@ func (g *Git) DiffNameOnly(base, head string) ([]string, error) {
 	return strings.Split(strings.TrimSpace(out), "\n"), nil
 }
 
+// DiffUnified returns a unified diff between two refs.
+// Equivalent to: git diff --unified=0 <base>...<head>
+func (g *Git) DiffUnified(base, head string) (string, error) {
+	return g.run("diff", "--unified=0", base+"..."+head)
+}
+
 // GitStatus represents the status of the working directory.
 type GitStatus struct {
 	Clean     bool

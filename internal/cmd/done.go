@@ -97,11 +97,15 @@ func validateRCADoneEvidence(issue *beads.Issue, g *git.Git, target, branch stri
 	if err != nil {
 		return fmt.Errorf("cannot validate RCA completion evidence: %w", err)
 	}
+	patch, err := g.DiffUnified(baseRef, branch)
+	if err != nil {
+		return fmt.Errorf("cannot validate RCA completion evidence: %w", err)
+	}
 
-	return validateRCAIssueEvidence(issue, changedFiles)
+	return validateRCAIssueEvidence(issue, changedFiles, patch)
 }
 
-func validateRCAIssueEvidence(issue *beads.Issue, changedFiles []string) error {
+func validateRCAIssueEvidence(issue *beads.Issue, changedFiles []string, patch string) error {
 	if issue == nil || !isRCAIssue(issue) {
 		return nil
 	}
@@ -114,7 +118,7 @@ func validateRCAIssueEvidence(issue *beads.Issue, changedFiles []string) error {
 	if !docsOnly && !hasRCAChangeEvidence(notes) {
 		return fmt.Errorf("cannot submit RCA work for %s: persisted notes must include behavior/test/config evidence", issue.ID)
 	}
-	if !docsOnly && !hasRCAImplementationEvidenceFile(changedFiles) {
+	if !docsOnly && !hasRCAImplementationEvidence(changedFiles, patch) {
 		return fmt.Errorf("cannot submit RCA work for %s: branch changes are docs-only/comment-only/no-op; RCA implementation work needs behavior, test, or config changes", issue.ID)
 	}
 
@@ -183,13 +187,62 @@ func hasRCAChangeEvidence(notes string) bool {
 	return false
 }
 
-func hasRCAImplementationEvidenceFile(changedFiles []string) bool {
+func hasRCAImplementationEvidence(changedFiles []string, patch string) bool {
+	hasNonDocFile := false
 	for _, file := range changedFiles {
 		file = strings.TrimSpace(file)
 		if file == "" || isDocsOnlyPath(file) {
 			continue
 		}
+		hasNonDocFile = true
+	}
+	if !hasNonDocFile {
+		return false
+	}
+	return hasNonCommentPatchChange(patch)
+}
+
+func hasNonCommentPatchChange(patch string) bool {
+	currentFileDocsOnly := false
+	for _, line := range strings.Split(patch, "\n") {
+		if strings.HasPrefix(line, "diff --git ") {
+			currentFileDocsOnly = isDocsOnlyPath(diffGitPath(line))
+			continue
+		}
+		if currentFileDocsOnly {
+			continue
+		}
+		if strings.HasPrefix(line, "Binary files ") {
+			return true
+		}
+		if strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "@@") {
+			continue
+		}
+		if !strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "-") {
+			continue
+		}
+		content := strings.TrimSpace(line[1:])
+		if content == "" || isCommentOnlyPatchLine(content) {
+			continue
+		}
 		return true
+	}
+	return false
+}
+
+func diffGitPath(line string) string {
+	parts := strings.Fields(line)
+	if len(parts) >= 4 {
+		return strings.TrimPrefix(parts[3], "b/")
+	}
+	return ""
+}
+
+func isCommentOnlyPatchLine(content string) bool {
+	for _, prefix := range []string{"//", "#", "--", ";", "/*", "*", "*/", "<!--", "-->", "'''", "\"\"\""} {
+		if strings.HasPrefix(content, prefix) {
+			return true
+		}
 	}
 	return false
 }

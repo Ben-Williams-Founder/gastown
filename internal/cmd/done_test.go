@@ -131,7 +131,7 @@ func TestValidateRCAIssueEvidenceRequiresPersistedReproductionNotes(t *testing.T
 		Notes:       "Implemented behavior change and validation.",
 	}
 
-	err := validateRCAIssueEvidence(issue, []string{"internal/cmd/done.go"})
+	err := validateRCAIssueEvidence(issue, []string{"internal/cmd/done.go"}, nonCommentPatch("internal/cmd/done.go"))
 	if err == nil || !strings.Contains(err.Error(), "reproduction or falsification") {
 		t.Fatalf("err = %v, want reproduction/falsification failure", err)
 	}
@@ -145,7 +145,7 @@ func TestValidateRCAIssueEvidenceBlocksDocsOnlyImplementation(t *testing.T) {
 		Notes:  "Reproduced the failure. Implemented behavior validation and tests.",
 	}
 
-	err := validateRCAIssueEvidence(issue, []string{"docs/rca.md", "README.md"})
+	err := validateRCAIssueEvidence(issue, []string{"docs/rca.md", "README.md"}, nonCommentPatch("docs/rca.md"))
 	if err == nil || !strings.Contains(err.Error(), "docs-only/comment-only/no-op") {
 		t.Fatalf("err = %v, want docs-only implementation failure", err)
 	}
@@ -159,8 +159,22 @@ func TestValidateRCAIssueEvidenceAllowsCodeEvidence(t *testing.T) {
 		Notes:  "Reproduced the failure. Implemented behavior change and targeted test validation.",
 	}
 
-	if err := validateRCAIssueEvidence(issue, []string{"internal/cmd/done.go", "internal/cmd/done_test.go"}); err != nil {
+	if err := validateRCAIssueEvidence(issue, []string{"internal/cmd/done.go", "internal/cmd/done_test.go"}, nonCommentPatch("internal/cmd/done.go")); err != nil {
 		t.Fatalf("validateRCAIssueEvidence returned error: %v", err)
+	}
+}
+
+func TestValidateRCAIssueEvidenceBlocksCommentOnlyImplementation(t *testing.T) {
+	issue := &beads.Issue{
+		ID:     "gt-rca-example",
+		Title:  "RCA cleanup: fix behavior",
+		Labels: []string{"rca-needed"},
+		Notes:  "Reproduced the failure. Implemented behavior validation and tests.",
+	}
+
+	err := validateRCAIssueEvidence(issue, []string{"internal/cmd/done.go"}, commentOnlyPatch("internal/cmd/done.go"))
+	if err == nil || !strings.Contains(err.Error(), "docs-only/comment-only/no-op") {
+		t.Fatalf("err = %v, want comment-only implementation failure", err)
 	}
 }
 
@@ -173,7 +187,7 @@ func TestValidateRCAIssueEvidencePreservesDocsOnlyTasks(t *testing.T) {
 		Notes:       "Reproduced the missing docs checklist. Validation changed documentation links.",
 	}
 
-	if err := validateRCAIssueEvidence(issue, []string{"docs/dolt-health-guide.md"}); err != nil {
+	if err := validateRCAIssueEvidence(issue, []string{"docs/dolt-health-guide.md"}, commentOnlyPatch("docs/dolt-health-guide.md")); err != nil {
 		t.Fatalf("validateRCAIssueEvidence returned error: %v", err)
 	}
 }
@@ -186,10 +200,18 @@ func TestValidateRCAIssueEvidenceDoesNotTreatNotesAsDocsOnly(t *testing.T) {
 		Notes:  "Reproduced the failure. This was claimed as docs-only, with validation changed documentation.",
 	}
 
-	err := validateRCAIssueEvidence(issue, []string{"docs/rca.md"})
+	err := validateRCAIssueEvidence(issue, []string{"docs/rca.md"}, nonCommentPatch("docs/rca.md"))
 	if err == nil || !strings.Contains(err.Error(), "docs-only/comment-only/no-op") {
 		t.Fatalf("err = %v, want docs-only implementation failure", err)
 	}
+}
+
+func nonCommentPatch(path string) string {
+	return fmt.Sprintf("diff --git a/%[1]s b/%[1]s\n@@ -1 +1 @@\n-return oldValue\n+return newValue\n", path)
+}
+
+func commentOnlyPatch(path string) string {
+	return fmt.Sprintf("diff --git a/%[1]s b/%[1]s\n@@ -1 +1 @@\n-// old comment\n+// new comment\n", path)
 }
 
 func TestRCAEvidenceTargetUsesFormulaBaseBranch(t *testing.T) {
