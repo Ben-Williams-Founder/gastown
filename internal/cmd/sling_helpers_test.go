@@ -212,6 +212,9 @@ func TestCollectExistingMoleculesFiltersClosedMolecules(t *testing.T) {
 }
 
 func TestReconcileMissingAttachedMoleculeDetachesStalePointer(t *testing.T) {
+	beads.ResetBdAllowStaleCacheForTest()
+	t.Cleanup(beads.ResetBdAllowStaleCacheForTest)
+
 	townRoot := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
 		t.Fatalf("mkdir .beads: %v", err)
@@ -225,7 +228,13 @@ func TestReconcileMissingAttachedMoleculeDetachesStalePointer(t *testing.T) {
 	bdScript := `#!/bin/sh
 set -e
 echo "CMD:$*" >> "${BD_LOG}"
-if [ "$1" = "--allow-stale" ]; then shift; fi
+if [ "$1" = "--allow-stale" ]; then
+  if [ "$2" = "version" ]; then
+    echo "Error: unknown flag: --allow-stale" >&2
+    exit 0
+  fi
+  shift
+fi
 cmd="$1"; shift || true
 case "$cmd" in
   show)
@@ -252,6 +261,10 @@ echo CMD:%*>>"%BD_LOG%"
 set "cmd=%1"
 set "id=%2"
 if "%cmd%"=="--allow-stale" (
+  if "%2"=="version" (
+    echo Error: unknown flag: --allow-stale 1>&2
+    exit /b 0
+  )
   set "cmd=%2"
   set "id=%3"
 )
