@@ -652,3 +652,43 @@ func TestDatabasePrefixCheck_MixedOwnAndRedirect(t *testing.T) {
 		t.Errorf("expected mismatch for mission_manager, got %s", check.mismatches[0].rigPath)
 	}
 }
+
+func TestDatabasePrefixCheck_RigScopedSkipsOtherRigMismatch(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	townBeads := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(townBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	routesContent := `{"prefix":"gt-","path":"gastown/mayor/rig"}
+{"prefix":"ot-","path":"otherrig/mayor/rig"}`
+	if err := os.WriteFile(filepath.Join(townBeads, "routes.jsonl"), []byte(routesContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	gastownPath := filepath.Join(tmpDir, "gastown", "mayor", "rig")
+	otherPath := filepath.Join(tmpDir, "otherrig", "mayor", "rig")
+	if err := os.MkdirAll(filepath.Join(gastownPath, ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(otherPath, ".beads"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewDatabasePrefixCheck()
+	check.prefixGetter = &mockDBPrefixGetter{
+		prefixes: map[string]string{
+			gastownPath: "gt",
+			otherPath:   "wrong",
+		},
+	}
+
+	result := check.Run(&CheckContext{TownRoot: tmpDir, RigName: "gastown"})
+	if result.Status != StatusOK {
+		t.Fatalf("expected StatusOK when other rig mismatches under --rig, got %v: %s details=%v", result.Status, result.Message, result.Details)
+	}
+	if len(check.mismatches) != 0 {
+		t.Fatalf("expected no scoped mismatches, got %+v", check.mismatches)
+	}
+}

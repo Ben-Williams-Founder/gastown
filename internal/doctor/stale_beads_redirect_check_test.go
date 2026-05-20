@@ -82,6 +82,46 @@ func TestStaleBeadsRedirectCheck_WithStaleFiles(t *testing.T) {
 	}
 }
 
+func TestStaleBeadsRedirectCheck_RigScopedSkipsOtherRigStaleFiles(t *testing.T) {
+	townRoot := t.TempDir()
+
+	targetRig := filepath.Join(townRoot, "gastown")
+	if err := os.MkdirAll(filepath.Join(targetRig, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	targetBeads := filepath.Join(targetRig, ".beads")
+	if err := os.MkdirAll(targetBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(targetBeads, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	otherRig := filepath.Join(townRoot, "otherrig")
+	if err := os.MkdirAll(filepath.Join(otherRig, ".git"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	otherBeads := filepath.Join(otherRig, ".beads")
+	if err := os.MkdirAll(otherBeads, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherBeads, "redirect"), []byte("mayor/rig/.beads\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(otherBeads, "metadata.json"), []byte(`{"dolt_database":"stale"}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	check := NewStaleBeadsRedirectCheck()
+	result := check.Run(&CheckContext{TownRoot: townRoot, RigName: "gastown"})
+	if result.Status != StatusOK {
+		t.Fatalf("expected StatusOK when other rig has stale redirect files under --rig, got %v: %s details=%v", result.Status, result.Message, result.Details)
+	}
+	if len(check.staleLocations) != 0 {
+		t.Fatalf("expected no scoped stale locations, got %v", check.staleLocations)
+	}
+}
+
 func TestStaleBeadsRedirectCheck_FixRemovesStaleFiles(t *testing.T) {
 	// Create temp town with stale .beads files
 	townRoot := t.TempDir()
