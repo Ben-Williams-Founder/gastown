@@ -859,9 +859,17 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// Without this, each sling creates a new wisp bonded to the bead, leaving orphaned molecules.
 	// NOTE: Uses local `force` (not `slingForce`) to respect auto-force paths (dead agent detection).
 	if formulaName != "" {
+		stale := (force || isOrphanMolecule(info)) && !slingDryRun
+		if recovered, err := reconcileMissingAttachedMolecule(info, beadID, townRoot, stale); err != nil {
+			return err
+		} else if recovered {
+			info, err = getBeadInfo(beadID)
+			if err != nil {
+				return fmt.Errorf("refreshing bead status after molecule recovery: %w", err)
+			}
+		}
 		existingMolecules := collectExistingMolecules(info)
 		if len(existingMolecules) > 0 {
-			stale := force || isOrphanMolecule(info)
 			if slingDryRun {
 				fmt.Printf("  Would burn %d stale molecule(s): %s\n",
 					len(existingMolecules), strings.Join(existingMolecules, ", "))

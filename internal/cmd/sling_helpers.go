@@ -180,6 +180,44 @@ func isOrphanMolecule(info *beadInfo) bool {
 	return isHookedAgentDeadFn(info.Assignee)
 }
 
+// reconcileMissingAttachedMolecule clears stale attached_molecule metadata when
+// the referenced wisp no longer exists. This recovers partial dispatches where
+// the base bead was updated but the formula wisp was never durably created.
+func reconcileMissingAttachedMolecule(info *beadInfo, beadID, townRoot string, canRecover bool) (bool, error) {
+	if !canRecover || info == nil || beadID == "" {
+		return false, nil
+	}
+	fields := beads.ParseAttachmentFields(&beads.Issue{Description: info.Description})
+	if fields == nil || fields.AttachedMolecule == "" {
+		return false, nil
+	}
+
+	// A live dependency bond means bd can still see the molecule; leave normal
+	// burn/replacement handling in charge.
+	for _, dep := range info.Dependencies {
+		if dep.ID == fields.AttachedMolecule && dep.Status != "closed" && dep.Status != "tombstone" {
+			return false, nil
+		}
+	}
+
+	b := beads.New(beads.ResolveHookDir(townRoot, beadID, ""))
+	if _, err := b.Show(fields.AttachedMolecule); err == nil {
+		return false, nil
+	} else if !isBeadNotFound(err) {
+		return false, fmt.Errorf("checking attached molecule %s: %w", fields.AttachedMolecule, err)
+	}
+
+	fmt.Printf("  %s Recovering missing attached molecule %s on %s\n",
+		style.Warning.Render("⚠"), fields.AttachedMolecule, beadID)
+	if _, err := b.DetachMoleculeWithAudit(beadID, beads.DetachOptions{
+		Operation: "recover-missing",
+		Reason:    "sling: attached molecule wisp not found",
+	}); err != nil {
+		return false, fmt.Errorf("detaching missing attached molecule %s from %s: %w", fields.AttachedMolecule, beadID, err)
+	}
+	return true, nil
+}
+
 // collectExistingMolecules returns all molecule wisp IDs attached to a bead.
 // Checks both dependency bonds (ground truth from bd mol bond) and the
 // description's attached_molecule field (metadata pointer). Wisp IDs are

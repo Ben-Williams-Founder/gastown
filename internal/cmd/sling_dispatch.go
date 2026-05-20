@@ -206,14 +206,24 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 
 	// 2. Burn stale molecules (if formula applies)
 	if params.FormulaName != "" {
+		stale := params.Force ||
+			(info.Assignee == "" && (info.Status == "open" || info.Status == "in_progress" || info.Status == "hooked")) ||
+			(info.Assignee != "" && isHookedAgentDeadFn(info.Assignee))
+		if recovered, err := reconcileMissingAttachedMolecule(info, params.BeadID, townRoot, stale); err != nil {
+			result.ErrMsg = fmt.Sprintf("molecule recovery failed: %v", err)
+			return result, err
+		} else if recovered {
+			info, err = getBeadInfo(params.BeadID)
+			if err != nil {
+				result.ErrMsg = err.Error()
+				return result, fmt.Errorf("refreshing bead status after molecule recovery: %w", err)
+			}
+		}
 		existingMolecules := collectExistingMolecules(info)
 		if len(existingMolecules) > 0 {
 			// Auto-burn when bead is unassigned (molecules are definitionally stale),
 			// or when the assigned agent's session is dead. This unblocks the daemon's
 			// stranded convoy scan which never passes --force.
-			stale := params.Force ||
-				(info.Assignee == "" && (info.Status == "open" || info.Status == "in_progress")) ||
-				(info.Assignee != "" && isHookedAgentDeadFn(info.Assignee))
 			if stale {
 				fmt.Printf("  %s Burning %d stale molecule(s): %s\n",
 					style.Warning.Render("⚠"), len(existingMolecules), strings.Join(existingMolecules, ", "))

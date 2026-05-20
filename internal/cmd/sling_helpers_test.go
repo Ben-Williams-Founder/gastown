@@ -211,6 +211,110 @@ func TestCollectExistingMoleculesFiltersClosedMolecules(t *testing.T) {
 	}
 }
 
+func TestReconcileMissingAttachedMoleculeDetachesStalePointer(t *testing.T) {
+	townRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(townRoot, ".beads"), 0755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+
+	binDir := filepath.Join(townRoot, "bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("mkdir binDir: %v", err)
+	}
+	logPath := filepath.Join(townRoot, "bd.log")
+	bdScript := `#!/bin/sh
+set -e
+echo "CMD:$*" >> "${BD_LOG}"
+if [ "$1" = "--allow-stale" ]; then shift; fi
+cmd="$1"; shift || true
+case "$cmd" in
+  show)
+    id="$1"
+    if [ "$id" = "gt-wisp-missing" ]; then
+      echo "Error fetching gt-wisp-missing: no issue found matching \"gt-wisp-missing\"" >&2
+      exit 1
+    fi
+    if [ "$id" = "gt-abc123" ]; then
+      printf '[{"id":"gt-abc123","title":"Base","status":"open","description":"attached_molecule: gt-wisp-missing\\nattached_formula: mol-polecat-work"}]\n'
+      exit 0
+    fi
+    exit 1
+    ;;
+  update)
+    exit 0
+    ;;
+esac
+exit 0
+`
+	bdScriptWindows := `@echo off
+setlocal enableextensions
+echo CMD:%*>>"%BD_LOG%"
+set "cmd=%1"
+set "id=%2"
+if "%cmd%"=="--allow-stale" (
+  set "cmd=%2"
+  set "id=%3"
+)
+if "%cmd%"=="show" (
+  if "%id%"=="gt-wisp-missing" (
+    echo Error fetching gt-wisp-missing: no issue found matching "gt-wisp-missing" 1>&2
+    exit /b 1
+  )
+  if "%id%"=="gt-abc123" (
+    echo [{^"id^":^"gt-abc123^",^"title^":^"Base^",^"status^":^"open^",^"description^":^"attached_molecule: gt-wisp-missing\nattached_formula: mol-polecat-work^"}]
+    exit /b 0
+  )
+  exit /b 1
+)
+if "%cmd%"=="update" exit /b 0
+exit /b 0
+`
+	_ = writeBDStub(t, binDir, bdScript, bdScriptWindows)
+	t.Setenv("BD_LOG", logPath)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	info := &beadInfo{
+		Status:      "open",
+		Description: "attached_molecule: gt-wisp-missing\nattached_formula: mol-polecat-work",
+	}
+	recovered, err := reconcileMissingAttachedMolecule(info, "gt-abc123", townRoot, true)
+	if err != nil {
+		t.Fatalf("reconcileMissingAttachedMolecule: %v", err)
+	}
+	if !recovered {
+		t.Fatalf("reconcileMissingAttachedMolecule recovered = false, want true")
+	}
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd log: %v", err)
+	}
+	logContent := string(logBytes)
+	if !strings.Contains(logContent, "show gt-wisp-missing --json") {
+		t.Fatalf("missing wisp existence check in log:\n%s", logContent)
+	}
+	if !strings.Contains(logContent, "update gt-abc123") {
+		t.Fatalf("missing detach update in log:\n%s", logContent)
+	}
+}
+
+func TestReconcileMissingAttachedMoleculeKeepsLiveBond(t *testing.T) {
+	info := &beadInfo{
+		Status:      "open",
+		Description: "attached_molecule: gt-wisp-live",
+		Dependencies: []beads.IssueDep{
+			{ID: "gt-wisp-live", Status: "open"},
+		},
+	}
+	recovered, err := reconcileMissingAttachedMolecule(info, "gt-abc123", t.TempDir(), true)
+	if err != nil {
+		t.Fatalf("reconcileMissingAttachedMolecule: %v", err)
+	}
+	if recovered {
+		t.Fatalf("reconcileMissingAttachedMolecule recovered live bond, want false")
+	}
+}
+
 func TestIsSlingConfigError(t *testing.T) {
 	tests := []struct {
 		name string
