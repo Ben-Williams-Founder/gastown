@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard pr-workflow"
+            "command": "{{GT_BIN}} tap guard pr-workflow --operation pr-create"
           }
         ]
       },
@@ -15,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard pr-workflow"
+            "command": "{{GT_BIN}} tap guard pr-workflow --operation branch-create"
           }
         ]
       },
@@ -24,7 +24,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "{{GT_BIN}} tap guard pr-workflow"
+            "command": "{{GT_BIN}} tap guard pr-workflow --operation branch-create"
           }
         ]
       }

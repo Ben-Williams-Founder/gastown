@@ -951,21 +951,21 @@ func DefaultBase() *HooksConfig {
 				Matcher: "Bash(gh pr create*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: gtCommand("gt tap guard pr-workflow"),
+					Command: gtCommand("gt tap guard pr-workflow --operation pr-create"),
 				}},
 			},
 			{
 				Matcher: "Bash(git checkout -b*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: gtCommand("gt tap guard pr-workflow"),
+					Command: gtCommand("gt tap guard pr-workflow --operation branch-create"),
 				}},
 			},
 			{
 				Matcher: "Bash(git switch -c*)",
 				Hooks: []Hook{{
 					Type:    "command",
-					Command: gtCommand("gt tap guard pr-workflow"),
+					Command: gtCommand("gt tap guard pr-workflow --operation branch-create"),
 				}},
 			},
 			{

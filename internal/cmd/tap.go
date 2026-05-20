@@ -23,7 +23,7 @@ Hook configuration in .claude/settings.json:
   {
     "PreToolUse": [{
       "matcher": "Bash(gh pr create*)",
-      "hooks": [{"command": "gt tap guard pr-workflow"}]
+      "hooks": [{"command": "gt tap guard pr-workflow --operation pr-create"}]
     }]
   }
 

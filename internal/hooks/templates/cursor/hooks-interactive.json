@@ -3,15 +3,15 @@
   "hooks": {
     "preToolUse": [
       {
-        "command": "{{GT_BIN}} tap guard pr-workflow",
+        "command": "{{GT_BIN}} tap guard pr-workflow --operation pr-create",
         "matcher": "Shell(gh pr create*)"
       },
       {
-        "command": "{{GT_BIN}} tap guard pr-workflow",
+        "command": "{{GT_BIN}} tap guard pr-workflow --operation branch-create",
         "matcher": "Shell(git checkout -b*)"
       },
       {
-        "command": "{{GT_BIN}} tap guard pr-workflow",
+        "command": "{{GT_BIN}} tap guard pr-workflow --operation branch-create",
         "matcher": "Shell(git switch -c*)"
       }
     ],
