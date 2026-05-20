@@ -867,6 +867,60 @@ commit_sha: a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2`,
 	}
 }
 
+func TestIsMergedMRForBranchAndSHA(t *testing.T) {
+	t.Parallel()
+
+	const branch = "polecat/rust/gt-rca-alias-convoy-ack-audit-v4@mp8khui0"
+	const sha = "abc123"
+
+	tests := []struct {
+		name  string
+		issue *Issue
+		want  bool
+	}{
+		{
+			name:  "closed merged exact sha blocks duplicate rerun",
+			issue: &Issue{Status: "closed", Description: "branch: " + branch + "\ncommit_sha: " + sha + "\nclose_reason: merged"},
+			want:  true,
+		},
+		{
+			name:  "closed merged legacy without sha blocks duplicate rerun",
+			issue: &Issue{Status: "closed", Description: "branch: " + branch + "\nclose_reason: merged"},
+			want:  true,
+		},
+		{
+			name:  "closed rejected preserves resubmission",
+			issue: &Issue{Status: "closed", Description: "branch: " + branch + "\ncommit_sha: " + sha + "\nclose_reason: rejected"},
+		},
+		{
+			name:  "closed superseded preserves resubmission",
+			issue: &Issue{Status: "closed", Description: "branch: " + branch + "\ncommit_sha: " + sha + "\nclose_reason: superseded"},
+		},
+		{
+			name:  "different sha preserves resubmission",
+			issue: &Issue{Status: "closed", Description: "branch: " + branch + "\ncommit_sha: def456\nclose_reason: merged"},
+		},
+		{
+			name:  "open merged-looking MR does not block open-MR path",
+			issue: &Issue{Status: "open", Description: "branch: " + branch + "\ncommit_sha: " + sha + "\nclose_reason: merged"},
+		},
+		{
+			name:  "branch prefix must be exact",
+			issue: &Issue{Status: "closed", Description: "branch: " + branch + "-extra\ncommit_sha: " + sha + "\nclose_reason: merged"},
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isMergedMRForBranchAndSHA(tt.issue, branch, sha); got != tt.want {
+				t.Fatalf("isMergedMRForBranchAndSHA() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestFormatMRFields tests formatting MR fields to string.
 func TestFormatMRFields(t *testing.T) {
 	tests := []struct {

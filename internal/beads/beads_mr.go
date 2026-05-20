@@ -60,6 +60,45 @@ func (b *Beads) FindMRForBranchAndSHA(branch, commitSHA string) (*Issue, error) 
 	return nil, nil
 }
 
+// FindMergedMRForBranchAndSHA searches for a closed merge-request bead marked
+// as merged for the given branch and commit. This protects idempotent gt done
+// recovery after post-merge cleanup deleted the source branch: rerunning gt done
+// must not re-push the already-merged branch and create a duplicate MR.
+func (b *Beads) FindMergedMRForBranchAndSHA(branch, commitSHA string) (*Issue, error) {
+	issues, err := b.ListMergeRequests(ListOptions{
+		Status: "all",
+		Label:  "gt:merge-request",
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	for _, issue := range issues {
+		if isMergedMRForBranchAndSHA(issue, branch, commitSHA) {
+			return issue, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func isMergedMRForBranchAndSHA(issue *Issue, branch, commitSHA string) bool {
+	if issue == nil || issue.Status != "closed" {
+		return false
+	}
+	if !strings.HasPrefix(issue.Description, "branch: "+branch+"\n") {
+		return false
+	}
+	fields := ParseMRFields(issue)
+	if fields == nil || fields.CloseReason != "merged" {
+		return false
+	}
+	// Legacy merged MRs may not have commit_sha; branch+merged is still a
+	// terminal lifecycle signal. When commit_sha is present, require an exact
+	// match so failed/superseded retries with new commits remain possible.
+	return fields.CommitSHA == "" || commitSHA == "" || fields.CommitSHA == commitSHA
+}
+
 // findMRForBranch searches the wisps table (Dolt) for a merge-request
 // bead matching the given branch.
 // Uses status=all which includes all issue statuses with full descriptions.

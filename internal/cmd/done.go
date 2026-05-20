@@ -767,6 +767,20 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		}
 
 		// Default: "mr" strategy (or no convoy) — push branch, create MR bead
+		prePushResolvedBeads := beads.ResolveBeadsDir(cwd)
+		prePushBd := beads.NewWithBeadsDir(cwd, prePushResolvedBeads)
+		prePushCommitSHA, _ := g.Rev("HEAD")
+		if prePushCommitSHA != "" {
+			mergedMR, mergedErr := prePushBd.FindMergedMRForBranchAndSHA(branch, prePushCommitSHA)
+			if mergedErr != nil {
+				style.PrintWarning("could not check for already-merged MR: %v", mergedErr)
+			} else if mergedMR != nil {
+				fmt.Printf("%s Branch commit already merged by MR %s\n", style.Bold.Render("✓"), mergedMR.ID)
+				fmt.Printf("  Skipping branch push and MR creation to avoid duplicate submission.\n\n")
+				doneCleanupStatus = "clean"
+				goto notifyWitness
+			}
+		}
 
 		// Pre-declare push variables for checkpoint goto (gt-aufru)
 		var refspec string
