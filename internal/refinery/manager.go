@@ -627,10 +627,15 @@ func (m *Manager) PostMerge(idOrBranch string) (*PostMergeResult, error) {
 	}
 
 	// Close the source issue with reason and --force to bypass dependency checks.
-	// The source issue may have an attached molecule (wisp) whose open steps
-	// would block a normal bd close. ForceCloseWithReason bypasses this,
-	// matching how gt done handles closures for the no-MR path.
+	// Close attached molecule wisps first so merged source aliases don't leave
+	// workflow hooks open after refinery post-merge cleanup.
 	if mr.IssueID != "" {
+		if moleculeID, closed, err := closeAttachedMoleculeForSource(b, mr.IssueID); err != nil {
+			_, _ = fmt.Fprintf(m.output, "  %s attached molecule close: %v\n", style.Dim.Render("○"), err)
+		} else if moleculeID != "" {
+			_, _ = fmt.Fprintf(m.output, "  %s attached molecule closed: %s (%d bead(s))\n", style.Dim.Render("○"), moleculeID, closed)
+		}
+
 		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
 		if mr.MergeCommit != "" {
 			closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.TargetBranch, mr.MergeCommit)

@@ -277,6 +277,69 @@ func TestManager_PostMerge_ClosesMRAndSourceIssue(t *testing.T) {
 	}
 }
 
+func TestManager_PostMerge_ClosesAttachedMolecule(t *testing.T) {
+	mgr, rigPath := setupTestManager(t)
+	testutil.RequireDoltContainer(t)
+	port, _ := strconv.Atoi(testutil.DoltContainerPort())
+	b := beads.NewIsolatedWithPort(rigPath, port)
+	if err := b.Init("gt"); err != nil {
+		t.Skipf("bd init unavailable: %v", err)
+	}
+
+	molecule, err := b.Create(beads.CreateOptions{
+		Title: "mol-polecat-work",
+		Type:  "molecule",
+	})
+	if err != nil {
+		t.Fatalf("create molecule: %v", err)
+	}
+	step, err := b.Create(beads.CreateOptions{
+		Title:  "formula step",
+		Type:   "task",
+		Parent: molecule.ID,
+	})
+	if err != nil {
+		t.Fatalf("create molecule step: %v", err)
+	}
+
+	srcIssue, err := b.Create(beads.CreateOptions{
+		Title:       "Implement feature with attached molecule",
+		Labels:      []string{"gt:task"},
+		Description: "attached_molecule: " + molecule.ID,
+	})
+	if err != nil {
+		t.Fatalf("create source issue: %v", err)
+	}
+
+	mrDesc := "branch: polecat/test/gt-xyz\nsource_issue: " + srcIssue.ID + "\nworker: test\ntarget: main"
+	mrIssue, err := b.Create(beads.CreateOptions{
+		Title:       "MR for feature with attached molecule",
+		Labels:      []string{"gt:merge-request"},
+		Description: mrDesc,
+	})
+	if err != nil {
+		t.Fatalf("create MR issue: %v", err)
+	}
+
+	result, err := mgr.PostMerge(mrIssue.ID)
+	if err != nil {
+		t.Fatalf("PostMerge() error: %v", err)
+	}
+	if !result.SourceIssueClosed {
+		t.Error("PostMerge() SourceIssueClosed = false, want true")
+	}
+
+	for _, id := range []string{srcIssue.ID, molecule.ID, step.ID} {
+		issue, err := b.Show(id)
+		if err != nil {
+			t.Fatalf("show %s: %v", id, err)
+		}
+		if issue.Status != "closed" {
+			t.Errorf("issue %s status = %q, want closed", id, issue.Status)
+		}
+	}
+}
+
 func TestManager_PostMerge_AlreadyClosedMR(t *testing.T) {
 	mgr, rigPath := setupTestManager(t)
 	testutil.RequireDoltContainer(t)

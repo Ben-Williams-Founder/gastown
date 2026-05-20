@@ -1216,10 +1216,15 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 	}
 
 	// 1. Close source issue with reference to MR.
-	// Use ForceCloseWithReason to bypass dependency checks — the source issue
-	// may have an attached molecule (wisp) whose open steps would block a
-	// normal close. This matches how gt done handles closures.
+	// Close attached molecule wisps first so merged source aliases don't leave
+	// workflow hooks open after refinery post-merge cleanup.
 	if mr.SourceIssue != "" {
+		if moleculeID, closed, err := closeAttachedMoleculeForSource(e.beads, mr.SourceIssue); err != nil {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close attached molecule for source issue %s: %v\n", mr.SourceIssue, err)
+		} else if moleculeID != "" {
+			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed attached molecule: %s (%d bead(s))\n", moleculeID, closed)
+		}
+
 		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
 		if result.MergeCommit != "" {
 			closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
