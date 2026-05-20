@@ -1675,7 +1675,7 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 	if err != nil {
 		return nil, err
 	}
-	if current.State == StateWorking && current.Issue == "" {
+	if (current.State == StateWorking || current.State == StateStalled) && current.Issue == "" {
 		current = &Polecat{
 			Name:      current.Name,
 			Rig:       current.Rig,
@@ -1687,11 +1687,23 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 			UpdatedAt: current.UpdatedAt,
 		}
 	}
+	if current.State != StateIdle {
+		return nil, fmt.Errorf("%w: polecat is %s", ErrPolecatNeedsRecovery, current.State)
+	}
 	state, err := m.evaluateWorkStateForPolecat(name, current)
 	if err != nil {
 		return nil, err
 	}
 	if !state.Reusable {
+		if !strings.Contains(state.Reason, "agent-bead-lookup-failed") {
+			return nil, fmt.Errorf("%w: %s", ErrPolecatNeedsRecovery, state.Reason)
+		}
+		// Legacy/test slots can lack agent beads while still having a live dead-prompt
+		// session. Clear that session before returning the recovery verdict so it
+		// does not keep consuming capacity or block later repair.
+		if err := m.killExistingPolecatSession(name, "reuse"); err != nil {
+			return nil, err
+		}
 		return nil, fmt.Errorf("%w: %s", ErrPolecatNeedsRecovery, state.Reason)
 	}
 
