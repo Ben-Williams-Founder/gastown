@@ -511,8 +511,9 @@ func releaseQueueMessage(beadsDir, messageID, actor string) error {
 // Queue management commands (beads-native)
 
 var (
-	mailQueueClaimers string
-	mailQueueJSON     bool
+	mailQueueClaimers       string
+	mailQueueMaxConcurrency int
+	mailQueueJSON           bool
 )
 
 var mailQueueCmd = &cobra.Command{
@@ -547,6 +548,7 @@ Patterns support wildcards: 'gastown/polecats/*' matches any polecat in gastown 
 
 Examples:
   gt mail queue create work --claimers 'gastown/polecats/*'
+  gt mail queue create work --claimers 'gastown/polecats/*' --max-concurrency 4
   gt mail queue create dispatch --claimers 'gastown/crew/*'
   gt mail queue create urgent --claimers '*'`,
 	Args: cobra.ExactArgs(1),
@@ -596,6 +598,7 @@ Examples:
 func init() {
 	// Queue create flags
 	mailQueueCreateCmd.Flags().StringVar(&mailQueueClaimers, "claimers", "", "Pattern for who can claim from this queue (required)")
+	mailQueueCreateCmd.Flags().IntVar(&mailQueueMaxConcurrency, "max-concurrency", 0, "Maximum concurrent claims for this queue (0 = unlimited)")
 	_ = mailQueueCreateCmd.MarkFlagRequired("claimers")
 
 	// Queue show/list flags
@@ -624,6 +627,9 @@ func runMailQueueCreate(cmd *cobra.Command, args []string) error {
 
 	// Get caller identity for created_by
 	caller := detectSender()
+	if mailQueueMaxConcurrency < 0 {
+		return fmt.Errorf("max-concurrency must be non-negative")
+	}
 
 	// Create queue bead
 	b := beads.NewWithBeadsDir(townRoot, beads.ResolveBeadsDir(townRoot))
@@ -642,11 +648,12 @@ func runMailQueueCreate(cmd *cobra.Command, args []string) error {
 
 	// Create queue fields
 	fields := &beads.QueueFields{
-		Name:         queueName,
-		ClaimPattern: mailQueueClaimers,
-		Status:       beads.QueueStatusActive,
-		CreatedBy:    caller,
-		CreatedAt:    time.Now().Format(time.RFC3339),
+		Name:           queueName,
+		ClaimPattern:   mailQueueClaimers,
+		Status:         beads.QueueStatusActive,
+		MaxConcurrency: mailQueueMaxConcurrency,
+		CreatedBy:      caller,
+		CreatedAt:      time.Now().Format(time.RFC3339),
 	}
 
 	title := fmt.Sprintf("Queue: %s", queueName)
@@ -658,6 +665,7 @@ func runMailQueueCreate(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s Created queue %s\n", style.Bold.Render("✓"), queueName)
 	fmt.Printf("  ID: %s\n", queueID)
 	fmt.Printf("  Claimers: %s\n", mailQueueClaimers)
+	fmt.Printf("  Max concurrency: %d\n", mailQueueMaxConcurrency)
 
 	return nil
 }
@@ -690,6 +698,7 @@ func runMailQueueShow(cmd *cobra.Command, args []string) error {
 			"name":             fields.Name,
 			"claim_pattern":    fields.ClaimPattern,
 			"status":           fields.Status,
+			"max_concurrency":  fields.MaxConcurrency,
 			"available_count":  fields.AvailableCount,
 			"processing_count": fields.ProcessingCount,
 			"completed_count":  fields.CompletedCount,
@@ -710,6 +719,7 @@ func runMailQueueShow(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  ID: %s\n", issue.ID)
 	fmt.Printf("  Claimers: %s\n", fields.ClaimPattern)
 	fmt.Printf("  Status: %s\n", fields.Status)
+	fmt.Printf("  Max concurrency: %d\n", fields.MaxConcurrency)
 	fmt.Printf("  Available: %d\n", fields.AvailableCount)
 	fmt.Printf("  Processing: %d\n", fields.ProcessingCount)
 	fmt.Printf("  Completed: %d\n", fields.CompletedCount)
@@ -752,10 +762,11 @@ func runMailQueueList(cmd *cobra.Command, args []string) error {
 		for _, issue := range queues {
 			fields := beads.ParseQueueFields(issue.Description)
 			output = append(output, map[string]interface{}{
-				"id":            issue.ID,
-				"name":          fields.Name,
-				"claim_pattern": fields.ClaimPattern,
-				"status":        fields.Status,
+				"id":              issue.ID,
+				"name":            fields.Name,
+				"claim_pattern":   fields.ClaimPattern,
+				"status":          fields.Status,
+				"max_concurrency": fields.MaxConcurrency,
 			})
 		}
 		jsonBytes, err := json.MarshalIndent(output, "", "  ")
@@ -773,6 +784,7 @@ func runMailQueueList(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  %s\n", style.Bold.Render(fields.Name))
 		fmt.Printf("    Claimers: %s\n", fields.ClaimPattern)
 		fmt.Printf("    Status: %s\n", fields.Status)
+		fmt.Printf("    Max concurrency: %d\n", fields.MaxConcurrency)
 	}
 
 	return nil

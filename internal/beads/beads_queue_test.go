@@ -168,6 +168,7 @@ func TestFormatQueueDescription(t *testing.T) {
 				Name:            "processing",
 				ClaimPattern:    "*/refinery",
 				Status:          QueueStatusActive,
+				MaxConcurrency:  3,
 				AvailableCount:  5,
 				ProcessingCount: 2,
 				CompletedCount:  10,
@@ -176,6 +177,7 @@ func TestFormatQueueDescription(t *testing.T) {
 			want: []string{
 				"name: processing",
 				"claim_pattern: */refinery",
+				"max_concurrency: 3",
 				"available_count: 5",
 				"processing_count: 2",
 				"completed_count: 10",
@@ -209,6 +211,7 @@ func TestParseQueueFields(t *testing.T) {
 		wantName    string
 		wantPattern string
 		wantStatus  string
+		wantMax     int
 	}{
 		{
 			name: "basic queue",
@@ -220,6 +223,7 @@ status: active`,
 			wantName:    "work-requests",
 			wantPattern: "gastown/crew/*",
 			wantStatus:  QueueStatusActive,
+			wantMax:     0,
 		},
 		{
 			name: "queue with defaults",
@@ -229,6 +233,7 @@ name: minimal`,
 			wantName:    "minimal",
 			wantPattern: "*", // Default
 			wantStatus:  QueueStatusActive,
+			wantMax:     0,
 		},
 		{
 			name:        "empty description",
@@ -236,6 +241,7 @@ name: minimal`,
 			wantName:    "",
 			wantPattern: "*", // Default
 			wantStatus:  QueueStatusActive,
+			wantMax:     0,
 		},
 		{
 			name: "queue with counts",
@@ -244,11 +250,13 @@ name: minimal`,
 name: processing
 claim_pattern: */refinery
 status: paused
+max_concurrency: 2
 available_count: 5
 processing_count: 2`,
 			wantName:    "processing",
 			wantPattern: "*/refinery",
 			wantStatus:  QueueStatusPaused,
+			wantMax:     2,
 		},
 	}
 
@@ -263,6 +271,9 @@ processing_count: 2`,
 			}
 			if got.Status != tt.wantStatus {
 				t.Errorf("Status = %q, want %q", got.Status, tt.wantStatus)
+			}
+			if got.MaxConcurrency != tt.wantMax {
+				t.Errorf("MaxConcurrency = %d, want %d", got.MaxConcurrency, tt.wantMax)
 			}
 		})
 	}
