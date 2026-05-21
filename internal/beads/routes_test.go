@@ -560,6 +560,38 @@ func TestAppendRouteIfPrefixAvailable(t *testing.T) {
 	}
 }
 
+func TestAppendRouteIfPrefixAvailableScansDuplicatePrefixes(t *testing.T) {
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := WriteRoutes(beadsDir, []Route{
+		{Prefix: "gt-", Path: "gastown"},
+		{Prefix: "gt-", Path: "secondrig"},
+	}); err != nil {
+		t.Fatalf("write routes: %v", err)
+	}
+
+	if _, err := AppendRouteIfPrefixAvailable(tmpDir, Route{Prefix: "gt-", Path: "gastown/mayor/rig"}); err == nil {
+		t.Fatal("AppendRouteIfPrefixAvailable succeeded with duplicate different-rig prefix")
+	}
+
+	if err := WriteRoutes(beadsDir, []Route{
+		{Prefix: "gt-", Path: "gastown"},
+		{Prefix: "gt-", Path: "gastown/mayor/rig"},
+	}); err != nil {
+		t.Fatalf("write same-rig duplicates: %v", err)
+	}
+	if _, err := AppendRouteIfPrefixAvailable(tmpDir, Route{Prefix: "gt-", Path: "gastown/mayor/rig"}); err != nil {
+		t.Fatalf("AppendRouteIfPrefixAvailable same-rig duplicates: %v", err)
+	}
+	routes, err := LoadRoutes(beadsDir)
+	if err != nil {
+		t.Fatalf("load routes: %v", err)
+	}
+	if len(routes) != 1 || routes[0].Prefix != "gt-" || routes[0].Path != "gastown/mayor/rig" {
+		t.Fatalf("same-rig duplicates were not collapsed: %#v", routes)
+	}
+}
+
 func TestAgentBeadIDsWithPrefix(t *testing.T) {
 	tests := []struct {
 		name     string

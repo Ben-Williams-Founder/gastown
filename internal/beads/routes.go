@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/config"
+	gtlock "github.com/steveyegge/gastown/internal/lock"
 )
 
 // Route represents a prefix-to-path routing rule.
@@ -75,27 +76,53 @@ func AppendRouteIfPrefixAvailable(townRoot string, route Route) (*Route, error) 
 
 // AppendRouteToDirIfPrefixAvailable is AppendRouteToDir with a same-rig guard.
 func AppendRouteToDirIfPrefixAvailable(beadsDir string, route Route) (*Route, error) {
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating beads directory: %w", err)
+	}
+	unlock, err := gtlock.FlockAcquire(filepath.Join(beadsDir, RoutesFileName+".flock"))
+	if err != nil {
+		return nil, fmt.Errorf("acquiring routes lock: %w", err)
+	}
+	defer unlock()
+
 	routes, err := LoadRoutes(beadsDir)
 	if err != nil {
 		return nil, fmt.Errorf("loading routes: %w", err)
 	}
 
 	newRig := strings.SplitN(route.Path, "/", 2)[0]
-	for i, r := range routes {
+	var previous *Route
+	for _, r := range routes {
 		if r.Prefix != route.Prefix {
 			continue
 		}
-		previous := r
 		existingRig := strings.SplitN(r.Path, "/", 2)[0]
 		if existingRig != newRig {
 			return nil, fmt.Errorf("prefix %q is already used by %s (path: %s); use --prefix to specify a different prefix", route.Prefix, existingRig, r.Path)
 		}
-		routes[i].Path = route.Path
-		return &previous, WriteRoutes(beadsDir, routes)
+		if previous == nil {
+			prev := r
+			previous = &prev
+		}
 	}
 
-	routes = append(routes, route)
-	return nil, WriteRoutes(beadsDir, routes)
+	updated := make([]Route, 0, len(routes)+1)
+	replaced := false
+	for _, r := range routes {
+		if r.Prefix == route.Prefix {
+			if !replaced {
+				updated = append(updated, route)
+				replaced = true
+			}
+			continue
+		}
+		updated = append(updated, r)
+	}
+	if !replaced {
+		updated = append(updated, route)
+	}
+
+	return previous, WriteRoutes(beadsDir, updated)
 }
 
 // RestoreRouteIfCurrent restores or removes a route only if it still matches
@@ -107,6 +134,15 @@ func RestoreRouteIfCurrent(townRoot string, route Route, previous *Route) error 
 
 // RestoreRouteInDirIfCurrent restores or removes a route only if it still matches.
 func RestoreRouteInDirIfCurrent(beadsDir string, route Route, previous *Route) error {
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		return fmt.Errorf("creating beads directory: %w", err)
+	}
+	unlock, err := gtlock.FlockAcquire(filepath.Join(beadsDir, RoutesFileName+".flock"))
+	if err != nil {
+		return fmt.Errorf("acquiring routes lock: %w", err)
+	}
+	defer unlock()
+
 	routes, err := LoadRoutes(beadsDir)
 	if err != nil {
 		return fmt.Errorf("loading routes: %w", err)
