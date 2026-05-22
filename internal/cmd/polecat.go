@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -857,6 +856,8 @@ type GitState struct {
 	UncommittedFiles []string `json:"uncommitted_files"`
 	UnpushedCommits  int      `json:"unpushed_commits"`
 	StashCount       int      `json:"stash_count"`
+	HasBranchWork    bool     `json:"has_branch_work"`
+	NeedsReconcile   bool     `json:"needs_reconcile"`
 }
 
 func runPolecatGitState(cmd *cobra.Command, args []string) error {
@@ -935,73 +936,39 @@ func getGitState(worktreePath string) (*GitState, error) {
 		UncommittedFiles: []string{},
 	}
 
-	// Check for uncommitted changes (git status --porcelain)
-	statusCmd := exec.Command("git", "status", "--porcelain")
-	statusCmd.Dir = worktreePath
-	output, err := statusCmd.Output()
+	worktreeGit := git.NewGit(worktreePath)
+
+	// Check for uncommitted changes.
+	gitStatus, err := worktreeGit.Status()
 	if err != nil {
 		return nil, fmt.Errorf("git status: %w", err)
 	}
-	if len(output) > 0 {
-		lines := splitLines(string(output))
-		for _, line := range lines {
-			if line != "" {
-				// Extract filename (skip the status prefix)
-				if len(line) > 3 {
-					state.UncommittedFiles = append(state.UncommittedFiles, line[3:])
-				} else {
-					state.UncommittedFiles = append(state.UncommittedFiles, line)
-				}
-			}
-		}
+	if !gitStatus.Clean {
+		state.UncommittedFiles = append(state.UncommittedFiles, gitStatus.Modified...)
+		state.UncommittedFiles = append(state.UncommittedFiles, gitStatus.Added...)
+		state.UncommittedFiles = append(state.UncommittedFiles, gitStatus.Deleted...)
+		state.UncommittedFiles = append(state.UncommittedFiles, gitStatus.Untracked...)
 		state.Clean = false
 	}
 
-	// Check for unpushed commits (git log origin/main..HEAD)
-	// We check commits first, then verify if content differs.
-	// After squash merge, commits may differ but content may be identical.
-	mainRef := "origin/main"
-	logCmd := exec.Command("git", "log", mainRef+"..HEAD", "--oneline")
-	logCmd.Dir = worktreePath
-	output, err = logCmd.Output()
-	if err != nil {
-		// origin/main might not exist - try origin/master
-		mainRef = "origin/master"
-		logCmd = exec.Command("git", "log", mainRef+"..HEAD", "--oneline")
-		logCmd.Dir = worktreePath
-		output, _ = logCmd.Output() // non-fatal: might be a new repo without remote tracking
-	}
-	if len(output) > 0 {
-		lines := splitLines(string(output))
-		count := 0
-		for _, line := range lines {
-			if line != "" {
-				count++
-			}
+	// Check branch push evidence against the actual push target instead of
+	// assuming origin/main is the only safe landing branch.
+	if branch, branchErr := worktreeGit.CurrentBranch(); branchErr == nil && branch != "" && branch != "HEAD" {
+		evidence, evidenceErr := worktreeGit.BranchPushEvidence(branch, "origin", "")
+		if evidenceErr != nil {
+			return nil, fmt.Errorf("branch push evidence: %w", evidenceErr)
 		}
-		if count > 0 {
-			// Commits exist that aren't on main. But after squash merge,
-			// the content may actually be on main with different commit SHAs.
-			// Check if there's any actual diff between HEAD and main.
-			diffCmd := exec.Command("git", "diff", mainRef, "HEAD", "--quiet")
-			diffCmd.Dir = worktreePath
-			diffErr := diffCmd.Run()
-			if diffErr == nil {
-				// Exit code 0 means no diff - content IS on main (squash merged)
-				// Don't count these as unpushed
-				state.UnpushedCommits = 0
-			} else {
-				// Exit code 1 means there's a diff - truly unpushed work
-				state.UnpushedCommits = count
-				state.Clean = false
-			}
+		state.UnpushedCommits = evidence.UnpushedCommits
+		state.HasBranchWork = evidence.HasBranchWork
+		state.NeedsReconcile = evidence.NeedsReconcile
+		if state.UnpushedCommits > 0 || state.NeedsReconcile {
+			state.Clean = false
 		}
 	}
 
 	// Check for stashes using Git.StashCount() which filters by current branch.
 	// Without branch filtering, worktrees see repo-wide stashes and produce
 	// false "NEEDS_RECOVERY" verdicts for worktrees with zero stashes of their own.
-	worktreeGit := git.NewGit(worktreePath)
 	if stashCount, stashErr := worktreeGit.StashCount(); stashErr == nil {
 		state.StashCount = stashCount
 		if stashCount > 0 {
@@ -1108,7 +1075,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		mqBd := beads.New(r.Path)
 		beadTerminal := isAssignedBeadTerminal(mqBd, status.Issue)
 		gitState, gitErr := getGitState(p.ClonePath)
-		hasSubmittableWork := gitErr != nil || gitState.UnpushedCommits > 0
+		hasSubmittableWork := gitErr != nil || gitState.UnpushedCommits > 0 || gitState.HasBranchWork
 		applyMQCheck(&status, mqBd, beadTerminal, hasSubmittableWork)
 	}
 

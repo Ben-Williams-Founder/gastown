@@ -2047,6 +2047,15 @@ func (g *Git) StashPop(ref string) error {
 func (g *Git) UnpushedCommits() (int, error) {
 	branch, branchErr := g.CurrentBranch()
 	hasBranch := branchErr == nil && branch != "" && branch != "HEAD"
+	if hasBranch {
+		evidence, err := g.BranchPushEvidence(branch, "origin", "")
+		if err == nil {
+			if evidence.NeedsReconcile && evidence.UnpushedCommits == 0 {
+				return evidence.RemoteAheadCommits, nil
+			}
+			return evidence.UnpushedCommits, nil
+		}
+	}
 
 	// Get the upstream branch
 	upstream, err := g.run("rev-parse", "--abbrev-ref", "@{u}")
@@ -2073,7 +2082,11 @@ func (g *Git) UnpushedCommits() (int, error) {
 }
 
 func (g *Git) countCommitsAhead(base string) (int, error) {
-	out, err := g.run("rev-list", "--count", base+"..HEAD")
+	return g.countCommitsRange(base, "HEAD")
+}
+
+func (g *Git) countCommitsRange(base, head string) (int, error) {
+	out, err := g.run("rev-list", "--count", base+".."+head)
 	if err != nil {
 		return 0, err
 	}
@@ -2095,6 +2108,117 @@ func (g *Git) unpushedFromExactRemoteBranch(localBranch, remote string) (int, bo
 
 	count, err := g.countCommitsAhead(remoteSHA)
 	return count, true, err
+}
+
+// BranchPushEvidence describes whether a local branch has work that is not on
+// its push target, and whether the branch still represents submittable work.
+type BranchPushEvidence struct {
+	RemoteBranchExists bool
+	RemoteBranchTip    string
+	BaseRef            string
+	HasBranchWork      bool
+	Landed             bool
+	NeedsReconcile     bool
+	UnpushedCommits    int
+	RemoteAheadCommits int
+}
+
+// BranchPushEvidence checks the branch against the configured push target. If
+// the push-target branch is gone, it falls back to patch-id evidence against the
+// branch base so squash-merged or deleted landed branches do not look unpushed.
+func (g *Git) BranchPushEvidence(localBranch, remote, baseRef string) (*BranchPushEvidence, error) {
+	if localBranch == "" || localBranch == "HEAD" {
+		return nil, fmt.Errorf("local branch required")
+	}
+	if remote == "" {
+		remote = "origin"
+	}
+
+	evidence := &BranchPushEvidence{}
+	if baseRef == "" {
+		baseRef = g.branchEvidenceBaseRef(localBranch, remote)
+	}
+	evidence.BaseRef = baseRef
+
+	remoteTip, err := g.PushRemoteBranchTip(remote, localBranch)
+	if err != nil {
+		return nil, err
+	}
+	evidence.RemoteBranchTip = remoteTip
+	evidence.RemoteBranchExists = remoteTip != ""
+
+	if baseRef != "" {
+		if unmerged, err := g.cherryUnmergedCount(baseRef, "HEAD"); err == nil {
+			evidence.HasBranchWork = unmerged > 0
+		}
+	}
+
+	if remoteTip == "" {
+		if baseRef == "" {
+			return nil, fmt.Errorf("remote branch %s/%s missing and no base ref available", remote, localBranch)
+		}
+		unmerged, err := g.cherryUnmergedCount(baseRef, "HEAD")
+		if err != nil {
+			return nil, err
+		}
+		evidence.UnpushedCommits = unmerged
+		evidence.HasBranchWork = unmerged > 0
+		evidence.Landed = unmerged == 0
+		return evidence, nil
+	}
+
+	localAhead, err := g.countCommitsAhead(remoteTip)
+	if err != nil {
+		return nil, err
+	}
+	evidence.UnpushedCommits = localAhead
+
+	remoteAhead, err := g.countCommitsRange("HEAD", remoteTip)
+	if err != nil {
+		return nil, err
+	}
+	evidence.RemoteAheadCommits = remoteAhead
+	evidence.NeedsReconcile = remoteAhead > 0
+
+	if baseRef != "" && !evidence.HasBranchWork {
+		if unmerged, err := g.cherryUnmergedCount(baseRef, remoteTip); err == nil {
+			evidence.HasBranchWork = unmerged > 0
+		}
+	}
+
+	return evidence, nil
+}
+
+func (g *Git) branchEvidenceBaseRef(localBranch, remote string) string {
+	upstream, err := g.run("rev-parse", "--abbrev-ref", "@{u}")
+	if err == nil && upstream != "" && upstream != remote+"/"+localBranch {
+		return upstream
+	}
+
+	defaultBranch := g.RemoteDefaultBranch()
+	if defaultBranch != "" {
+		ref := remote + "/" + defaultBranch
+		if exists, err := g.RefExists(ref); err == nil && exists {
+			return ref
+		}
+	}
+
+	return ""
+}
+
+func (g *Git) cherryUnmergedCount(upstream, head string) (int, error) {
+	out, err := g.Cherry(upstream, head)
+	if err != nil {
+		return 0, err
+	}
+
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "+") {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // UncommittedWorkStatus contains information about uncommitted work in a repo.
@@ -2252,87 +2376,16 @@ func (g *Git) CheckUncommittedWork() (*UncommittedWorkStatus, error) {
 // Returns (pushed bool, unpushedCount int, err).
 // This handles polecat branches that don't have upstream tracking configured.
 func (g *Git) BranchPushedToRemote(localBranch, remote string) (bool, int, error) {
-	remoteBranch := remote + "/" + localBranch
-
-	// Resolve the push URL: with a split fetch/push configuration (e.g.,
-	// polecats pushing to a local bare repo), ls-remote against the remote
-	// name resolves the fetch URL (GitHub) not the push target.
-	lsTarget := remote
-	if fetchURL, ferr := g.RemoteURL(remote); ferr == nil {
-		if pushURL, perr := g.GetPushURL(remote); perr == nil && pushURL != fetchURL {
-			lsTarget = pushURL
-		}
-	}
-
-	// Check if the remote branch exists via ls-remote and save the output.
-	// The output contains the SHA which we reuse in the fallback path below,
-	// avoiding a redundant second ls-remote call.
-	lsOut, err := g.run("ls-remote", "--heads", lsTarget, localBranch)
+	evidence, err := g.BranchPushEvidence(localBranch, remote, "")
 	if err != nil {
-		return false, 0, fmt.Errorf("checking remote branch: %w", err)
+		return false, 0, fmt.Errorf("checking branch push evidence: %w", err)
 	}
 
-	if lsOut == "" {
-		// Remote branch doesn't exist - count commits since origin/main (or HEAD if that fails)
-		count, err := g.run("rev-list", "--count", "origin/main..HEAD")
-		if err != nil {
-			// Fallback: just count all commits on HEAD
-			count, err = g.run("rev-list", "--count", "HEAD")
-			if err != nil {
-				return false, 0, fmt.Errorf("counting commits: %w", err)
-			}
-		}
-		var n int
-		_, err = fmt.Sscanf(count, "%d", &n)
-		if err != nil {
-			return false, 0, fmt.Errorf("parsing commit count: %w", err)
-		}
-		// If there are any commits since main, branch is not pushed
-		return n == 0, n, nil
+	unpushed := evidence.UnpushedCommits
+	if evidence.NeedsReconcile && unpushed == 0 {
+		unpushed = evidence.RemoteAheadCommits
 	}
-
-	// Remote branch exists - fetch to ensure we have the local tracking ref
-	// This handles the case where we just pushed and origin/branch doesn't exist locally yet
-	_, fetchErr := g.run("fetch", remote, localBranch)
-
-	// In worktrees, the fetch may not update refs/remotes/origin/<branch> due to
-	// missing refspecs. If the remote ref doesn't exist locally, create it from FETCH_HEAD.
-	// See: gt-cehl8 (gt done fails in worktrees due to missing origin tracking ref)
-	remoteRef := "refs/remotes/" + remoteBranch
-	if _, err := g.run("rev-parse", "--verify", remoteRef); err != nil {
-		// Remote ref doesn't exist locally - update it from FETCH_HEAD if fetch succeeded.
-		// Best-effort: if this fails, the code below falls back to the saved ls-remote SHA.
-		if fetchErr == nil {
-			_, _ = g.run("update-ref", remoteRef, "FETCH_HEAD")
-		}
-	}
-
-	// Check if local is ahead
-	count, err := g.run("rev-list", "--count", remoteBranch+"..HEAD")
-	if err != nil {
-		// Fallback: If we can't use the tracking ref (possibly missing remote.origin.fetch),
-		// use the SHA from the ls-remote call above instead of hitting the network again.
-		// See: gt-0eh3r (gt done fails in worktree with missing remote.origin.fetch config)
-		parts := strings.Fields(strings.TrimSpace(lsOut))
-		if len(parts) == 0 {
-			return false, 0, fmt.Errorf("counting unpushed commits: %w (invalid ls-remote output)", err)
-		}
-		remoteSHA := parts[0]
-
-		// Count commits from remote SHA to HEAD
-		count, err = g.run("rev-list", "--count", remoteSHA+"..HEAD")
-		if err != nil {
-			return false, 0, fmt.Errorf("counting unpushed commits (fallback): %w", err)
-		}
-	}
-
-	var n int
-	_, err = fmt.Sscanf(count, "%d", &n)
-	if err != nil {
-		return false, 0, fmt.Errorf("parsing unpushed count: %w", err)
-	}
-
-	return n == 0, n, nil
+	return unpushed == 0 && !evidence.NeedsReconcile, unpushed, nil
 }
 
 // PrunedBranch represents a local branch that was pruned (or would be pruned in dry-run).

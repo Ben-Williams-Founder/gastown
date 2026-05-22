@@ -2466,6 +2466,185 @@ func TestBranchPushedToRemote_SplitURL(t *testing.T) {
 	}
 }
 
+func TestBranchPushedToRemote_UsesPushTargetDespiteStaleTrackingRef(t *testing.T) {
+	localDir, upstream, _, mainBranch := initTestRepoWithSplitRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/stale-tracking"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch upstream branch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout upstream branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "upstream-stale.go"), []byte("package upstream\n"), 0644); err != nil {
+		t.Fatalf("write upstream: %v", err)
+	}
+	if err := g.Add("upstream-stale.go"); err != nil {
+		t.Fatalf("Add upstream: %v", err)
+	}
+	if err := g.Commit("upstream stale branch"); err != nil {
+		t.Fatalf("Commit upstream: %v", err)
+	}
+	upstreamSHA, err := g.Rev("HEAD")
+	if err != nil {
+		t.Fatalf("Rev upstream: %v", err)
+	}
+	runGit(t, localDir, "push", upstream, branch)
+
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	runGit(t, localDir, "checkout", "-B", branch, "origin/"+mainBranch)
+	if err := os.WriteFile(filepath.Join(localDir, "fork-stale.go"), []byte("package fork\n"), 0644); err != nil {
+		t.Fatalf("write fork: %v", err)
+	}
+	if err := g.Add("fork-stale.go"); err != nil {
+		t.Fatalf("Add fork: %v", err)
+	}
+	if err := g.Commit("fork stale branch"); err != nil {
+		t.Fatalf("Commit fork: %v", err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push fork branch: %v", err)
+	}
+	runGit(t, localDir, "update-ref", "refs/remotes/origin/"+branch, upstreamSHA)
+
+	pushed, unpushed, err := g.BranchPushedToRemote(branch, "origin")
+	if err != nil {
+		t.Fatalf("BranchPushedToRemote: %v", err)
+	}
+	if !pushed || unpushed != 0 {
+		t.Fatalf("BranchPushedToRemote = pushed %v, unpushed %d; want pushed true, unpushed 0", pushed, unpushed)
+	}
+}
+
+func TestBranchPushedToRemote_MissingRemoteBranchLandedContentIsSafe(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/squash-landed"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "landed.go"), []byte("package landed\n"), 0644); err != nil {
+		t.Fatalf("write landed: %v", err)
+	}
+	if err := g.Add("landed.go"); err != nil {
+		t.Fatalf("Add landed: %v", err)
+	}
+	if err := g.Commit("branch work"); err != nil {
+		t.Fatalf("Commit branch: %v", err)
+	}
+
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	runGit(t, localDir, "cherry-pick", branch)
+	runGit(t, localDir, "push", "origin", mainBranch)
+	runGit(t, localDir, "fetch", "origin", mainBranch)
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch again: %v", err)
+	}
+
+	pushed, unpushed, err := g.BranchPushedToRemote(branch, "origin")
+	if err != nil {
+		t.Fatalf("BranchPushedToRemote: %v", err)
+	}
+	if !pushed || unpushed != 0 {
+		t.Fatalf("BranchPushedToRemote = pushed %v, unpushed %d; want landed content safe", pushed, unpushed)
+	}
+}
+
+func TestBranchPushedToRemote_MissingRemoteBranchUsesIntegrationUpstream(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	integration := "integration/test-base"
+	branch := "polecat/integration-work"
+
+	runGit(t, localDir, "checkout", "-b", integration, mainBranch)
+	if err := os.WriteFile(filepath.Join(localDir, "integration.go"), []byte("package integration\n"), 0644); err != nil {
+		t.Fatalf("write integration: %v", err)
+	}
+	if err := g.Add("integration.go"); err != nil {
+		t.Fatalf("Add integration: %v", err)
+	}
+	if err := g.Commit("integration base"); err != nil {
+		t.Fatalf("Commit integration: %v", err)
+	}
+	runGit(t, localDir, "push", "-u", "origin", integration)
+
+	runGit(t, localDir, "checkout", "-b", branch, "origin/"+integration)
+	runGit(t, localDir, "branch", "--set-upstream-to=origin/"+integration, branch)
+	if err := os.WriteFile(filepath.Join(localDir, "local-work.go"), []byte("package localwork\n"), 0644); err != nil {
+		t.Fatalf("write local work: %v", err)
+	}
+	if err := g.Add("local-work.go"); err != nil {
+		t.Fatalf("Add local work: %v", err)
+	}
+	if err := g.Commit("local integration work"); err != nil {
+		t.Fatalf("Commit local work: %v", err)
+	}
+
+	pushed, unpushed, err := g.BranchPushedToRemote(branch, "origin")
+	if err != nil {
+		t.Fatalf("BranchPushedToRemote: %v", err)
+	}
+	if pushed || unpushed != 1 {
+		t.Fatalf("BranchPushedToRemote = pushed %v, unpushed %d; want exactly one local commit ahead of integration", pushed, unpushed)
+	}
+}
+
+func TestBranchPushedToRemote_RemoteAheadRequiresReconcile(t *testing.T) {
+	localDir, _, _ := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/remote-ahead"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "remote-ahead.go"), []byte("package remoteahead\n"), 0644); err != nil {
+		t.Fatalf("write v1: %v", err)
+	}
+	if err := g.Add("remote-ahead.go"); err != nil {
+		t.Fatalf("Add v1: %v", err)
+	}
+	if err := g.Commit("remote ahead v1"); err != nil {
+		t.Fatalf("Commit v1: %v", err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push v1: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(localDir, "remote-ahead.go"), []byte("package remoteahead\nconst V = 2\n"), 0644); err != nil {
+		t.Fatalf("write v2: %v", err)
+	}
+	if err := g.Add("remote-ahead.go"); err != nil {
+		t.Fatalf("Add v2: %v", err)
+	}
+	if err := g.Commit("remote ahead v2"); err != nil {
+		t.Fatalf("Commit v2: %v", err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push v2: %v", err)
+	}
+	runGit(t, localDir, "reset", "--hard", "HEAD~1")
+
+	pushed, unpushed, err := g.BranchPushedToRemote(branch, "origin")
+	if err != nil {
+		t.Fatalf("BranchPushedToRemote: %v", err)
+	}
+	if pushed || unpushed == 0 {
+		t.Fatalf("BranchPushedToRemote = pushed %v, unpushed %d; want reconcile required", pushed, unpushed)
+	}
+}
+
 func TestUnpushedCommitsPrefersExactRemoteBranchOverUpstream(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)
