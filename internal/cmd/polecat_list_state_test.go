@@ -119,10 +119,16 @@ func TestActiveMRBlocksReuse(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "missing MR blocks conservatively",
+			name: "missing MR does not block forever",
 			mrID: "mr-1",
 			bd:   fakeReuseMRShower{},
-			want: true,
+			want: false,
+		},
+		{
+			name: "reaped MR does not block forever",
+			mrID: "mr-1",
+			bd:   fakeReuseMRShower{err: beads.ErrNotFound},
+			want: false,
 		},
 	}
 

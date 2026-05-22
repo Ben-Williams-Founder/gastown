@@ -1173,12 +1173,21 @@ func (m *Manager) RemoveWithOptions(name string, force, nuclear, selfNuke bool) 
 	// but MR status is a higher-level concern that should always be checked.
 	if !force {
 		agentID := m.agentBeadID(name)
+		activeMR := ""
 		_, fields, aErr := m.agentBeads().GetAgentBead(agentID)
-		if aErr == nil && fields != nil && fields.ActiveMR != "" {
-			mrBead, mrErr := m.beads.Show(fields.ActiveMR)
-			if mrErr == nil && mrBead != nil && beads.IssueStatus(mrBead.Status).BlocksRemoval() {
-				return fmt.Errorf("cannot remove polecat %s: MR %s is still open in merge queue\nRefinery will process the MR and clean up after merge\nUse --force to override (risks data loss)", name, fields.ActiveMR)
-			}
+		if aErr == nil && fields != nil {
+			activeMR = fields.ActiveMR
+		}
+		branch := ""
+		if currentBranch, branchErr := git.NewGit(clonePath).CurrentBranch(); branchErr == nil {
+			branch = currentBranch
+		}
+		mrBead, mrErr := beads.PendingMRForActiveOrOwnership(m.beads, activeMR, agentID, branch)
+		if mrErr != nil {
+			return fmt.Errorf("cannot remove polecat %s: cannot verify MR ownership: %w", name, mrErr)
+		}
+		if mrBead != nil && !beads.IssueStatus(mrBead.Status).IsTerminal() {
+			return fmt.Errorf("cannot remove polecat %s: MR %s is still open in merge queue\nRefinery will process the MR and clean up after merge\nUse --force to override (risks data loss)", name, mrBead.ID)
 		}
 	}
 
@@ -2169,7 +2178,6 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 	if err == nil && fields != nil {
 		input.HookBead = fields.HookBead
 		input.ActiveMR = fields.ActiveMR
-		input.ActiveMRBlocks = fields.ActiveMR != ""
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
 		if fields.CleanupStatus != "" {
@@ -2200,6 +2208,12 @@ func (m *Manager) reuseDecisionForPolecat(name string, state State) SlotReuseDec
 		} else {
 			input.GitCheckFailed = true
 		}
+	}
+	if mr, err := beads.PendingMRForActiveOrOwnership(m.beads, input.ActiveMR, agentID, input.Branch); err != nil {
+		input.GitCheckFailed = true
+	} else if mr != nil {
+		input.ActiveMR = mr.ID
+		input.ActiveMRBlocks = true
 	}
 	// Legacy/test polecats can lack agent cleanup metadata. If git proves there is
 	// no local work at risk, treat the missing cleanup_status as clean; otherwise

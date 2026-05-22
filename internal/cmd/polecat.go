@@ -430,7 +430,7 @@ func activeMRBlocksReuse(bd reuseMRShower, mrID string) bool {
 	}
 	mr, err := bd.Show(mrID)
 	if err != nil || mr == nil {
-		return true
+		return err != nil && !errors.Is(err, beads.ErrNotFound)
 	}
 	return !beads.IssueStatus(mr.Status).IsTerminal()
 }
@@ -533,6 +533,10 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				SessionRunning: running,
 			})
 			activeMRBlocks := activeMRBlocksReuse(bd, activeMR)
+			if mr, err := beads.PendingMRForActiveOrOwnership(bd, activeMR, agentBeadID, p.Branch); err == nil && mr != nil {
+				activeMR = mr.ID
+				activeMRBlocks = true
+			}
 			disposition := polecatListDisposition(state, cleanupStatus, activeMR, activeMRBlocks)
 			allPolecats = append(allPolecats, PolecatListItem{
 				Rig:            r.Name,
@@ -1171,12 +1175,11 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			}
 		}
 		activeMRBlocks := false
-		if blocker := activeMRBlocker(bd, fields.ActiveMR); blocker != "" {
-			if strings.Contains(blocker, "lookup_error") || strings.Contains(blocker, "unverified") {
-				status.Blockers = append(status.Blockers, blocker)
-			} else {
-				activeMRBlocks = true
-			}
+		if mr, err := beads.PendingMRForActiveOrOwnership(bd, fields.ActiveMR, agentBeadID, p.Branch); err != nil {
+			status.Blockers = append(status.Blockers, fmt.Sprintf("active_mr=%s status=lookup_error: %v", fields.ActiveMR, err))
+		} else if mr != nil {
+			status.ActiveMR = mr.ID
+			activeMRBlocks = true
 		}
 		if len(status.Blockers) > 0 {
 			status.applyDisposition(dispositionForRecoveryBlockers(status.Blockers))

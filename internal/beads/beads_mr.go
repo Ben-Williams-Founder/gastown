@@ -2,6 +2,7 @@
 package beads
 
 import (
+	"errors"
 	"strings"
 )
 
@@ -106,6 +107,74 @@ func (b *Beads) FindOpenMRsForIssue(issueID string) ([]*Issue, error) {
 		}
 	}
 	return matches, nil
+}
+
+// FindPendingMRForAgentOrBranch returns a non-terminal MR that belongs to the
+// given agent bead or branch. This is the fallback when active_mr is empty or
+// stale but the merge request still exists in the queue.
+func (b *Beads) FindPendingMRForAgentOrBranch(agentBeadID, branch string) (*Issue, error) {
+	if agentBeadID == "" && branch == "" {
+		return nil, nil
+	}
+	issues, err := b.ListMergeRequests(ListOptions{
+		Status: "all",
+		Label:  "gt:merge-request",
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, issue := range issues {
+		if IssueStatus(issue.Status).IsTerminal() {
+			continue
+		}
+		if MRMatchesAgentOrBranch(issue, agentBeadID, branch) {
+			return issue, nil
+		}
+	}
+	return nil, nil
+}
+
+type pendingMRLookup interface {
+	Show(issueID string) (*Issue, error)
+	FindPendingMRForAgentOrBranch(agentBeadID, branch string) (*Issue, error)
+}
+
+// PendingMRForActiveOrOwnership reconciles active_mr with MR ownership evidence.
+// A non-terminal active_mr wins; terminal or missing active_mr falls through to
+// agent/branch ownership lookup so stale metadata does not block forever.
+func PendingMRForActiveOrOwnership(lookup pendingMRLookup, activeMR, agentBeadID, branch string) (*Issue, error) {
+	if lookup == nil {
+		return nil, nil
+	}
+	if activeMR != "" {
+		mr, err := lookup.Show(activeMR)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+		if mr != nil && !IssueStatus(mr.Status).IsTerminal() {
+			return mr, nil
+		}
+	}
+	return lookup.FindPendingMRForAgentOrBranch(agentBeadID, branch)
+}
+
+// MRMatchesAgentOrBranch reports whether an MR belongs to an agent bead or
+// source branch. Branch falls back to the legacy description prefix format.
+func MRMatchesAgentOrBranch(issue *Issue, agentBeadID, branch string) bool {
+	if issue == nil {
+		return false
+	}
+	fields := ParseMRFields(issue)
+	if agentBeadID != "" && fields != nil && fields.AgentBead == agentBeadID {
+		return true
+	}
+	if branch == "" {
+		return false
+	}
+	if fields != nil && fields.Branch == branch {
+		return true
+	}
+	return strings.HasPrefix(issue.Description, "branch: "+branch+"\n")
 }
 
 // MatchesMRSourceIssue returns true if the MR description contains a
