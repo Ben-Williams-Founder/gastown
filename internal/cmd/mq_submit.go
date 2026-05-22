@@ -11,7 +11,6 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
-	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/git"
 	"github.com/steveyegge/gastown/internal/rig"
@@ -161,58 +160,31 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	// Initialize beads for looking up source issue
 	bd := beads.New(cwd)
 
-	// Determine target branch
-	// Priority: explicit --epic > formula_vars base_branch > integration branch auto-detect > rig default.
-	target := defaultBranch
+	// Always try to fetch source issue (needed for target, priority, and dep check)
+	var sourceIssue *beads.Issue
+	sourceIssue, err = bd.Show(issueID)
+	sourceIssueErr := err
+
+	// Determine target branch using the central resolver.
+	explicitTarget := ""
 	if mqSubmitEpic != "" {
 		// Explicit --epic flag: read stored branch name, fall back to template
 		rigPath := filepath.Join(townRoot, rigName)
-		target = resolveIntegrationBranchName(bd, rigPath, mqSubmitEpic)
-	} else {
-		// Check for explicit --base-branch override in formula vars on the source issue.
-		// When gt sling dispatches with --base-branch, the value is persisted in
-		// the bead's formula_vars field. Without this check, MRs created via
-		// gt mq submit always target the rig's default branch (usually main),
-		// even when the polecat was working against a feature branch.
-		if sourceIssue, showErr := bd.Show(issueID); showErr == nil {
-			if af := beads.ParseAttachmentFields(sourceIssue); af != nil {
-				if bb := extractFormulaVar(af.FormulaVars, "base_branch"); bb != "" && bb != defaultBranch {
-					target = bb
-					fmt.Printf("  Target branch override: %s (from formula_vars)\n", target)
-				}
-			}
-		}
-
-		// Auto-detect: check if source issue has a parent epic with an integration branch
-		// Only if no explicit base_branch was found above
-		if target == defaultBranch {
-			refineryEnabled := true
-			rigPath := filepath.Join(townRoot, rigName)
-			settingsPath := filepath.Join(rigPath, "settings", "config.json")
-			if settings, err := config.LoadRigSettings(settingsPath); err == nil && settings.MergeQueue != nil {
-				refineryEnabled = settings.MergeQueue.IsRefineryIntegrationEnabled()
-			}
-			if refineryEnabled {
-				autoTarget, err := beads.DetectIntegrationBranch(bd, g, issueID)
-				if err != nil {
-					// Non-fatal: log and continue with default branch as target
-					fmt.Printf("  %s\n", style.Dim.Render(fmt.Sprintf("(note: %v)", err)))
-				} else if autoTarget != "" {
-					target = autoTarget
-				}
-			}
-		}
+		explicitTarget = resolveIntegrationBranchName(bd, rigPath, mqSubmitEpic)
 	}
+	targetResult, err := resolveCommandMRTarget(townRoot, rigName, defaultBranch, issueID, explicitTarget, sourceIssue, bd, g)
+	if err != nil {
+		return fmt.Errorf("resolving MR target: %w", err)
+	}
+	target := targetResult.Branch
+	printResolvedMRTarget(targetResult)
 
 	// Get source issue for priority inheritance and dependency check
 	var priority int
-	var sourceIssue *beads.Issue
 	if mqSubmitPriority >= 0 {
 		priority = mqSubmitPriority
 	}
-	// Always try to fetch source issue (needed for both priority and dep check)
-	sourceIssue, err = bd.Show(issueID)
-	if err != nil {
+	if sourceIssueErr != nil {
 		if mqSubmitPriority < 0 {
 			priority = 2
 		}
