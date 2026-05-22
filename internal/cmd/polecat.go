@@ -1184,8 +1184,8 @@ type mrFinder interface {
 }
 
 // isAssignedBeadTerminal reports whether the polecat's assigned bead (if any)
-// is in a terminal status (closed/tombstone). Returns false on any lookup
-// failure — callers must only use this to *skip* further escalation, never to
+// no longer requires merge-queue submission. Returns false on any lookup failure
+// because callers must only use this to *skip* further escalation, never to
 // escalate, so a false negative is safe.
 func isAssignedBeadTerminal(bd *beads.Beads, issueID string) bool {
 	if issueID == "" || bd == nil {
