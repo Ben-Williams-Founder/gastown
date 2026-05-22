@@ -14,6 +14,8 @@ type SlotReuseInput struct {
 	CleanupStatus   CleanupStatus
 	PushFailed      bool
 	MRFailed        bool
+	ActiveMR        string
+	ActiveMRFailed  bool
 	Branch          string
 	GitDirty        bool
 	StashCount      int
@@ -41,6 +43,12 @@ func DecideSlotReuse(in SlotReuseInput) SlotReuseDecision {
 	}
 	if in.MRFailed {
 		return SlotReuseDecision{Reason: "mr-failed"}
+	}
+	if in.ActiveMRFailed {
+		return SlotReuseDecision{Reason: "active-mr-lookup-failed"}
+	}
+	if in.ActiveMR != "" {
+		return SlotReuseDecision{Reason: "active-mr-open"}
 	}
 	if !in.CleanupStatus.IsSafe() {
 		if in.CleanupStatus == "" {

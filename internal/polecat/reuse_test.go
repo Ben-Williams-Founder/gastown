@@ -14,6 +14,8 @@ func TestDecideSlotReuse(t *testing.T) {
 		{name: "hook", mutate: func(in *SlotReuseInput) { in.HookBead = "gt-work" }, want: "hook-still-set"},
 		{name: "push failed", mutate: func(in *SlotReuseInput) { in.PushFailed = true }, want: "push-failed"},
 		{name: "mr failed", mutate: func(in *SlotReuseInput) { in.MRFailed = true }, want: "mr-failed"},
+		{name: "active MR lookup failed", mutate: func(in *SlotReuseInput) { in.ActiveMRFailed = true }, want: "active-mr-lookup-failed"},
+		{name: "open active MR", mutate: func(in *SlotReuseInput) { in.ActiveMR = "gt-mr" }, want: "active-mr-open"},
 		{name: "cleanup dirty", mutate: func(in *SlotReuseInput) { in.CleanupStatus = CleanupUnpushed }, want: "cleanup-has_unpushed"},
 		{name: "cleanup unknown", mutate: func(in *SlotReuseInput) { in.CleanupStatus = CleanupUnknown }, want: "cleanup-unknown"},
 		{name: "git dirty", mutate: func(in *SlotReuseInput) { in.GitDirty = true }, want: "git-dirty"},
