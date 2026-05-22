@@ -987,6 +987,8 @@ type RecoveryStatus struct {
 	NeedsRecovery bool                  `json:"needs_recovery"`
 	Verdict       string                `json:"verdict"` // SAFE_TO_NUKE, NEEDS_RECOVERY, or NEEDS_MQ_SUBMIT
 	Branch        string                `json:"branch,omitempty"`
+	ActiveMR      string                `json:"active_mr"`
+	GitState      *GitState             `json:"git_state,omitempty"`
 	Issue         string                `json:"issue,omitempty"`
 	MQStatus      string                `json:"mq_status,omitempty"` // "submitted", "not_submitted", "not_required", "unknown"
 	Reason        string                `json:"reason,omitempty"`
@@ -1030,6 +1032,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		status.Verdict = "NEEDS_RECOVERY"
 		status.Reason = fmt.Sprintf("cannot verify direct git evidence: %v", gitErr)
 	} else {
+		status.GitState = gitState
 		status.CleanupStatus = cleanupStatusFromGitState(gitState)
 		status.NeedsRecovery = !status.CleanupStatus.IsSafe()
 		if status.NeedsRecovery {
@@ -1043,6 +1046,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	if err == nil && fields != nil && fields.ActiveMR != "" {
+		status.ActiveMR = fields.ActiveMR
 		activeMRPending, activeMRErr := resolveActiveMRForRecovery(bd, agentBeadID, fields.ActiveMR)
 		if activeMRErr != nil {
 			status.NeedsRecovery = true
@@ -1191,7 +1195,21 @@ func isAssignedBeadTerminal(bd *beads.Beads, issueID string) bool {
 	if err != nil || issue == nil {
 		return false
 	}
-	return beads.IssueStatus(issue.Status).IsTerminal()
+	return recoverySourceDoesNotRequireMQ(issue)
+}
+
+func recoverySourceDoesNotRequireMQ(issue *beads.Issue) bool {
+	if issue == nil {
+		return false
+	}
+	status := beads.IssueStatus(issue.Status)
+	if status.IsTerminal() || issue.Status == "deferred" || issue.Status == "escalated" {
+		return true
+	}
+	if fields := beads.ParseAttachmentFields(issue); fields != nil {
+		return fields.NoMerge || fields.ReviewOnly
+	}
+	return false
 }
 
 // applyMQCheck mutates status based on merge-queue state for the polecat's
@@ -1216,8 +1234,11 @@ func applyMQCheck(status *RecoveryStatus, bd mrFinder, beadTerminal, hasSubmitta
 	}
 	mr, mrErr := bd.FindMRForBranchAny(status.Branch)
 	if mrErr != nil {
-		// Can't verify MQ — be conservative
+		// Can't verify MQ — fail closed rather than nuking unverifiable work.
 		status.MQStatus = "unknown"
+		status.NeedsRecovery = true
+		status.Verdict = "NEEDS_RECOVERY"
+		status.Reason = fmt.Sprintf("cannot verify merge queue for branch %s: %v", status.Branch, mrErr)
 		return
 	}
 	if mr != nil {

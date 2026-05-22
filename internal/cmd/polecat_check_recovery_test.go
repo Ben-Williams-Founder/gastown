@@ -1,10 +1,12 @@
 package cmd
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/polecat"
 )
 
 // fakeMRFinder is a test stub for the mrFinder interface used by applyMQCheck.
@@ -81,14 +83,14 @@ func TestApplyMQCheck(t *testing.T) {
 			wantNeedsRecov: false,
 		},
 		{
-			name:           "MR lookup error is conservative (unknown, no escalation)",
+			name:           "MR lookup error fails closed",
 			finder:         fakeMRFinder{issue: nil, err: errors.New("bd exploded")},
 			beadTerminal:   false,
 			hasWork:        true,
 			initialVerdict: "SAFE_TO_NUKE",
-			wantVerdict:    "SAFE_TO_NUKE",
+			wantVerdict:    "NEEDS_RECOVERY",
 			wantMQStatus:   "unknown",
-			wantNeedsRecov: false,
+			wantNeedsRecov: true,
 		},
 	}
 
@@ -110,6 +112,319 @@ func TestApplyMQCheck(t *testing.T) {
 				t.Errorf("NeedsRecovery = %v, want %v", status.NeedsRecovery, tt.wantNeedsRecov)
 			}
 		})
+	}
+}
+
+func TestRecoverySourceDoesNotRequireMQ(t *testing.T) {
+	tests := []struct {
+		name  string
+		issue *beads.Issue
+		want  bool
+	}{
+		{name: "missing source requires verification", want: false},
+		{name: "open source requires MQ", issue: &beads.Issue{Status: "open"}, want: false},
+		{name: "closed source skips MQ", issue: &beads.Issue{Status: "closed"}, want: true},
+		{name: "deferred source skips MQ", issue: &beads.Issue{Status: "deferred"}, want: true},
+		{name: "escalated source skips MQ", issue: &beads.Issue{Status: "escalated"}, want: true},
+		{name: "no merge source skips MQ", issue: &beads.Issue{Status: "open", Description: "no_merge: true"}, want: true},
+		{name: "review only source skips MQ", issue: &beads.Issue{Status: "open", Description: "review_only: true"}, want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := recoverySourceDoesNotRequireMQ(tt.issue); got != tt.want {
+				t.Errorf("recoverySourceDoesNotRequireMQ() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRecoveryPermutationMatrix(t *testing.T) {
+	tests := []struct {
+		name           string
+		hookPresent    bool
+		sourceStatus   string
+		sessionRunning bool
+		gitState       *GitState
+		gitErr         error
+		activeMR       string
+		activeMRBD     issueShower
+		finder         mrFinder
+		wantCleanup    polecat.CleanupStatus
+		wantVerdict    string
+		wantMQStatus   string
+		wantNeedsRecov bool
+	}{
+		{
+			name:           "hook open running clean no branch work has no MQ requirement",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: true,
+			gitState:       &GitState{Clean: true},
+			finder:         fakeMRFinder{},
+			wantCleanup:    polecat.CleanupClean,
+			wantVerdict:    "SAFE_TO_NUKE",
+			wantMQStatus:   "not_required",
+		},
+		{
+			name:         "no hook closed stopped pushed branch without MR is a false positive",
+			sourceStatus: "closed",
+			gitState:     &GitState{Clean: true, HasBranchWork: true},
+			finder:       fakeMRFinder{},
+			wantCleanup:  polecat.CleanupClean,
+			wantVerdict:  "SAFE_TO_NUKE",
+			wantMQStatus: "submitted",
+		},
+		{
+			name:         "hook deferred stopped pushed branch without MR is a false positive",
+			hookPresent:  true,
+			sourceStatus: "deferred",
+			gitState:     &GitState{Clean: true, HasBranchWork: true},
+			finder:       fakeMRFinder{},
+			wantCleanup:  polecat.CleanupClean,
+			wantVerdict:  "SAFE_TO_NUKE",
+			wantMQStatus: "submitted",
+		},
+		{
+			name:         "hook escalated stopped pushed branch without MR is a false positive",
+			hookPresent:  true,
+			sourceStatus: "escalated",
+			gitState:     &GitState{Clean: true, HasBranchWork: true},
+			finder:       fakeMRFinder{},
+			wantCleanup:  polecat.CleanupClean,
+			wantVerdict:  "SAFE_TO_NUKE",
+			wantMQStatus: "submitted",
+		},
+		{
+			name:           "hook open stopped pushed branch without MR is true risk",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: false,
+			gitState:       &GitState{Clean: true, HasBranchWork: true},
+			finder:         fakeMRFinder{},
+			wantCleanup:    polecat.CleanupClean,
+			wantVerdict:    "NEEDS_MQ_SUBMIT",
+			wantMQStatus:   "not_submitted",
+			wantNeedsRecov: true,
+		},
+		{
+			name:           "hook open stopped pushed branch with open active MR is true risk",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: false,
+			gitState:       &GitState{Clean: true, HasBranchWork: true},
+			activeMR:       "gt-mr-open",
+			activeMRBD:     fakeIssueShower{issue: &beads.Issue{ID: "gt-mr-open", Status: "open"}},
+			finder:         fakeMRFinder{},
+			wantCleanup:    polecat.CleanupClean,
+			wantVerdict:    "NEEDS_RECOVERY",
+			wantNeedsRecov: true,
+		},
+		{
+			name:           "hook open stopped pushed branch with terminal active MR and MR evidence is safe",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: false,
+			gitState:       &GitState{Clean: true, HasBranchWork: true},
+			activeMR:       "gt-mr-closed",
+			activeMRBD:     fakeIssueShower{issue: &beads.Issue{ID: "gt-mr-closed", Status: "closed"}},
+			finder:         fakeMRFinder{issue: &beads.Issue{ID: "gt-mr-closed", Status: "closed"}},
+			wantCleanup:    polecat.CleanupClean,
+			wantVerdict:    "SAFE_TO_NUKE",
+			wantMQStatus:   "submitted",
+		},
+		{
+			name:           "hook open stopped pushed branch with missing active MR falls back to missing MQ risk",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: false,
+			gitState:       &GitState{Clean: true, HasBranchWork: true},
+			activeMR:       "gt-mr-missing",
+			activeMRBD:     fakeIssueShower{err: beads.ErrNotFound},
+			finder:         fakeMRFinder{},
+			wantCleanup:    polecat.CleanupClean,
+			wantVerdict:    "NEEDS_MQ_SUBMIT",
+			wantMQStatus:   "not_submitted",
+			wantNeedsRecov: true,
+		},
+		{
+			name:           "hook open stopped unpushed branch is true risk",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: false,
+			gitState:       &GitState{UnpushedCommits: 1},
+			wantCleanup:    polecat.CleanupUnpushed,
+			wantVerdict:    "NEEDS_RECOVERY",
+			wantNeedsRecov: true,
+		},
+		{
+			name:           "no hook open stopped diverged branch is true risk",
+			sourceStatus:   "open",
+			sessionRunning: false,
+			gitState:       &GitState{NeedsReconcile: true},
+			wantCleanup:    polecat.CleanupUnpushed,
+			wantVerdict:    "NEEDS_RECOVERY",
+			wantNeedsRecov: true,
+		},
+		{
+			name:           "hook open running dirty worktree is true risk",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: true,
+			gitState:       &GitState{UncommittedFiles: []string{"file.go"}},
+			wantCleanup:    polecat.CleanupUncommitted,
+			wantVerdict:    "NEEDS_RECOVERY",
+			wantNeedsRecov: true,
+		},
+		{
+			name:           "hook open running untracked worktree is true risk",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: true,
+			gitState:       &GitState{UncommittedFiles: []string{"new-file.go"}},
+			wantCleanup:    polecat.CleanupUncommitted,
+			wantVerdict:    "NEEDS_RECOVERY",
+			wantNeedsRecov: true,
+		},
+		{
+			name:           "hook open stopped stash is true risk",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: false,
+			gitState:       &GitState{StashCount: 1},
+			wantCleanup:    polecat.CleanupStash,
+			wantVerdict:    "NEEDS_RECOVERY",
+			wantNeedsRecov: true,
+		},
+		{
+			name:           "hook open stopped unknown git state fails closed",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: false,
+			gitErr:         errors.New("status denied"),
+			wantCleanup:    polecat.CleanupUnknown,
+			wantVerdict:    "NEEDS_RECOVERY",
+			wantNeedsRecov: true,
+		},
+		{
+			name:           "hook open stopped pushed branch with unverifiable MQ fails closed",
+			hookPresent:    true,
+			sourceStatus:   "open",
+			sessionRunning: false,
+			gitState:       &GitState{Clean: true, HasBranchWork: true},
+			finder:         fakeMRFinder{err: errors.New("bd unavailable")},
+			wantCleanup:    polecat.CleanupClean,
+			wantVerdict:    "NEEDS_RECOVERY",
+			wantMQStatus:   "unknown",
+			wantNeedsRecov: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.sourceStatus == "" || tt.wantVerdict == "" {
+				t.Fatalf("matrix row must explicitly name sourceStatus and wantVerdict")
+			}
+
+			status := evaluateRecoveryPermutationForTest(tt.gitState, tt.gitErr, tt.sourceStatus, tt.activeMR, tt.activeMRBD, tt.finder)
+
+			if status.CleanupStatus != tt.wantCleanup {
+				t.Errorf("CleanupStatus = %q, want %q", status.CleanupStatus, tt.wantCleanup)
+			}
+			if status.Verdict != tt.wantVerdict {
+				t.Errorf("Verdict = %q, want %q", status.Verdict, tt.wantVerdict)
+			}
+			if status.MQStatus != tt.wantMQStatus {
+				t.Errorf("MQStatus = %q, want %q", status.MQStatus, tt.wantMQStatus)
+			}
+			if status.NeedsRecovery != tt.wantNeedsRecov {
+				t.Errorf("NeedsRecovery = %v, want %v", status.NeedsRecovery, tt.wantNeedsRecov)
+			}
+		})
+	}
+}
+
+func evaluateRecoveryPermutationForTest(gitState *GitState, gitErr error, sourceStatus, activeMR string, activeMRBD issueShower, finder mrFinder) RecoveryStatus {
+	status := RecoveryStatus{
+		Rig:      "gastown",
+		Polecat:  "shiny",
+		Branch:   "polecat/test",
+		ActiveMR: activeMR,
+		Issue:    "gt-work",
+	}
+
+	if gitErr != nil {
+		status.CleanupStatus = polecat.CleanupUnknown
+		status.NeedsRecovery = true
+		status.Verdict = "NEEDS_RECOVERY"
+		status.Reason = gitErr.Error()
+	} else {
+		status.GitState = gitState
+		status.CleanupStatus = cleanupStatusFromGitState(gitState)
+		status.NeedsRecovery = !status.CleanupStatus.IsSafe()
+		if status.NeedsRecovery {
+			status.Verdict = "NEEDS_RECOVERY"
+		} else {
+			status.Verdict = "SAFE_TO_NUKE"
+		}
+	}
+
+	if status.Verdict == "SAFE_TO_NUKE" && activeMR != "" {
+		pending, err := activeMRPending(activeMRBD, activeMR)
+		if err != nil {
+			status.NeedsRecovery = true
+			status.Verdict = "NEEDS_RECOVERY"
+			status.Reason = err.Error()
+		} else if pending {
+			status.NeedsRecovery = true
+			status.Verdict = "NEEDS_RECOVERY"
+			status.Reason = "active_mr " + activeMR + " is still open"
+		}
+	}
+
+	if status.Verdict == "SAFE_TO_NUKE" && status.Branch != "" {
+		sourceDoesNotRequireMQ := recoverySourceDoesNotRequireMQ(&beads.Issue{Status: sourceStatus})
+		hasSubmittableWork := gitErr != nil || (gitState != nil && (gitState.UnpushedCommits > 0 || gitState.HasBranchWork))
+		applyMQCheck(&status, finder, sourceDoesNotRequireMQ, hasSubmittableWork)
+	}
+
+	return status
+}
+
+func TestRecoveryStatusJSONIncludesBranchAndMREvidence(t *testing.T) {
+	status := RecoveryStatus{
+		Rig:           "gastown",
+		Polecat:       "shiny",
+		CleanupStatus: polecat.CleanupClean,
+		Verdict:       "SAFE_TO_NUKE",
+		Branch:        "polecat/shiny/gt-12-recovery-permutation-tests",
+		ActiveMR:      "gt-mr-123",
+		GitState:      &GitState{Clean: true, HasBranchWork: true},
+		Issue:         "gt-work",
+		MQStatus:      "submitted",
+	}
+
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if got["branch"] != status.Branch {
+		t.Fatalf("branch evidence = %v, want %q", got["branch"], status.Branch)
+	}
+	if got["active_mr"] != status.ActiveMR {
+		t.Fatalf("active_mr evidence = %v, want %q", got["active_mr"], status.ActiveMR)
+	}
+	gitEvidence, ok := got["git_state"].(map[string]any)
+	if !ok {
+		t.Fatalf("git_state evidence missing or wrong type: %#v", got["git_state"])
+	}
+	if gitEvidence["has_branch_work"] != true {
+		t.Fatalf("has_branch_work evidence = %v, want true", gitEvidence["has_branch_work"])
 	}
 }
 
