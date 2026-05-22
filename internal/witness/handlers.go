@@ -794,6 +794,10 @@ func notifyMayorSlotOpen(workDir, rigName, polecatName, exitType string) {
 		})
 		return
 	}
+	if ok, reason := shouldNotifyMayorSlotOpen(workDir, rigName, polecatName); !ok {
+		fmt.Fprintf(os.Stderr, "witness: suppressing SLOT_OPEN for %s/%s: %s\n", rigName, polecatName, reason)
+		return
+	}
 
 	// Emit SLOT_OPEN channel event so Mayor's await-event unblocks instantly.
 	_, _ = channelevents.EmitToTown(townRoot, "mayor", "SLOT_OPEN", []string{
