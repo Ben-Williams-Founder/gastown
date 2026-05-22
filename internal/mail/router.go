@@ -1736,10 +1736,61 @@ func ShouldEnqueueReplyReminder(msg *Message) bool {
 	}
 	switch msg.Type {
 	case TypeTask, TypeScavenge:
-		return true
+		return !isNonActionableReplyReminder(msg)
 	default:
 		return false
 	}
+}
+
+func isNonActionableReplyReminder(msg *Message) bool {
+	subject := strings.TrimSpace(msg.Subject)
+	lowerSubject := strings.ToLower(subject)
+	lowerBody := strings.ToLower(msg.Body)
+
+	if containsNoReplyMarker(lowerSubject) || containsNoReplyMarker(lowerBody) {
+		return true
+	}
+
+	upperSubject := strings.ToUpper(subject)
+	for _, prefix := range []string{
+		"ACK",
+		"MERGED",
+		"SLOT_OPEN",
+		"SLOT_BLOCKED",
+		"CONVOY_STATUS",
+		"CONVOY_COMPLETE",
+		"CONVOY_COMPLETED",
+	} {
+		if hasSubjectTokenPrefix(upperSubject, prefix) {
+			return true
+		}
+	}
+
+	if strings.Contains(lowerSubject, "convoy status") ||
+		strings.Contains(lowerSubject, "convoy complete") ||
+		strings.Contains(lowerSubject, "convoy completed") {
+		return true
+	}
+
+	return lowerSubject == "status" ||
+		strings.HasPrefix(lowerSubject, "status:") ||
+		strings.HasPrefix(lowerSubject, "status update") ||
+		strings.HasPrefix(lowerSubject, "routine status")
+}
+
+func containsNoReplyMarker(s string) bool {
+	return strings.Contains(s, "no-reply") ||
+		strings.Contains(s, "no reply") ||
+		strings.Contains(s, "do not reply") ||
+		strings.Contains(s, "do not respond") ||
+		strings.Contains(s, "no response needed")
+}
+
+func hasSubjectTokenPrefix(subject, prefix string) bool {
+	return subject == prefix ||
+		strings.HasPrefix(subject, prefix+":") ||
+		strings.HasPrefix(subject, prefix+" ") ||
+		strings.HasPrefix(subject, prefix+"-")
 }
 
 // enqueueReplyReminder queues a deferred nudge reminding the recipient to reply

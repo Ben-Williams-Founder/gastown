@@ -1825,6 +1825,18 @@ func TestShouldEnqueueReplyReminder(t *testing.T) {
 		{"escalation", &Message{Type: TypeEscalation}, false},
 		{"reply", &Message{Type: TypeReply}, false},
 		{"unset", &Message{}, false},
+		{"ack task", &Message{Type: TypeTask, Subject: "ACK convoy status"}, false},
+		{"convoy status task", &Message{Type: TypeTask, Subject: "Convoy status hq-cv123"}, false},
+		{"convoy complete task", &Message{Type: TypeTask, Subject: "CONVOY_COMPLETE hq-cv123"}, false},
+		{"merged task", &Message{Type: TypeTask, Subject: "MERGED nux"}, false},
+		{"slot open task", &Message{Type: TypeTask, Subject: "SLOT_OPEN: gastown/thunder completed"}, false},
+		{"slot blocked task", &Message{Type: TypeTask, Subject: "SLOT_BLOCKED: gastown/thunder blocked"}, false},
+		{"routine status task", &Message{Type: TypeTask, Subject: "Status update: all quiet"}, false},
+		{"no reply subject task", &Message{Type: TypeTask, Subject: "[no-reply] daily digest"}, false},
+		{"no reply body task", &Message{Type: TypeTask, Subject: "Daily digest", Body: "Automated notice. Do not reply."}, false},
+		{"status check remains actionable", &Message{Type: TypeTask, Subject: "status check"}, true},
+		{"recovery needed remains actionable", &Message{Type: TypeTask, Subject: "RECOVERY_NEEDED: cleanup required", Priority: PriorityHigh}, true},
+		{"critical task remains actionable", &Message{Type: TypeTask, Subject: "[CRITICAL] Disk full", Priority: PriorityUrgent}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1925,6 +1937,38 @@ func TestEnqueueReplyReminder_SkipsGenericNotification(t *testing.T) {
 	pending, _ := nudge.Pending(townRoot, "gt-gastown-crew-alice")
 	if pending != 0 {
 		t.Errorf("TypeNotification should not enqueue a reminder, got %d", pending)
+	}
+}
+
+func TestEnqueueReplyReminder_SkipsNonActionableTaskSubjects(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  *Message
+	}{
+		{"ack", &Message{From: "gastown/witness", Subject: "ACK convoy status", Type: TypeTask}},
+		{"convoy status", &Message{From: "gastown/witness", Subject: "Convoy status hq-cv123", Type: TypeTask}},
+		{"convoy complete", &Message{From: "gastown/witness", Subject: "CONVOY_COMPLETE hq-cv123", Type: TypeTask}},
+		{"merged", &Message{From: "gastown/refinery", Subject: "MERGED thunder", Type: TypeTask}},
+		{"slot open", &Message{From: "gastown/witness", Subject: "SLOT_OPEN: gastown/thunder completed", Type: TypeTask}},
+		{"slot blocked", &Message{From: "gastown/witness", Subject: "SLOT_BLOCKED: gastown/thunder blocked", Type: TypeTask}},
+		{"routine status", &Message{From: "gastown/witness", Subject: "Status: all quiet", Type: TypeTask}},
+		{"no reply", &Message{From: "gastown/witness", Subject: "Daily digest", Body: "No response needed.", Type: TypeTask}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			townRoot := t.TempDir()
+			r := &Router{workDir: t.TempDir(), townRoot: townRoot}
+			r.enqueueReplyReminder(tt.msg, "gt-gastown-crew-alice")
+
+			pending, err := nudge.Pending(townRoot, "gt-gastown-crew-alice")
+			if err != nil {
+				t.Fatalf("Pending: %v", err)
+			}
+			if pending != 0 {
+				t.Fatalf("expected no reply reminder for %q, got %d", tt.msg.Subject, pending)
+			}
+		})
 	}
 }
 
