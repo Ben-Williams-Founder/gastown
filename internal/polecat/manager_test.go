@@ -1800,6 +1800,122 @@ func TestStalePendingMarkerIsCleanedUp(t *testing.T) {
 	}
 }
 
+func TestStalePendingMarkerOwnedByLiveProcessIsKept(t *testing.T) {
+	t.Parallel()
+
+	tmpDir, err := os.MkdirTemp("", "live-pending-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	r := &rig.Rig{
+		Name: "myrig",
+		Path: tmpDir,
+	}
+	m := NewManager(r, nil, nil)
+
+	polecatsDir := filepath.Join(tmpDir, "polecats")
+	if err := os.MkdirAll(polecatsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	pendingPath := m.pendingPath("furiosa")
+	if err := writePendingReservation(pendingPath); err != nil {
+		t.Fatal(err)
+	}
+
+	staleTime := time.Now().Add(-(pendingMaxAge + time.Minute))
+	if err := os.Chtimes(pendingPath, staleTime, staleTime); err != nil {
+		t.Fatal(err)
+	}
+
+	m.cleanupOrphanPolecatState()
+
+	if _, err := os.Stat(pendingPath); err != nil {
+		t.Fatalf("live owner .pending marker should be kept, got: %v", err)
+	}
+}
+
+func TestPendingReservationOwnedByLiveProcess(t *testing.T) {
+	fingerprint := func(value string, ok bool) func(int) (processFingerprint, bool) {
+		return func(int) (processFingerprint, bool) {
+			return processFingerprint{StartTime: value}, ok
+		}
+	}
+	alive := func(ok bool) func(int) bool {
+		return func(int) bool { return ok }
+	}
+
+	tests := []struct {
+		name        string
+		reservation pendingReservation
+		fingerprint func(int) (processFingerprint, bool)
+		alive       func(int) bool
+		want        bool
+	}{
+		{
+			name: "live owner metadata matches",
+			reservation: pendingReservation{
+				PID:              42,
+				ProcessStart:     "12345",
+				hasOwnerMetadata: true,
+			},
+			fingerprint: fingerprint("12345", true),
+			alive:       alive(true),
+			want:        true,
+		},
+		{
+			name: "dead owner",
+			reservation: pendingReservation{
+				PID:              42,
+				ProcessStart:     "12345",
+				hasOwnerMetadata: true,
+			},
+			fingerprint: fingerprint("12345", true),
+			alive:       alive(false),
+			want:        false,
+		},
+		{
+			name: "reused pid mismatches metadata",
+			reservation: pendingReservation{
+				PID:              42,
+				ProcessStart:     "12345",
+				hasOwnerMetadata: true,
+			},
+			fingerprint: fingerprint("67890", true),
+			alive:       alive(true),
+			want:        false,
+		},
+		{
+			name: "fingerprint unavailable when reservation was created",
+			reservation: pendingReservation{
+				PID:              42,
+				hasOwnerMetadata: true,
+			},
+			fingerprint: fingerprint("", false),
+			alive:       alive(true),
+			want:        true,
+		},
+		{
+			name:        "legacy marker has no owner metadata",
+			reservation: pendingReservation{PID: 42},
+			fingerprint: fingerprint("12345", true),
+			alive:       alive(true),
+			want:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := pendingReservationOwnedByLiveProcess(tt.reservation, tt.fingerprint, tt.alive)
+			if got != tt.want {
+				t.Fatalf("pendingReservationOwnedByLiveProcess() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestAddWithOptions_RollbackReleasesName verifies that when AddWithOptions fails,
 // the allocated name is released back to the pool and the polecat directory is cleaned up.
 // Regression test for gt-2vs22: cleanupOnError previously only removed the directory,

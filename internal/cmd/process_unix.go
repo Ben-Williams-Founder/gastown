@@ -2,7 +2,10 @@
 
 package cmd
 
-import "syscall"
+import (
+	"os"
+	"syscall"
+)
 
 // isProcessRunning checks if a process with the given PID exists.
 func isProcessRunning(pid int) bool {
@@ -10,7 +13,12 @@ func isProcessRunning(pid int) bool {
 		return false
 	}
 
-	err := syscall.Kill(pid, 0)
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+
+	err = process.Signal(syscall.Signal(0))
 	if err == nil {
 		return true
 	}

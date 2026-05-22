@@ -4,6 +4,7 @@ package polecat
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -13,7 +14,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/gofrs/flock"
@@ -487,6 +487,86 @@ func (m *Manager) polecatDir(name string) string {
 // the same name during the window between pool save and directory creation.
 func (m *Manager) pendingPath(name string) string {
 	return filepath.Join(m.rig.Path, "polecats", name+".pending")
+}
+
+type pendingReservation struct {
+	Version      int    `json:"version,omitempty"`
+	PID          int    `json:"pid"`
+	ProcessStart string `json:"process_start,omitempty"`
+	CreatedAt    string `json:"created_at,omitempty"`
+
+	hasOwnerMetadata bool
+}
+
+type processFingerprint struct {
+	StartTime string
+}
+
+func newPendingReservation() pendingReservation {
+	reservation := pendingReservation{
+		Version:          1,
+		PID:              os.Getpid(),
+		CreatedAt:        time.Now().UTC().Format(time.RFC3339Nano),
+		hasOwnerMetadata: true,
+	}
+	if fingerprint, ok := processFingerprintForPID(reservation.PID); ok {
+		reservation.ProcessStart = fingerprint.StartTime
+	}
+	return reservation
+}
+
+func writePendingReservation(path string) error {
+	data, err := json.Marshal(newPendingReservation())
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(path, data, 0644)
+}
+
+func parsePendingReservation(data []byte) (pendingReservation, bool) {
+	text := strings.TrimSpace(string(data))
+	if text == "" {
+		return pendingReservation{}, false
+	}
+
+	var reservation pendingReservation
+	if err := json.Unmarshal([]byte(text), &reservation); err == nil && reservation.PID > 0 {
+		reservation.hasOwnerMetadata = true
+		return reservation, true
+	}
+
+	pid, err := strconv.Atoi(text)
+	if err != nil || pid <= 0 {
+		return pendingReservation{}, false
+	}
+	return pendingReservation{PID: pid}, true
+}
+
+func pendingReservationOwnedByLiveProcess(reservation pendingReservation, fingerprintForPID func(int) (processFingerprint, bool), alive func(int) bool) bool {
+	if reservation.PID <= 0 || !reservation.hasOwnerMetadata || !alive(reservation.PID) {
+		return false
+	}
+	if reservation.ProcessStart == "" {
+		return true
+	}
+	fingerprint, ok := fingerprintForPID(reservation.PID)
+	if !ok || fingerprint.StartTime == "" {
+		return true
+	}
+	return fingerprint.StartTime == reservation.ProcessStart
+}
+
+func pendingReservationPathOwnedByLiveProcess(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	reservation, ok := parsePendingReservation(data)
+	if !ok {
+		return false
+	}
+	return pendingReservationOwnedByLiveProcess(reservation, processFingerprintForPID, processAlive)
 }
 
 // clonePath returns the path where the git worktree lives.
@@ -1398,7 +1478,7 @@ func (m *Manager) AllocateName() (string, error) {
 	if err := os.MkdirAll(filepath.Join(m.rig.Path, "polecats"), 0755); err != nil {
 		return "", fmt.Errorf("creating polecats dir for reservation marker: %w", err)
 	}
-	if err := os.WriteFile(m.pendingPath(name), []byte(fmt.Sprintf("%d", os.Getpid())), 0644); err != nil {
+	if err := writePendingReservation(m.pendingPath(name)); err != nil {
 		return "", fmt.Errorf("writing reservation marker: %w", err)
 	}
 
@@ -1982,8 +2062,8 @@ func (m *Manager) ReconcilePoolWith(namesWithDirs, namesWithSessions []string) {
 // via gt commands (gt prime, gt hook, bd show, etc.) which run frequently during
 // normal operation. A stale heartbeat indicates the agent is no longer active.
 //
-// Falls back to PID signal probing when no heartbeat file exists (backward
-// compatibility for sessions started before heartbeat support was added).
+// Falls back to build-tagged PID probing when no heartbeat file exists
+// (backward compatibility for sessions started before heartbeat support was added).
 //
 // Returns true only when we can confirm the process is dead, not on transient
 // failures (gt-kncti: permission denied false positives).
@@ -2013,12 +2093,7 @@ func isSessionProcessDead(t *tmux.Tmux, sessionName string, townRoot string) boo
 		// Got a non-numeric PID — shouldn't happen, but don't kill.
 		return false
 	}
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return true
-	}
-	// On Unix, Signal(0) checks if process exists without sending a signal
-	if err := p.Signal(syscall.Signal(0)); err != nil {
+	if !processAlive(pid) {
 		return true
 	}
 	return false
@@ -2046,13 +2121,15 @@ func (m *Manager) cleanupOrphanPolecatState() {
 
 	for _, entry := range entries {
 		// Clean up stale allocation reservation markers.
-		// A .pending file older than pendingMaxAge means gt sling crashed after
-		// AllocateName but before AddWithOptions created the directory. Remove it
-		// so the name can be reallocated on the next reconcile.
+		// A .pending file older than pendingMaxAge usually means gt sling crashed
+		// after AllocateName but before AddWithOptions created the directory. Keep
+		// it only if owner metadata still matches a live process; this avoids
+		// removing a slow live reservation while reducing PID-reuse false positives.
 		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".pending") {
 			info, err := entry.Info()
-			if err == nil && time.Since(info.ModTime()) > pendingMaxAge {
-				_ = os.Remove(filepath.Join(polecatsDir, entry.Name()))
+			path := filepath.Join(polecatsDir, entry.Name())
+			if err == nil && time.Since(info.ModTime()) > pendingMaxAge && !pendingReservationPathOwnedByLiveProcess(path) {
+				_ = os.Remove(path)
 			}
 			continue
 		}
