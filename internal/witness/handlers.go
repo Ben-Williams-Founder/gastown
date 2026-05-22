@@ -741,8 +741,10 @@ func shouldNotifyMayorSlotOpen(workDir, rigName, polecatName string) (bool, stri
 	}
 
 	var status struct {
-		Verdict  string   `json:"verdict"`
-		Blockers []string `json:"blockers,omitempty"`
+		Disposition      string   `json:"disposition,omitempty"`
+		SlotOpenEligible bool     `json:"slot_open_eligible,omitempty"`
+		Verdict          string   `json:"verdict"`
+		Blockers         []string `json:"blockers,omitempty"`
 	}
 	jsonOutput := strings.TrimSpace(output)
 	if idx := strings.Index(jsonOutput, "{"); idx > 0 {
@@ -750,6 +752,16 @@ func shouldNotifyMayorSlotOpen(workDir, rigName, polecatName string) (bool, stri
 	}
 	if err := json.Unmarshal([]byte(jsonOutput), &status); err != nil {
 		return false, fmt.Sprintf("check-recovery json parse failed: %v", err)
+	}
+	if status.SlotOpenEligible || status.Verdict == "SAFE_TO_NUKE" {
+		return true, ""
+	}
+	if status.Disposition != "" {
+		reason := "check-recovery disposition=" + status.Disposition
+		if len(status.Blockers) > 0 {
+			reason += " blockers=" + strings.Join(status.Blockers, ";")
+		}
+		return false, reason
 	}
 	if status.Verdict != "SAFE_TO_NUKE" {
 		reason := "check-recovery verdict=" + status.Verdict
@@ -824,6 +836,8 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	input := polecat.SlotReuseInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupUnknown, GitCheckFailed: err != nil || fields == nil}
 	if fields != nil {
 		input.HookBead = fields.HookBead
+		input.ActiveMR = fields.ActiveMR
+		input.ActiveMRBlocks = fields.ActiveMR != ""
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
 		if fields.CleanupStatus != "" {

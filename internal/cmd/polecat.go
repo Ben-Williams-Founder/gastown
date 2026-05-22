@@ -220,16 +220,18 @@ Examples:
 
 var polecatCheckRecoveryCmd = &cobra.Command{
 	Use:   "check-recovery <rig>/<polecat>",
-	Short: "Check if polecat needs recovery vs safe to nuke",
-	Long: `Check recovery status of a polecat based on cleanup_status, active_mr, and merge queue state.
+	Short: "Check canonical polecat disposition for cleanup/reuse",
+	Long: `Check recovery status of a polecat based on canonical disposition derived from cleanup_status, active_mr, git, and merge queue state.
 
 Used by the Witness to determine appropriate cleanup action:
-  - SAFE_TO_NUKE: cleanup_status is 'clean', active_mr is terminal, AND work submitted to merge queue
-  - NEEDS_MQ_SUBMIT: git is clean but work was never submitted to the merge queue
-  - NEEDS_RECOVERY: cleanup_status, active_mr, or fallback git predicates require recovery
+	- available-clean: safe to nuke and reusable
+	- submitted-preserved: reusable/slot-open while submitted work is preserved
+	- submit-required: git is clean but work was never submitted to the merge queue
+	- recover-local: cleanup_status or fallback git predicates require recovery
+	- reconcile-metadata / blocked-unknown / active-work: fail closed until resolved
 
 This prevents accidental data loss when cleaning up dormant polecats.
-The Witness should escalate NEEDS_RECOVERY and NEEDS_MQ_SUBMIT cases to the Mayor.
+The Witness should escalate non-reusable dispositions to the Mayor.
 
 Examples:
   gt polecat check-recovery greenplace/Toast
@@ -382,17 +384,18 @@ func init() {
 
 // PolecatListItem represents a polecat in list output.
 type PolecatListItem struct {
-	Rig            string        `json:"rig"`
-	Name           string        `json:"name"`
-	State          polecat.State `json:"state"`
-	Issue          string        `json:"issue,omitempty"`
-	CleanupStatus  string        `json:"cleanup_status,omitempty"`
-	ActiveMR       string        `json:"active_mr,omitempty"`
-	Branch         string        `json:"branch,omitempty"`
-	ReuseStatus    string        `json:"reuse_status,omitempty"`
-	SessionRunning bool          `json:"session_running"`
-	Zombie         bool          `json:"zombie,omitempty"`
-	SessionName    string        `json:"session_name,omitempty"`
+	Rig            string              `json:"rig"`
+	Name           string              `json:"name"`
+	State          polecat.State       `json:"state"`
+	Issue          string              `json:"issue,omitempty"`
+	CleanupStatus  string              `json:"cleanup_status,omitempty"`
+	ActiveMR       string              `json:"active_mr,omitempty"`
+	Branch         string              `json:"branch,omitempty"`
+	Disposition    polecat.Disposition `json:"disposition,omitempty"`
+	ReuseStatus    string              `json:"reuse_status,omitempty"`
+	SessionRunning bool                `json:"session_running"`
+	Zombie         bool                `json:"zombie,omitempty"`
+	SessionName    string              `json:"session_name,omitempty"`
 }
 
 // effectivePolecatState returns the observable state used by polecat list output.
@@ -437,17 +440,30 @@ func polecatReuseStatus(state polecat.State, cleanupStatus, activeMR, branch str
 	if state != polecat.StateIdle {
 		return ""
 	}
-	status := polecat.CleanupStatus(cleanupStatus)
-	if cleanupStatus == "" || status == polecat.CleanupUnknown || status.RequiresRecovery() {
+	disposition := polecatListDisposition(state, cleanupStatus, activeMR, activeMRBlocks)
+	switch disposition {
+	case polecat.DispositionRecoverLocal, polecat.DispositionReconcileMetadata, polecat.DispositionBlockedUnknown:
 		return "idle-recovery-needed"
+	case polecat.DispositionSubmitRequired:
+		return "idle-submit-required"
 	}
-	if activeMR != "" && activeMRBlocks {
+	if disposition == polecat.DispositionSubmittedPreserved {
 		return "idle-pr-open"
 	}
 	if strings.HasPrefix(branch, "polecat/") {
 		return "idle-preserved"
 	}
 	return "idle-clean"
+}
+
+func polecatListDisposition(state polecat.State, cleanupStatus, activeMR string, activeMRBlocks bool) polecat.Disposition {
+	resolved := polecat.ResolveWorkstateDisposition(polecat.WorkstateInput{
+		State:          state,
+		CleanupStatus:  polecat.CleanupStatus(cleanupStatus),
+		ActiveMR:       activeMR,
+		ActiveMRBlocks: activeMRBlocks,
+	})
+	return resolved.Disposition
 }
 
 // getPolecatManager creates a polecat manager for the given rig.
@@ -518,6 +534,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				Issue:          p.Issue,
 				SessionRunning: running,
 			})
+			activeMRBlocks := activeMRBlocksReuse(bd, activeMR)
+			disposition := polecatListDisposition(state, cleanupStatus, activeMR, activeMRBlocks)
 			allPolecats = append(allPolecats, PolecatListItem{
 				Rig:            r.Name,
 				Name:           p.Name,
@@ -526,7 +544,8 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				CleanupStatus:  cleanupStatus,
 				ActiveMR:       activeMR,
 				Branch:         p.Branch,
-				ReuseStatus:    polecatReuseStatus(state, cleanupStatus, activeMR, p.Branch, activeMRBlocksReuse(bd, activeMR)),
+				Disposition:    disposition,
+				ReuseStatus:    polecatReuseStatus(state, cleanupStatus, activeMR, p.Branch, activeMRBlocks),
 				SessionRunning: running,
 			})
 			knownNames[p.Name] = true
@@ -1033,17 +1052,47 @@ func countPatchUniqueCommits(worktreePath, baseRef string) (int, error) {
 
 // RecoveryStatus represents whether a polecat needs recovery or is safe to nuke.
 type RecoveryStatus struct {
-	Rig           string                `json:"rig"`
-	Polecat       string                `json:"polecat"`
-	CleanupStatus polecat.CleanupStatus `json:"cleanup_status"`
-	NeedsRecovery bool                  `json:"needs_recovery"`
-	Verdict       string                `json:"verdict"` // SAFE_TO_NUKE, NEEDS_RECOVERY, or NEEDS_MQ_SUBMIT
-	Branch        string                `json:"branch,omitempty"`
-	Issue         string                `json:"issue,omitempty"`
-	MQStatus      string                `json:"mq_status,omitempty"` // "submitted", "not_submitted", "not_required", "unknown"
-	ActiveMR      string                `json:"active_mr,omitempty"`
-	Blockers      []string              `json:"blockers,omitempty"`
-	Diagnostics   []string              `json:"diagnostics,omitempty"`
+	Rig                   string                `json:"rig"`
+	Polecat               string                `json:"polecat"`
+	CleanupStatus         polecat.CleanupStatus `json:"cleanup_status"`
+	Disposition           polecat.Disposition   `json:"disposition"`
+	Reusable              bool                  `json:"reusable"`
+	SlotOpenEligible      bool                  `json:"slot_open_eligible"`
+	SafeToNuke            bool                  `json:"safe_to_nuke"`
+	NeedsMQSubmit         bool                  `json:"needs_mq_submit"`
+	NeedsRecovery         bool                  `json:"needs_recovery"`
+	CountsAgainstCapacity bool                  `json:"counts_against_capacity"`
+	Verdict               string                `json:"verdict"` // compatibility: SAFE_TO_NUKE, SUBMITTED_PRESERVED, NEEDS_RECOVERY, or NEEDS_MQ_SUBMIT
+	Branch                string                `json:"branch,omitempty"`
+	Issue                 string                `json:"issue,omitempty"`
+	MQStatus              string                `json:"mq_status,omitempty"` // "submitted", "not_submitted", "not_required", "unknown"
+	ActiveMR              string                `json:"active_mr,omitempty"`
+	Blockers              []string              `json:"blockers,omitempty"`
+	Diagnostics           []string              `json:"diagnostics,omitempty"`
+}
+
+func (s *RecoveryStatus) applyDisposition(disposition polecat.Disposition) {
+	s.Disposition = disposition
+	s.Reusable = disposition.Reusable()
+	s.SlotOpenEligible = disposition.SlotOpenEligible()
+	s.SafeToNuke = disposition.SafeToNuke()
+	s.NeedsMQSubmit = disposition.NeedsMQSubmit()
+	s.NeedsRecovery = disposition.NeedsRecovery()
+	s.CountsAgainstCapacity = disposition.CountsAgainstCapacity()
+	s.Verdict = recoveryVerdict(disposition)
+}
+
+func recoveryVerdict(disposition polecat.Disposition) string {
+	if disposition.SafeToNuke() {
+		return "SAFE_TO_NUKE"
+	}
+	if disposition == polecat.DispositionSubmittedPreserved {
+		return "SUBMITTED_PRESERVED"
+	}
+	if disposition.NeedsMQSubmit() {
+		return "NEEDS_MQ_SUBMIT"
+	}
+	return "NEEDS_RECOVERY"
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -1084,32 +1133,28 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		gitState, gitErr := getGitState(p.ClonePath)
 		if gitErr != nil {
 			status.CleanupStatus = polecat.CleanupUnknown
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
+			status.applyDisposition(polecat.DispositionBlockedUnknown)
 			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=unknown path=%s: %v", p.ClonePath, gitErr))
 		} else if gitState.Clean {
 			status.CleanupStatus = polecat.CleanupClean
-			status.NeedsRecovery = false
-			status.Verdict = "SAFE_TO_NUKE"
+			status.applyDisposition(polecat.DispositionAvailableClean)
 		} else if gitState.UnpushedCommits > 0 {
 			status.CleanupStatus = polecat.CleanupUnpushed
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
+			status.applyDisposition(polecat.DispositionRecoverLocal)
 			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=has_unpushed unpushed_commits=%d", gitState.UnpushedCommits))
 		} else if gitState.StashCount > 0 {
 			status.CleanupStatus = polecat.CleanupStash
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
+			status.applyDisposition(polecat.DispositionRecoverLocal)
 			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=has_stash stash_count=%d", gitState.StashCount))
 		} else {
 			status.CleanupStatus = polecat.CleanupUncommitted
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
+			status.applyDisposition(polecat.DispositionRecoverLocal)
 			status.Blockers = append(status.Blockers, fmt.Sprintf("git_state=has_uncommitted uncommitted_files=%d", len(gitState.UncommittedFiles)))
 		}
 	} else {
 		// Use cleanup_status from agent bead
 		status.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
+		effectiveCleanupStatus := status.CleanupStatus
 		status.ActiveMR = fields.ActiveMR
 		hookBead := agentHookBead(agentIssue, fields)
 		var gitState *GitState
@@ -1132,6 +1177,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 				loadGitState()
 			}
 			if staleCleanupStatusCanBeIgnoredForRecovery(status.CleanupStatus, beadTerminal, hookBead, fields.ActiveMR, gitState, gitErr) {
+				effectiveCleanupStatus = polecat.CleanupClean
 				status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("ignored_stale_cleanup_status=%s direct_git_state=clean assigned_bead=terminal", status.CleanupStatus))
 			} else {
 				status.Blockers = append(status.Blockers, blocker)
@@ -1143,17 +1189,27 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 				status.Blockers = append(status.Blockers, blocker)
 			}
 		}
+		activeMRBlocks := false
 		if blocker := activeMRBlocker(bd, fields.ActiveMR); blocker != "" {
-			status.Blockers = append(status.Blockers, blocker)
+			if strings.Contains(blocker, "lookup_error") || strings.Contains(blocker, "unverified") {
+				status.Blockers = append(status.Blockers, blocker)
+			} else {
+				activeMRBlocks = true
+			}
 		}
-		if len(status.Blockers) == 0 {
-			status.NeedsRecovery = false
-			status.Verdict = "SAFE_TO_NUKE"
+		if len(status.Blockers) > 0 {
+			status.applyDisposition(dispositionForRecoveryBlockers(status.Blockers))
 		} else {
-			// RequiresRecovery covers uncommitted, stash, unpushed
-			// Unknown/empty also treated conservatively
-			status.NeedsRecovery = true
-			status.Verdict = "NEEDS_RECOVERY"
+			resolved := polecat.ResolveWorkstateDisposition(polecat.WorkstateInput{
+				State:          polecat.StateIdle,
+				HookBead:       hookBead,
+				CleanupStatus:  effectiveCleanupStatus,
+				ActiveMR:       fields.ActiveMR,
+				ActiveMRBlocks: activeMRBlocks,
+				PushFailed:     fields.PushFailed,
+				MRFailed:       fields.MRFailed,
+			})
+			status.applyDisposition(resolved.Disposition)
 		}
 	}
 
@@ -1167,7 +1223,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	// on a closed bead triggered a zombie-restart loop (see aa-55d8): witness
 	// patrols kept auto-restarting the polecat to "finish" work that was already
 	// done, which just ran `gt done` again and died, over and over.
-	if status.Verdict == "SAFE_TO_NUKE" && status.Branch != "" {
+	if status.SafeToNuke && status.Branch != "" {
 		mqBd := beads.New(r.Path)
 		gitState, gitErr := getGitState(p.ClonePath)
 		hasSubmittableWork := hasSubmittableWorkForRecovery(p.ClonePath, gitState, gitErr)
@@ -1183,6 +1239,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 
 	// Human-readable output
 	fmt.Printf("%s\n\n", style.Bold.Render(fmt.Sprintf("Recovery Status: %s/%s", rigName, polecatName)))
+	fmt.Printf("  Disposition:     %s\n", status.Disposition)
 	fmt.Printf("  Cleanup Status:  %s\n", status.CleanupStatus)
 	if status.Branch != "" {
 		fmt.Printf("  Branch:          %s\n", status.Branch)
@@ -1205,6 +1262,13 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		fmt.Println()
 		fmt.Printf("  %s Work is pushed but was never submitted to the merge queue.\n", style.Warning.Render("⚠"))
 		fmt.Println("  Submit to MQ before cleanup, or the branch will be orphaned.")
+	case "SUBMITTED_PRESERVED":
+		fmt.Printf("  Verdict:         %s\n", style.Info.Render("SUBMITTED_PRESERVED"))
+		if status.MQStatus != "" {
+			fmt.Printf("  MQ Status:       %s\n", status.MQStatus)
+		}
+		fmt.Println()
+		fmt.Printf("  %s Slot is open/reusable; submitted work remains preserved.\n", style.Success.Render("✓"))
 	case "NEEDS_RECOVERY":
 		fmt.Printf("  Verdict:         %s\n", style.Error.Render("NEEDS_RECOVERY"))
 		fmt.Println()
@@ -1231,6 +1295,18 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 
 type issueShower interface {
 	Show(issueID string) (*beads.Issue, error)
+}
+
+func dispositionForRecoveryBlockers(blockers []string) polecat.Disposition {
+	for _, blocker := range blockers {
+		if strings.Contains(blocker, "unknown") || strings.Contains(blocker, "lookup_error") || strings.Contains(blocker, "unverified") {
+			return polecat.DispositionBlockedUnknown
+		}
+		if strings.Contains(blocker, "<missing>") {
+			return polecat.DispositionReconcileMetadata
+		}
+	}
+	return polecat.DispositionRecoverLocal
 }
 
 func cleanupStatusBlocker(status polecat.CleanupStatus) string {
@@ -1416,16 +1492,17 @@ func applyMQCheck(status *RecoveryStatus, bd mrFinder, beadTerminal, hasSubmitta
 	if mrErr != nil {
 		// Can't verify MQ — be conservative
 		status.MQStatus = "unknown"
+		status.applyDisposition(polecat.DispositionBlockedUnknown)
 		return
 	}
 	if mr != nil {
 		status.MQStatus = "submitted"
+		status.applyDisposition(polecat.DispositionSubmittedPreserved)
 		return
 	}
 	// Work was pushed but never entered the merge queue
 	status.MQStatus = "not_submitted"
-	status.NeedsRecovery = true
-	status.Verdict = "NEEDS_MQ_SUBMIT"
+	status.applyDisposition(polecat.DispositionSubmitRequired)
 }
 
 func runPolecatGC(cmd *cobra.Command, args []string) error {

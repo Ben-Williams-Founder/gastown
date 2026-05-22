@@ -75,9 +75,19 @@ func TestShouldNotifyMayorSlotOpenRequiresSafeRecovery(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			name:   "slot-open disposition notifies",
+			output: `{"disposition":"submitted-preserved","slot_open_eligible":true,"verdict":"SUBMITTED_PRESERVED"}`,
+			wantOK: true,
+		},
+		{
 			name:   "warning-prefixed json notifies",
 			output: "warning: stale binary\n" + `{"verdict":"SAFE_TO_NUKE"}`,
 			wantOK: true,
+		},
+		{
+			name:    "blocked disposition suppresses",
+			output:  `{"disposition":"blocked-unknown","verdict":"NEEDS_RECOVERY","blockers":["git_state=unknown"]}`,
+			wantMsg: "blocked-unknown",
 		},
 		{
 			name:    "needs recovery suppresses",
