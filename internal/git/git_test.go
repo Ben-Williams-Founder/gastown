@@ -2645,6 +2645,41 @@ func TestBranchPushedToRemote_RemoteAheadRequiresReconcile(t *testing.T) {
 	}
 }
 
+func TestBranchPushEvidenceRemoteBranchWithMissingBaseKeepsBranchWork(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/missing-base"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "missing-base.go"), []byte("package missingbase\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("missing-base.go"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("missing base work"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	runGit(t, localDir, "update-ref", "-d", "refs/remotes/origin/"+mainBranch)
+	runGit(t, localDir, "update-ref", "-d", "refs/remotes/origin/HEAD")
+
+	evidence, err := g.BranchPushEvidence(branch, "origin", "")
+	if err != nil {
+		t.Fatalf("BranchPushEvidence: %v", err)
+	}
+	if evidence.UnpushedCommits != 0 || !evidence.HasBranchWork {
+		t.Fatalf("BranchPushEvidence = unpushed %d, branch work %v; want pushed branch preserved for MQ check", evidence.UnpushedCommits, evidence.HasBranchWork)
+	}
+}
+
 func TestUnpushedCommitsPrefersExactRemoteBranchOverUpstream(t *testing.T) {
 	localDir, _, mainBranch := initTestRepoWithRemote(t)
 	g := NewGit(localDir)

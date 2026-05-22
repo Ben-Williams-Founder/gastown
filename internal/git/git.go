@@ -2147,8 +2147,10 @@ func (g *Git) BranchPushEvidence(localBranch, remote, baseRef string) (*BranchPu
 	evidence.RemoteBranchTip = remoteTip
 	evidence.RemoteBranchExists = remoteTip != ""
 
+	baseEvidenceKnown := false
 	if baseRef != "" {
 		if unmerged, err := g.cherryUnmergedCount(baseRef, "HEAD"); err == nil {
+			baseEvidenceKnown = true
 			evidence.HasBranchWork = unmerged > 0
 		}
 	}
@@ -2182,8 +2184,14 @@ func (g *Git) BranchPushEvidence(localBranch, remote, baseRef string) (*BranchPu
 
 	if baseRef != "" && !evidence.HasBranchWork {
 		if unmerged, err := g.cherryUnmergedCount(baseRef, remoteTip); err == nil {
+			baseEvidenceKnown = true
 			evidence.HasBranchWork = unmerged > 0
 		}
+	}
+	if !baseEvidenceKnown {
+		// A pushed branch without trustworthy base evidence is still submittable
+		// work. Treating it as no-op would let cleanup skip the MQ recovery check.
+		evidence.HasBranchWork = true
 	}
 
 	return evidence, nil
