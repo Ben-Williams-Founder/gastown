@@ -39,7 +39,7 @@ func TestCreateBatchConvoy_CreatesOneConvoyTrackingAllBeads(t *testing.T) {
 
 	// Stub bd: log all commands. create and dep add succeed.
 	bdScript := `#!/bin/sh
-echo "CMD:$*" >> "` + logPath + `"
+	echo "CMD:$*|BEADS_DIR:${BEADS_DIR:-}" >> "` + logPath + `"
 cmd="$1"
 if [ "$cmd" = "--allow-stale" ]; then
   shift || true
@@ -63,6 +63,7 @@ exit 0
 
 	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", binDir+":"+origPath)
+	t.Setenv("BEADS_DIR", filepath.Join(townRoot, "poison", ".beads"))
 
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -96,6 +97,12 @@ exit 0
 	for _, line := range logLines {
 		if strings.Contains(line, "CMD:create") {
 			createCount++
+			if strings.Contains(line, "--force") {
+				t.Fatalf("convoy create should not use --force for hq-cv-* ID:\n%s", string(logBytes))
+			}
+			if !strings.Contains(line, "BEADS_DIR:"+townBeads) {
+				t.Fatalf("convoy create should ignore ambient BEADS_DIR and target town beads %q:\n%s", townBeads, string(logBytes))
+			}
 		}
 	}
 	if createCount != 1 {

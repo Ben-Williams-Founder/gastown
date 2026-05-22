@@ -1415,6 +1415,21 @@ func (b *Beads) CreateWithID(id string, opts CreateOptions) (*Issue, error) {
 		return nil, fmt.Errorf("refusing to create bead: %w (got %q)", ErrFlagTitle, opts.Title)
 	}
 
+	if !b.noRoute {
+		currentDir := b.getResolvedBeadsDir()
+		targetDir := ResolveRoutingTarget(b.getTownRoot(), id, currentDir)
+		if targetDir != "" && targetDir != currentDir {
+			bdForCreate := &Beads{
+				workDir:    b.workDir,
+				beadsDir:   targetDir,
+				serverPort: b.serverPort,
+				isolated:   b.isolated,
+				townRoot:   b.townRoot,
+			}
+			return bdForCreate.CreateWithID(id, opts)
+		}
+	}
+
 	args := []string{"create", "--json", "--id=" + id}
 	if NeedsForceForID(id) {
 		args = append(args, "--force")

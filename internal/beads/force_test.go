@@ -10,9 +10,9 @@ func TestNeedsForceForID(t *testing.T) {
 		{id: "", want: false},
 		{id: "hq-mayor", want: false},
 		{id: "gt-abc123", want: false},
-		{id: "hq-mayor-role", want: true},
-		{id: "st-stockdrop-polecat-nux", want: true},
-		{id: "hq-cv-abc", want: true},
+		{id: "hq-mayor-role", want: false},
+		{id: "st-stockdrop-polecat-nux", want: false},
+		{id: "hq-cv-abc", want: false},
 	}
 
 	for _, tc := range tests {
