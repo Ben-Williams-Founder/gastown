@@ -2187,7 +2187,12 @@ func runPolecatPrune(cmd *cobra.Command, args []string) error {
 			if polecatPruneDryRun {
 				fmt.Printf("  Would delete remote: %s\n", style.Dim.Render(branch))
 			} else {
-				if delErr := repoGit.DeleteRemoteBranch("origin", branch); delErr != nil {
+				openPR, openPRErr := repoGit.OpenPRExists(branch)
+				if openPRErr != nil {
+					fmt.Printf("  %s remote %s: skipping delete; could not verify PR state: %v\n", style.Warning.Render("⚠"), branch, openPRErr)
+				} else if openPR {
+					fmt.Printf("  %s remote %s: skipping delete; open PR exists\n", style.Dim.Render("○"), branch)
+				} else if delErr := repoGit.DeleteRemoteBranch("origin", branch); delErr != nil {
 					fmt.Printf("  %s remote %s: %v\n", style.Warning.Render("⚠"), branch, delErr)
 				} else {
 					fmt.Printf("  %s deleted remote %s\n", style.Success.Render("✓"), branch)
