@@ -26,4 +26,12 @@ Scope: audit the Gas Town Dolt dependency from the previously pinned/released fl
 
 - `dolt version`: local host still reports `dolt version 1.84.0`, so the new `CheckDolt` gate should classify this host as too old until the system binary is upgraded.
 - `gt dolt status`: server was running on port `3307`, query latency `0s`, `4 / 1000` connections, with one pre-existing orphan database (`testrig`) reported for cleanup.
+- `gt scheduler status`: scheduler active, 3 scheduled beads, 1 ready, 3 active polecats, and 9 free slots of 25.
+- `go test ./internal/deps ./internal/doctor ./internal/testutil`: passed.
+- Focused Dolt command tests under `./internal/cmd`: passed.
+- `go build ./cmd/gt`: passed.
+- `gh api repos/dolthub/dolt/releases/tags/v2.0.7 --jq '.assets[].name'`: verified the `install.sh` and `dolt-linux-amd64.tar.gz` release assets used by CI/Docker are present.
+- `docker manifest inspect docker.io/dolthub/dolt-sql-server:2.0.7`: verified the pinned testcontainers image exists for linux/amd64 and linux/arm64. The unqualified `dolthub/dolt-sql-server:2.0.7` manifest check fails in this environment because short-name resolution requires an interactive prompt; CI/testcontainers use Docker Hub resolution for the same image name.
 - Release-note sources checked with `gh api repos/dolthub/dolt/releases/tags/v2.0.7`, `v2.0.0`, and release entries for `v1.85.0`, `v1.86.0`, `v1.86.5`, `v2.0.1` through `v2.0.6`.
+
+Non-blocking note: an intentionally broad `go test ./internal/cmd -run 'TestDolt|TestInstall.*Dolt|Test.*Dolt'` selection also matched `TestSlingSetsDoltAutoCommitOff` and failed because fixture bead `gt-test456` was absent. A focused Dolt command test selection passed.
