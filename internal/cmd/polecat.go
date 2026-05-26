@@ -1075,8 +1075,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		hookBead := agentHookBead(agentIssue, fields)
 		hookSafe, hookTerminal, hookBlocker := hookBeadSafeForCleanup(bd, hookBead)
 		workTerminal := beadTerminal || hookTerminal
-		activeMRReason := activeMRBlocker(bd, fields.ActiveMR)
-		activeMRSafe := activeMRReason == ""
+		sourceHint := agentSourceIssueHint(status.Issue, fields)
 		var gitState *GitState
 		var gitErr error
 		gitStateLoaded := false
@@ -1098,7 +1097,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			gitSafe := gitErr == nil && gitState != nil && gitState.Clean
 			activeMRAssessment = polecat.AssessActiveMR(bd, polecat.ActiveMRInput{
 				ActiveMR:        fields.ActiveMR,
-				SourceIssueHint: agentSourceIssueHint(status.Issue, fields),
+				SourceIssueHint: sourceHint,
 				RequireGitSafe:  true,
 				GitSafe:         gitSafe,
 			})
@@ -1107,42 +1106,29 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 			}
 			if activeMRAssessment.SourceTerminal {
 				beadTerminal = true
+				workTerminal = true
 			}
 		}
+		activeMRSafe := !activeMRAssessment.Pending
 		if blocker := cleanupStatusBlockerForRecovery(status.CleanupStatus, partialSpawn); blocker != "" {
 			if status.CleanupStatus == polecat.CleanupUnpushed {
 				loadGitState()
 			}
-<<<<<<< HEAD
 			if staleCleanupStatusCanBeIgnoredForRecovery(status.CleanupStatus, workTerminal, hookSafe, activeMRSafe, gitState, gitErr) {
 				status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("ignored_stale_cleanup_status=%s direct_git_state=clean work_ref=terminal", status.CleanupStatus))
-=======
-			if staleCleanupStatusCanBeIgnoredForRecovery(status.CleanupStatus, beadTerminal, hookBead, activeMRAssessment.Pending, gitState, gitErr) {
-				status.Diagnostics = append(status.Diagnostics, fmt.Sprintf("ignored_stale_cleanup_status=%s direct_git_state=clean assigned_bead=terminal", status.CleanupStatus))
->>>>>>> e15c4ba5 (WIP: checkpoint (auto))
 			} else {
 				status.Blockers = append(status.Blockers, blocker)
 			}
 		}
-<<<<<<< HEAD
 		loadGitState()
 		if blocker := recoveryGitStateBlocker(p.ClonePath, gitState, gitErr); blocker != "" {
-=======
-		if status.CleanupStatus == "" || status.CleanupStatus == polecat.CleanupUnknown {
-			loadGitState()
-			if blocker := recoveryGitStateBlocker(p.ClonePath, gitState, gitErr); blocker != "" {
-				status.Blockers = append(status.Blockers, blocker)
-			}
-		}
-		if blocker := activeMRAssessment.Reason; activeMRAssessment.Pending && blocker != "" {
->>>>>>> e15c4ba5 (WIP: checkpoint (auto))
 			status.Blockers = append(status.Blockers, blocker)
 		}
 		if hookBlocker != "" {
 			status.Blockers = append(status.Blockers, hookBlocker)
 		}
-		if activeMRReason != "" {
-			status.Blockers = append(status.Blockers, activeMRReason)
+		if blocker := activeMRAssessment.Reason; activeMRAssessment.Pending && blocker != "" {
+			status.Blockers = append(status.Blockers, blocker)
 		}
 		if len(status.Blockers) == 0 {
 			status.NeedsRecovery = false
@@ -1271,25 +1257,16 @@ func agentHookBead(agentIssue *beads.Issue, fields *beads.AgentFields) string {
 	return ""
 }
 
-<<<<<<< HEAD
 func staleCleanupStatusCanBeIgnoredForRecovery(status polecat.CleanupStatus, workTerminal, hookSafe, activeMRSafe bool, gitState *GitState, gitErr error) bool {
 	return status == polecat.CleanupUnpushed &&
 		workTerminal &&
 		hookSafe &&
 		activeMRSafe &&
-=======
-func staleCleanupStatusCanBeIgnoredForRecovery(status polecat.CleanupStatus, beadTerminal bool, hookBead string, activeMRPending bool, gitState *GitState, gitErr error) bool {
-	return status == polecat.CleanupUnpushed &&
-		beadTerminal &&
-		hookBead == "" &&
-		!activeMRPending &&
->>>>>>> e15c4ba5 (WIP: checkpoint (auto))
 		gitErr == nil &&
 		gitState != nil &&
 		gitState.Clean
 }
 
-<<<<<<< HEAD
 func hookBeadSafeForCleanup(bd issueShower, hookBead string) (safe bool, terminal bool, blocker string) {
 	if hookBead == "" {
 		return true, false, ""
@@ -1354,7 +1331,8 @@ func cleanupStatusReconcileCandidate(status *RecoveryStatus, p *polecat.Polecat,
 		return previous, false
 	}
 	return previous, true
-=======
+}
+
 func agentSourceIssueHint(currentIssue string, fields *beads.AgentFields) string {
 	if currentIssue != "" {
 		return currentIssue
@@ -1366,7 +1344,6 @@ func agentSourceIssueHint(currentIssue string, fields *beads.AgentFields) string
 		return fields.LastSourceIssue
 	}
 	return fields.HookBead
->>>>>>> e15c4ba5 (WIP: checkpoint (auto))
 }
 
 func partialSpawnWithoutDurableHook(bd issueShower, fields *beads.AgentFields, assignee, currentIssue string) (bool, string) {
