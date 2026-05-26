@@ -2227,6 +2227,14 @@ func TestCleanExcludingRuntime(t *testing.T) {
 			want: false,
 		},
 		{
+			name: "runtime path conflict blocks",
+			s: UncommittedWorkStatus{
+				HasUncommittedChanges: true,
+				UnmergedFiles:         []string{".opencode/plugins/gastown.js"},
+			},
+			want: false,
+		},
+		{
 			name: "mix of runtime and real",
 			s: UncommittedWorkStatus{
 				HasUncommittedChanges: true,
@@ -2350,23 +2358,53 @@ func TestRuntimeArtifactPaths(t *testing.T) {
 	}
 }
 
-func TestPorcelainStatusPathUsesRenameCopyDestination(t *testing.T) {
+func TestParsePorcelainStatusEntryPreservesRenameCopySourceAndConflict(t *testing.T) {
 	tests := []struct {
-		name string
-		code string
-		path string
-		want string
+		name       string
+		line       string
+		wantCode   string
+		wantSource string
+		wantPath   string
+		wantPaths  []string
+		unmerged   bool
 	}{
-		{name: "rename", code: "R ", path: "old.txt -> new.txt", want: "new.txt"},
-		{name: "copy", code: "C ", path: "old.txt -> copied.txt", want: "copied.txt"},
-		{name: "unmerged", code: "UU", path: "conflict.txt", want: "conflict.txt"},
-		{name: "modified", code: " M", path: "src/main.go", want: "src/main.go"},
+		{
+			name:       "rename",
+			line:       "R  README.md -> .opencode/plugins/gastown.js",
+			wantCode:   "R ",
+			wantSource: "README.md",
+			wantPath:   ".opencode/plugins/gastown.js",
+			wantPaths:  []string{"README.md", ".opencode/plugins/gastown.js"},
+		},
+		{
+			name:       "copy",
+			line:       "C  README.md -> .opencode/plugins/gastown.js",
+			wantCode:   "C ",
+			wantSource: "README.md",
+			wantPath:   ".opencode/plugins/gastown.js",
+			wantPaths:  []string{"README.md", ".opencode/plugins/gastown.js"},
+		},
+		{
+			name:      "unmerged",
+			line:      "UU .opencode/plugins/gastown.js",
+			wantCode:  "UU",
+			wantPath:  ".opencode/plugins/gastown.js",
+			wantPaths: []string{".opencode/plugins/gastown.js"},
+			unmerged:  true,
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := porcelainStatusPath(tt.code, tt.path); got != tt.want {
-				t.Fatalf("porcelainStatusPath(%q, %q) = %q, want %q", tt.code, tt.path, got, tt.want)
+			got, ok := parsePorcelainStatusEntry(tt.line)
+			if !ok {
+				t.Fatal("parsePorcelainStatusEntry returned ok=false")
+			}
+			if got.Code != tt.wantCode || got.SourcePath != tt.wantSource || got.Path != tt.wantPath || got.Unmerged != tt.unmerged {
+				t.Fatalf("parsePorcelainStatusEntry(%q) = %+v", tt.line, got)
+			}
+			if paths := got.paths(); strings.Join(paths, "\x00") != strings.Join(tt.wantPaths, "\x00") {
+				t.Fatalf("paths = %v, want %v", paths, tt.wantPaths)
 			}
 		})
 	}
@@ -2384,15 +2422,16 @@ func TestCheckUncommittedWorkCapturesPorcelainRenameAndUnmergedPaths(t *testing.
 		if !status.HasUncommittedChanges {
 			t.Fatal("rename should mark worktree dirty")
 		}
-		if got := status.NonRuntimePaths(); len(got) != 1 || got[0] != "renamed.md" {
-			t.Fatalf("NonRuntimePaths = %v, want [renamed.md]", got)
+		want := []string{"README.md", "renamed.md"}
+		if got := status.NonRuntimePaths(); strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+			t.Fatalf("NonRuntimePaths = %v, want %v", got, want)
 		}
 		if status.CleanExcludingRuntime() {
 			t.Fatal("rename to real path must block runtime-excluding clean check")
 		}
 	})
 
-	t.Run("rename to runtime path is ignored by runtime filter", func(t *testing.T) {
+	t.Run("rename from real path to runtime path blocks", func(t *testing.T) {
 		dir := initTestRepo(t)
 		if err := os.MkdirAll(filepath.Join(dir, ".opencode", "plugins"), 0755); err != nil {
 			t.Fatalf("mkdir opencode plugins: %v", err)
@@ -2406,11 +2445,73 @@ func TestCheckUncommittedWorkCapturesPorcelainRenameAndUnmergedPaths(t *testing.
 		if !status.HasUncommittedChanges {
 			t.Fatal("runtime rename should still mark raw worktree dirty")
 		}
+		if got := status.NonRuntimePaths(); len(got) != 1 || got[0] != "README.md" {
+			t.Fatalf("NonRuntimePaths = %v, want [README.md]", got)
+		}
+		if status.CleanExcludingRuntime() {
+			t.Fatal("real source renamed to runtime destination must block runtime-excluding clean check")
+		}
+	})
+
+	t.Run("rename from runtime path to runtime path is ignored by runtime filter", func(t *testing.T) {
+		dir := initTestRepo(t)
+		if err := os.MkdirAll(filepath.Join(dir, ".opencode", "plugins"), 0755); err != nil {
+			t.Fatalf("mkdir opencode plugins: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".opencode", "plugins", "old.js"), []byte("runtime\n"), 0644); err != nil {
+			t.Fatalf("write runtime source: %v", err)
+		}
+		runGitTestCmd(t, dir, "add", ".opencode/plugins/old.js")
+		runGitTestCmd(t, dir, "commit", "-m", "add tracked runtime source")
+		runGitTestCmd(t, dir, "mv", ".opencode/plugins/old.js", ".opencode/plugins/gastown.js")
+
+		status, err := NewGit(dir).CheckUncommittedWork()
+		if err != nil {
+			t.Fatalf("CheckUncommittedWork: %v", err)
+		}
+		if !status.HasUncommittedChanges {
+			t.Fatal("runtime rename should still mark raw worktree dirty")
+		}
 		if got := status.NonRuntimePaths(); len(got) != 0 {
-			t.Fatalf("NonRuntimePaths = %v, want none for runtime destination", got)
+			t.Fatalf("NonRuntimePaths = %v, want none for runtime-only rename", got)
 		}
 		if !status.CleanExcludingRuntime() {
-			t.Fatal("runtime destination should be clean excluding runtime")
+			t.Fatal("runtime-only rename should be clean excluding runtime")
+		}
+	})
+
+	t.Run("unmerged runtime conflict blocks", func(t *testing.T) {
+		dir := initTestRepo(t)
+		runGitTestCmd(t, dir, "branch", "-M", "main")
+		if err := os.MkdirAll(filepath.Join(dir, ".opencode", "plugins"), 0755); err != nil {
+			t.Fatalf("mkdir opencode plugins: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".opencode", "plugins", "gastown.js"), []byte("base\n"), 0644); err != nil {
+			t.Fatalf("write base runtime conflict file: %v", err)
+		}
+		runGitTestCmd(t, dir, "add", ".opencode/plugins/gastown.js")
+		runGitTestCmd(t, dir, "commit", "-m", "add runtime conflict base")
+		runGitTestCmd(t, dir, "switch", "-c", "side")
+		if err := os.WriteFile(filepath.Join(dir, ".opencode", "plugins", "gastown.js"), []byte("side\n"), 0644); err != nil {
+			t.Fatalf("write side runtime conflict file: %v", err)
+		}
+		runGitTestCmd(t, dir, "commit", "-am", "side runtime change")
+		runGitTestCmd(t, dir, "switch", "main")
+		if err := os.WriteFile(filepath.Join(dir, ".opencode", "plugins", "gastown.js"), []byte("main\n"), 0644); err != nil {
+			t.Fatalf("write main runtime conflict file: %v", err)
+		}
+		runGitTestCmd(t, dir, "commit", "-am", "main runtime change")
+		runGitTestCmdWantFailure(t, dir, "merge", "side")
+
+		status, err := NewGit(dir).CheckUncommittedWork()
+		if err != nil {
+			t.Fatalf("CheckUncommittedWork: %v", err)
+		}
+		if got := status.NonRuntimePaths(); len(got) != 1 || got[0] != ".opencode/plugins/gastown.js" {
+			t.Fatalf("NonRuntimePaths = %v, want [.opencode/plugins/gastown.js]", got)
+		}
+		if status.CleanExcludingRuntime() {
+			t.Fatal("runtime unmerged conflict must block runtime-excluding clean check")
 		}
 	})
 

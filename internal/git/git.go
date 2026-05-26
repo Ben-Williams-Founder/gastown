@@ -1076,6 +1076,14 @@ type GitStatus struct {
 	Added     []string
 	Deleted   []string
 	Untracked []string
+	Unmerged  []string
+}
+
+type porcelainStatusEntry struct {
+	Code       string
+	Path       string
+	SourcePath string
+	Unmerged   bool
 }
 
 // Status returns the current git status.
@@ -1098,19 +1106,20 @@ func (g *Git) Status() (*GitStatus, error) {
 
 	status.Clean = false
 	for _, line := range strings.Split(out, "\n") {
-		if len(line) < 3 {
+		entry, ok := parsePorcelainStatusEntry(line)
+		if !ok {
 			continue
 		}
-		code := line[:2]
-		file := porcelainStatusPath(code, line[3:])
+		code := entry.Code
+		file := entry.Path
 
 		switch {
+		case entry.Unmerged:
+			status.Unmerged = append(status.Unmerged, entry.paths()...)
 		case strings.Contains(code, "?"):
 			status.Untracked = append(status.Untracked, file)
 		case strings.ContainsAny(code, "RC"):
-			status.Modified = append(status.Modified, file)
-		case isUnmergedPorcelainStatus(code):
-			status.Modified = append(status.Modified, file)
+			status.Modified = append(status.Modified, entry.paths()...)
 		case strings.Contains(code, "M"):
 			status.Modified = append(status.Modified, file)
 		case strings.Contains(code, "A"):
@@ -1129,20 +1138,41 @@ func (g *Git) Status() (*GitStatus, error) {
 
 	// Recheck clean: if all entries were skip-worktree deletions, we're actually clean.
 	if len(status.Modified) == 0 && len(status.Added) == 0 &&
-		len(status.Deleted) == 0 && len(status.Untracked) == 0 {
+		len(status.Deleted) == 0 && len(status.Untracked) == 0 && len(status.Unmerged) == 0 {
 		status.Clean = true
 	}
 
 	return status, nil
 }
 
-func porcelainStatusPath(code, path string) string {
-	if strings.ContainsAny(code, "RC") {
-		if idx := strings.LastIndex(path, " -> "); idx >= 0 {
-			return path[idx+4:]
-		}
+func parsePorcelainStatusEntry(line string) (porcelainStatusEntry, bool) {
+	if len(line) < 3 {
+		return porcelainStatusEntry{}, false
 	}
-	return path
+
+	entry := porcelainStatusEntry{
+		Code:     line[:2],
+		Path:     line[3:],
+		Unmerged: isUnmergedPorcelainStatus(line[:2]),
+	}
+	if strings.ContainsAny(entry.Code, "RC") {
+		entry.SourcePath, entry.Path = porcelainRenameCopyPaths(entry.Path)
+	}
+	return entry, true
+}
+
+func (e porcelainStatusEntry) paths() []string {
+	if e.SourcePath == "" || e.SourcePath == e.Path {
+		return []string{e.Path}
+	}
+	return []string{e.SourcePath, e.Path}
+}
+
+func porcelainRenameCopyPaths(path string) (string, string) {
+	if idx := strings.LastIndex(path, " -> "); idx >= 0 {
+		return path[:idx], path[idx+4:]
+	}
+	return "", path
 }
 
 func isUnmergedPorcelainStatus(code string) bool {
@@ -2532,11 +2562,12 @@ type UncommittedWorkStatus struct {
 	// Details for error messages
 	ModifiedFiles  []string
 	UntrackedFiles []string
+	UnmergedFiles  []string
 }
 
 // Clean returns true if there is no uncommitted work.
 func (s *UncommittedWorkStatus) Clean() bool {
-	return !s.HasUncommittedChanges && s.StashCount == 0 && s.UnpushedCommits == 0
+	return !s.HasUncommittedChanges && s.StashCount == 0 && s.UnpushedCommits == 0 && len(s.UnmergedFiles) == 0
 }
 
 // CleanExcludingBeads returns true if the only uncommitted changes are .beads/ files.
@@ -2544,7 +2575,7 @@ func (s *UncommittedWorkStatus) Clean() bool {
 // across worktrees and shouldn't block cleanup.
 func (s *UncommittedWorkStatus) CleanExcludingBeads() bool {
 	// Stashes and unpushed commits always count as uncommitted work
-	if s.StashCount > 0 || s.UnpushedCommits > 0 {
+	if s.StashCount > 0 || s.UnpushedCommits > 0 || len(s.UnmergedFiles) > 0 {
 		return false
 	}
 
@@ -2627,6 +2658,7 @@ func (s *UncommittedWorkStatus) RuntimeArtifactPaths() []string {
 // still blocking on real source changes.
 func (s *UncommittedWorkStatus) NonRuntimePaths() []string {
 	var paths []string
+	paths = append(paths, s.UnmergedFiles...)
 	for _, f := range append(append([]string{}, s.ModifiedFiles...), s.UntrackedFiles...) {
 		if !isGasTownRuntimePath(f) {
 			paths = append(paths, f)
@@ -2645,6 +2677,10 @@ func (s *UncommittedWorkStatus) NonRuntimePaths() []string {
 // survive worktree deletion — both are handled separately and shouldn't block
 // completion on runtime-only dirt (gas-7vg).
 func (s *UncommittedWorkStatus) CleanExcludingRuntime() bool {
+	if len(s.UnmergedFiles) > 0 {
+		return false
+	}
+
 	for _, f := range s.ModifiedFiles {
 		if !isGasTownRuntimePath(f) {
 			return false
@@ -2664,7 +2700,10 @@ func (s *UncommittedWorkStatus) CleanExcludingRuntime() bool {
 func (s *UncommittedWorkStatus) String() string {
 	var issues []string
 	if s.HasUncommittedChanges {
-		issues = append(issues, fmt.Sprintf("%d uncommitted change(s)", len(s.ModifiedFiles)+len(s.UntrackedFiles)))
+		issues = append(issues, fmt.Sprintf("%d uncommitted change(s)", len(s.ModifiedFiles)+len(s.UntrackedFiles)+len(s.UnmergedFiles)))
+	}
+	if len(s.UnmergedFiles) > 0 {
+		issues = append(issues, fmt.Sprintf("unmerged: %s", strings.Join(s.UnmergedFiles, ", ")))
 	}
 	if s.StashCount > 0 {
 		issues = append(issues, fmt.Sprintf("%d stash(es)", s.StashCount))
@@ -2691,6 +2730,7 @@ func (g *Git) CheckUncommittedWork() (*UncommittedWorkStatus, error) {
 	status.ModifiedFiles = append(gitStatus.Modified, gitStatus.Added...)
 	status.ModifiedFiles = append(status.ModifiedFiles, gitStatus.Deleted...)
 	status.UntrackedFiles = gitStatus.Untracked
+	status.UnmergedFiles = gitStatus.Unmerged
 
 	// Check stashes
 	stashCount, err := g.StashCount()
