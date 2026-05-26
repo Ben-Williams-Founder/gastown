@@ -2247,6 +2247,83 @@ func TestInitRig_InvalidCharacters(t *testing.T) {
 	}
 }
 
+func TestIssuePrefixForRigInit_PrefersRoutes(t *testing.T) {
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routes := []byte(`{"prefix":"tr-","path":"testrig/mayor/rig"}` + "\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), routes, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := issuePrefixForRigInit(townRoot, "testrig"); got != "tr" {
+		t.Fatalf("issuePrefixForRigInit() = %q, want tr", got)
+	}
+}
+
+func TestIssuePrefixForRigInit_PrefersRigsConfigBeforeFallback(t *testing.T) {
+	townRoot := t.TempDir()
+	mayorDir := filepath.Join(townRoot, "mayor")
+	if err := os.MkdirAll(mayorDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	rigsJSON := []byte(`{"version":1,"rigs":{"testrig":{"beads":{"prefix":"tc-"}}}}`)
+	if err := os.WriteFile(filepath.Join(mayorDir, "rigs.json"), rigsJSON, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := issuePrefixForRigInit(townRoot, "testrig"); got != "tc" {
+		t.Fatalf("issuePrefixForRigInit() = %q, want tc", got)
+	}
+}
+
+func TestIssuePrefixForRigInit_FallsBackToRigName(t *testing.T) {
+	townRoot := t.TempDir()
+
+	if got := issuePrefixForRigInit(townRoot, "newrig"); got != "newrig" {
+		t.Fatalf("issuePrefixForRigInit() = %q, want newrig", got)
+	}
+}
+
+func TestInitRigSeedsIssuePrefixEmbedded(t *testing.T) {
+	if _, err := exec.LookPath("dolt"); err != nil {
+		t.Skip("dolt binary not available")
+	}
+
+	townRoot := t.TempDir()
+	beadsDir := filepath.Join(townRoot, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	routes := []byte(`{"prefix":"tr-","path":"testrig/mayor/rig"}` + "\n")
+	if err := os.WriteFile(filepath.Join(beadsDir, "routes.jsonl"), routes, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, created, err := InitRig(townRoot, "testrig")
+	if err != nil {
+		if strings.Contains(err.Error(), "initializing Dolt database") {
+			t.Skipf("dolt init unavailable in test environment: %v", err)
+		}
+		t.Fatalf("InitRig: %v", err)
+	}
+	if !created {
+		t.Fatal("InitRig created = false, want true")
+	}
+
+	cmd := exec.Command("dolt", "sql", "-q", "SELECT value FROM config WHERE `key` = 'issue_prefix'")
+	cmd.Dir = RigDatabaseDir(townRoot, "testrig")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("query issue_prefix: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "tr") {
+		t.Fatalf("issue_prefix query missing tr:\n%s", out)
+	}
+}
+
 // =============================================================================
 // Catalog race condition tests (isDoltRetryableError coverage)
 // =============================================================================
