@@ -2207,10 +2207,13 @@ func DiscoverCompletions(bd *BdCli, workDir, rigName string, router *mail.Router
 		// Route based on exit type and MR presence
 		processDiscoveredCompletion(bd, workDir, rigName, payload, &discovery)
 
-		// Clear completion metadata to prevent re-processing next cycle
-		if err := clearCompletionMetadata(bd, workDir, agentBeadID); err != nil {
-			result.Errors = append(result.Errors,
-				fmt.Errorf("clearing completion metadata for %s: %w", polecatName, err))
+		// Clear completion metadata only after successful processing. If cleanup
+		// wisp creation/update failed, leave metadata for the next patrol retry.
+		if discovery.Error == nil {
+			if err := clearCompletionMetadata(bd, workDir, agentBeadID); err != nil {
+				result.Errors = append(result.Errors,
+					fmt.Errorf("clearing completion metadata for %s: %w", polecatName, err))
+			}
 		}
 
 		result.Discovered = append(result.Discovered, discovery)

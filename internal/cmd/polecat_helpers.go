@@ -136,21 +136,20 @@ func checkPolecatSafety(target polecatTarget) *SafetyCheckResult {
 		sourceHint := agentSourceIssueHint(currentIssue, fields)
 		hookBead := agentHookBead(agentIssue, fields)
 		var gitState *GitState
-		var gitErr error
 		gitStateLoaded := false
 		loadGitState := func() {
 			if gitStateLoaded || infoErr != nil || polecatInfo == nil {
 				return
 			}
-			gitState, gitErr = getGitState(polecatInfo.ClonePath)
+			gitState, _ = getGitState(polecatInfo.ClonePath)
 			result.GitState = gitState
 			gitStateLoaded = true
 		}
 		activeMRAssessment := polecat.ActiveMRAssessment{}
 		if fields.ActiveMR != "" {
 			loadGitState()
-			gitSafe := gitErr == nil && gitState != nil && gitState.Clean
-			if !gitSafe && polecatInfo != nil {
+			gitSafe := false
+			if polecatInfo != nil {
 				gitSafe = activeMRGitSafeForWorktree(polecatInfo.ClonePath)
 			}
 			activeMRAssessment = polecat.AssessActiveMR(bd, polecat.ActiveMRInput{ActiveMR: fields.ActiveMR, SourceIssueHint: sourceHint, RequireGitSafe: true, GitSafe: gitSafe})
@@ -169,8 +168,8 @@ func checkPolecatSafety(target polecatTarget) *SafetyCheckResult {
 			if result.CleanupStatus == polecat.CleanupUnpushed {
 				loadGitState()
 			}
-			gitSafe := gitErr == nil && gitState != nil && gitState.Clean
-			if !gitSafe && polecatInfo != nil {
+			gitSafe := false
+			if polecatInfo != nil {
 				gitSafe = activeMRGitSafeForWorktree(polecatInfo.ClonePath)
 			}
 			if staleCleanupStatusCanBeIgnoredForRecovery(result.CleanupStatus, beadTerminal, hookBead, activeMRAssessment.Pending, gitSafe) {
@@ -318,11 +317,7 @@ func displayDryRunSafetyCheck(target polecatTarget) bool {
 			sourceHint := agentSourceIssueHint("", fields)
 			gitSafe := false
 			if infoErr == nil && polecatInfo != nil {
-				gitState, gitErr := getGitState(polecatInfo.ClonePath)
-				gitSafe = gitErr == nil && gitState != nil && gitState.Clean
-				if !gitSafe {
-					gitSafe = activeMRGitSafeForWorktree(polecatInfo.ClonePath)
-				}
+				gitSafe = activeMRGitSafeForWorktree(polecatInfo.ClonePath)
 			}
 			if blocker := activeMRBlocker(bd, fields.ActiveMR, sourceHint, true, gitSafe); blocker != "" {
 				fmt.Printf("    - Active MR: %s (%s)\n", style.Error.Render("blocked"), blocker)

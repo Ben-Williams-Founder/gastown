@@ -526,11 +526,7 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 					return gitSafe
 				}
 				gitStateLoaded = true
-				if gitState, gitErr := getGitState(p.ClonePath); gitErr == nil && gitState != nil && gitState.Clean {
-					gitSafe = true
-				} else {
-					gitSafe = activeMRGitSafeForWorktree(p.ClonePath)
-				}
+				gitSafe = activeMRGitSafeForWorktree(p.ClonePath)
 				return gitSafe
 			}
 			activeMRBlocks := false
@@ -1447,6 +1443,11 @@ func hasSubmittableWorkForRecovery(worktreePath string, targetRefs []string, git
 	branch, _ := g.CurrentBranch()
 	if status, err := g.BranchTargetStatus(branch, "origin", targetRefs); err == nil {
 		return status.UnpreservedPatchCount > 0
+	}
+	if branch, err := g.CurrentBranch(); err == nil && branch != "" && !isRecoveryBaseBranch(branch) {
+		if pushed, _, err := g.BranchPushedToRemote(branch, "origin"); err == nil && pushed {
+			return true
+		}
 	}
 	return gitErr != nil || (gitState != nil && gitState.UnpushedCommits > 0)
 }
