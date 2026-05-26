@@ -12,28 +12,28 @@ const (
 // WorkstateInput contains the lifecycle, git, and merge-queue facts needed to
 // classify a polecat consistently across list, recovery, witness, and capacity.
 type WorkstateInput struct {
-	State                         State
-	HookBead                      string
-	CleanupStatus                 CleanupStatus
-	IgnoreCleanupStatus           bool
+	State                          State
+	HookBead                       string
+	CleanupStatus                  CleanupStatus
+	IgnoreCleanupStatus            bool
 	PartialSpawnWithoutDurableHook bool
-	PushFailed                    bool
-	MRFailed                      bool
-	Branch                        string
-	GitDirty                      bool
-	GitDirtyReason                string
-	StashCount                    int
-	UnpushedCommits               int
-	GitCheckFailed                bool
-	GitCheckFailedReason          string
-	ActiveMR                      string
-	ActiveMRBlocker               string
-	MQCheckRequired               bool
-	HasSubmittableWork            bool
-	MQNotRequired                 bool
-	AssignedBeadTerminal          bool
-	MRSubmitted                   bool
-	MQLookupFailed                bool
+	PushFailed                     bool
+	MRFailed                       bool
+	Branch                         string
+	GitDirty                       bool
+	GitDirtyReason                 string
+	StashCount                     int
+	UnpushedCommits                int
+	GitCheckFailed                 bool
+	GitCheckFailedReason           string
+	ActiveMR                       string
+	ActiveMRBlocker                string
+	MQCheckRequired                bool
+	HasSubmittableWork             bool
+	MQNotRequired                  bool
+	AssignedBeadTerminal           bool
+	MRSubmitted                    bool
+	MQLookupFailed                 bool
 }
 
 // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure

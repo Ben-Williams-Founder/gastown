@@ -145,10 +145,10 @@ func TestActiveMRBlocksReuse(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "missing MR blocks conservatively",
+			name: "missing MR does not block after terminal-aware lookup",
 			mrID: "mr-1",
 			bd:   fakeReuseMRShower{},
-			want: true,
+			want: false,
 		},
 	}
 
@@ -156,6 +156,74 @@ func TestActiveMRBlocksReuse(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := activeMRBlocksReuse(tt.bd, tt.mrID); got != tt.want {
 				t.Fatalf("activeMRBlocksReuse() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWorkstateDispositionProjectionAgreement(t *testing.T) {
+	tests := []struct {
+		name         string
+		in           polecat.WorkstateInput
+		wantReusable bool
+		wantRecovery bool
+		wantMQSubmit bool
+		wantSafe     bool
+		wantCapacity polecatCapacitySnapshot
+	}{
+		{
+			name:         "reusable idle",
+			in:           polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupClean},
+			wantReusable: true,
+			wantSafe:     true,
+			wantCapacity: polecatCapacitySnapshot{ReusableIdle: 1},
+		},
+		{
+			name:         "recovery blocked idle",
+			in:           polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupUnpushed},
+			wantRecovery: true,
+			wantCapacity: polecatCapacitySnapshot{RecoveryBlocked: 1},
+		},
+		{
+			name:         "needs mq submit",
+			in:           polecat.WorkstateInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupClean, Branch: "polecat/test", MQCheckRequired: true, HasSubmittableWork: true},
+			wantRecovery: true,
+			wantMQSubmit: true,
+			wantCapacity: polecatCapacitySnapshot{RecoveryBlocked: 1},
+		},
+		{
+			name:         "working",
+			in:           polecat.WorkstateInput{State: polecat.StateWorking, CleanupStatus: polecat.CleanupClean},
+			wantCapacity: polecatCapacitySnapshot{Working: 1},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			disposition := polecat.DecideWorkstate(tt.in)
+			list := PolecatListItem{
+				Verdict:              disposition.Verdict,
+				Reason:               disposition.Reason,
+				Reusable:             disposition.Reusable,
+				SafeToNuke:           disposition.SafeToNuke,
+				NeedsRecovery:        disposition.NeedsRecovery,
+				NeedsMQSubmit:        disposition.NeedsMQSubmit,
+				MQStatus:             disposition.MQStatus,
+				CountsTowardCapacity: disposition.CountsTowardCapacity,
+				ReuseStatus:          disposition.ReuseStatus,
+			}
+			recovery := RecoveryStatus{}
+			applyWorkstateDispositionToRecoveryStatus(&recovery, disposition)
+			if list.Reusable != recovery.Reusable || list.SafeToNuke != recovery.SafeToNuke || list.NeedsRecovery != recovery.NeedsRecovery || list.NeedsMQSubmit != recovery.NeedsMQSubmit || list.MQStatus != recovery.MQStatus || list.CountsTowardCapacity != recovery.CountsTowardCapacity || list.ReuseStatus != recovery.ReuseStatus {
+				t.Fatalf("list projection %+v disagrees with recovery %+v", list, recovery)
+			}
+			if recovery.Reusable != tt.wantReusable || recovery.SafeToNuke != tt.wantSafe || recovery.NeedsRecovery != tt.wantRecovery || recovery.NeedsMQSubmit != tt.wantMQSubmit {
+				t.Fatalf("recovery projection = %+v", recovery)
+			}
+			snapshot := polecatCapacitySnapshot{}
+			applyWorkstateDispositionToCapacitySnapshot(&snapshot, tt.in.State, disposition)
+			if snapshot.Working != tt.wantCapacity.Working || snapshot.RecoveryBlocked != tt.wantCapacity.RecoveryBlocked || snapshot.ReusableIdle != tt.wantCapacity.ReusableIdle {
+				t.Fatalf("capacity projection = %+v, want %+v", snapshot, tt.wantCapacity)
 			}
 		})
 	}

@@ -113,6 +113,37 @@ func TestShouldNotifyMayorSlotOpenRequiresSafeRecovery(t *testing.T) {
 	}
 }
 
+func TestActiveMRBlockerFromCLIUsesTerminalStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		err    error
+		want   string
+	}{
+		{name: "empty active mr", want: ""},
+		{name: "open mr blocks", output: `[{"status":"open"}]`, want: "active_mr=gt-mr status=open"},
+		{name: "closed mr does not block", output: `[{"status":"closed"}]`, want: ""},
+		{name: "not found does not block", err: fmt.Errorf("issue not found"), want: ""},
+		{name: "lookup error blocks", err: fmt.Errorf("bd unavailable"), want: "active_mr=gt-mr status=lookup_error: bd unavailable"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bd, _ := mockBd(
+				func(args []string) (string, error) { return tt.output, tt.err },
+				func(args []string) error { return nil },
+			)
+			mrID := "gt-mr"
+			if tt.name == "empty active mr" {
+				mrID = ""
+			}
+			if got := activeMRBlockerFromCLI(bd, t.TempDir(), mrID); got != tt.want {
+				t.Fatalf("activeMRBlockerFromCLI() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestHandlePolecatDoneFromBead_NilFields(t *testing.T) {
 	t.Parallel()
 	result := HandlePolecatDoneFromBead(DefaultBdCli(), "/tmp", "testrig", "nux", nil, nil)

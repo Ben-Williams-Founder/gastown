@@ -9,27 +9,27 @@ var ErrPolecatNeedsRecovery = errors.New("polecat needs recovery before reuse")
 // SlotReuseInput is the shared input for deciding whether a polecat slot can be
 // advertised as open and destructively reused for new work.
 type SlotReuseInput struct {
-	State           State
-	HookBead        string
-	CleanupStatus   CleanupStatus
-	IgnoreCleanupStatus bool
-	PushFailed      bool
-	MRFailed        bool
-	Branch          string
-	GitDirty        bool
-	GitDirtyReason  string
-	StashCount      int
-	UnpushedCommits int
-	GitCheckFailed  bool
+	State                State
+	HookBead             string
+	CleanupStatus        CleanupStatus
+	IgnoreCleanupStatus  bool
+	PushFailed           bool
+	MRFailed             bool
+	Branch               string
+	GitDirty             bool
+	GitDirtyReason       string
+	StashCount           int
+	UnpushedCommits      int
+	GitCheckFailed       bool
 	GitCheckFailedReason string
-	ActiveMR        string
-	ActiveMRBlocker string
-	MQCheckRequired bool
-	HasSubmittableWork bool
-	MQNotRequired bool
+	ActiveMR             string
+	ActiveMRBlocker      string
+	MQCheckRequired      bool
+	HasSubmittableWork   bool
+	MQNotRequired        bool
 	AssignedBeadTerminal bool
-	MRSubmitted bool
-	MQLookupFailed bool
+	MRSubmitted          bool
+	MQLookupFailed       bool
 }
 
 // SlotReuseDecision explains whether a polecat can be reused and why not.

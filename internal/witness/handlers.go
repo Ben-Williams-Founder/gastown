@@ -3,6 +3,7 @@ package witness
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -820,12 +821,17 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	}
 	prefix := beads.GetPrefixForRig(townRoot, rigName)
 	agentID := beads.PolecatBeadIDWithPrefix(prefix, rigName, polecatName)
-	_, fields, err := beads.New(beads.ResolveBeadsDir(workDir)).ForAgentBead().GetAgentBead(agentID)
+	rigBeads := beads.New(workDir)
+	_, fields, err := rigBeads.ForAgentBead().GetAgentBead(agentID)
 	input := polecat.SlotReuseInput{State: polecat.StateIdle, CleanupStatus: polecat.CleanupUnknown, GitCheckFailed: err != nil || fields == nil}
+	issueID := ""
 	if fields != nil {
+		issueID = fields.HookBead
 		input.HookBead = fields.HookBead
 		input.PushFailed = fields.PushFailed
 		input.MRFailed = fields.MRFailed
+		input.ActiveMR = fields.ActiveMR
+		input.ActiveMRBlocker = witnessActiveMRBlocker(rigBeads, fields.ActiveMR)
 		if fields.CleanupStatus != "" {
 			input.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
 		}
@@ -851,7 +857,111 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	} else {
 		input.GitCheckFailed = true
 	}
+	input.MQCheckRequired = input.Branch != ""
+	input.HasSubmittableWork = witnessHasSubmittableWork(clonePath)
+	input.AssignedBeadTerminal = witnessIssueTerminal(rigBeads, issueID)
+	input.MQNotRequired = witnessMQNotRequiredSource(rigBeads, issueID)
+	if input.MQCheckRequired && input.HasSubmittableWork && !input.AssignedBeadTerminal && !input.MQNotRequired {
+		mr, err := rigBeads.FindMRForBranchAny(input.Branch)
+		if err != nil {
+			input.MQLookupFailed = true
+		} else {
+			input.MRSubmitted = mr != nil
+		}
+	}
 	return polecat.DecideSlotReuse(input)
+}
+
+func witnessActiveMRBlocker(bd *beads.Beads, mrID string) string {
+	if mrID == "" {
+		return ""
+	}
+	if bd == nil {
+		return fmt.Sprintf("active_mr=%s status=unverified", mrID)
+	}
+	mr, err := bd.Show(mrID)
+	if err != nil {
+		if errors.Is(err, beads.ErrNotFound) {
+			return ""
+		}
+		return fmt.Sprintf("active_mr=%s status=lookup_error: %v", mrID, err)
+	}
+	if mr == nil || beads.IssueStatus(mr.Status).IsTerminal() {
+		return ""
+	}
+	return fmt.Sprintf("active_mr=%s status=%s", mrID, mr.Status)
+}
+
+func witnessIssueTerminal(bd *beads.Beads, issueID string) bool {
+	if bd == nil || issueID == "" {
+		return false
+	}
+	issue, err := bd.Show(issueID)
+	return err == nil && issue != nil && beads.IssueStatus(issue.Status).IsTerminal()
+}
+
+func witnessMQNotRequiredSource(bd *beads.Beads, issueID string) bool {
+	if bd == nil || issueID == "" {
+		return false
+	}
+	issue, err := bd.Show(issueID)
+	if err != nil || issue == nil {
+		return false
+	}
+	attachment := beads.ParseAttachmentFields(issue)
+	if attachment == nil {
+		return false
+	}
+	return attachment.NoMerge || attachment.ReviewOnly || strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local")
+}
+
+func witnessHasSubmittableWork(worktreePath string) bool {
+	ref, err := witnessWorkstateComparisonRef(worktreePath)
+	if err != nil {
+		return false
+	}
+	count, err := witnessCountPatchUniqueCommits(worktreePath, ref)
+	return err == nil && count > 0
+}
+
+func witnessWorkstateComparisonRef(worktreePath string) (string, error) {
+	upstreamCmd := exec.Command("git", "rev-parse", "--abbrev-ref", "@{u}")
+	upstreamCmd.Dir = worktreePath
+	if output, err := upstreamCmd.Output(); err == nil {
+		upstream := strings.TrimSpace(string(output))
+		upstreamBranch := strings.TrimPrefix(upstream, "origin/")
+		if upstream != "" && witnessIsWorkstateRecoveryBaseBranch(upstreamBranch) {
+			return upstream, nil
+		}
+	}
+	for _, ref := range []string{"origin/main", "origin/master"} {
+		verifyCmd := exec.Command("git", "rev-parse", "--verify", "--quiet", ref)
+		verifyCmd.Dir = worktreePath
+		if err := verifyCmd.Run(); err == nil {
+			return ref, nil
+		}
+	}
+	return "", fmt.Errorf("no recovery base ref")
+}
+
+func witnessIsWorkstateRecoveryBaseBranch(branch string) bool {
+	return branch == "main" || branch == "master" || strings.HasPrefix(branch, "integration/")
+}
+
+func witnessCountPatchUniqueCommits(worktreePath, baseRef string) (int, error) {
+	cherryCmd := exec.Command("git", "cherry", baseRef, "HEAD")
+	cherryCmd.Dir = worktreePath
+	output, err := cherryCmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "+") {
+			count++
+		}
+	}
+	return count, nil
 }
 
 // RecoveryPayload contains data for RECOVERY_NEEDED escalation.
@@ -3011,7 +3121,7 @@ func hasPendingMR(bd *BdCli, workDir, _, polecatName, agentBeadID string) bool {
 
 	// Check 2: active_mr on agent bead (set by gt done when MR is created)
 	activeMR := getAgentActiveMR(bd, workDir, agentBeadID)
-	return activeMR != ""
+	return activeMRBlockerFromCLI(bd, workDir, activeMR) != ""
 }
 
 // hasPendingMRFromSnapshot checks for a pending MR using a pre-fetched ActiveMR
@@ -3024,7 +3134,48 @@ func hasPendingMRFromSnapshot(bd *BdCli, workDir, polecatName, activeMR string) 
 	}
 
 	// Check 2: active_mr from pre-fetched snapshot
-	return activeMR != ""
+	return activeMRBlockerFromCLI(bd, workDir, activeMR) != ""
+}
+
+func activeMRBlockerFromCLI(bd *BdCli, workDir, activeMR string) string {
+	if activeMR == "" {
+		return ""
+	}
+	if bd == nil {
+		return fmt.Sprintf("active_mr=%s status=unverified", activeMR)
+	}
+	output, err := bd.Exec(workDir, "show", activeMR, "--json")
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "not found") {
+			return ""
+		}
+		return fmt.Sprintf("active_mr=%s status=lookup_error: %v", activeMR, err)
+	}
+	status := issueStatusFromShowJSON(output)
+	if status == "" || beads.IssueStatus(status).IsTerminal() {
+		return ""
+	}
+	return fmt.Sprintf("active_mr=%s status=%s", activeMR, status)
+}
+
+func issueStatusFromShowJSON(output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" || output == "null" || output == "[]" {
+		return ""
+	}
+	var items []struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(output), &items); err == nil && len(items) > 0 {
+		return items[0].Status
+	}
+	var item struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal([]byte(output), &item); err == nil {
+		return item.Status
+	}
+	return ""
 }
 
 // getAgentActiveMR retrieves the active_mr field from a polecat's agent bead.

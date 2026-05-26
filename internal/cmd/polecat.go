@@ -382,25 +382,25 @@ func init() {
 
 // PolecatListItem represents a polecat in list output.
 type PolecatListItem struct {
-	Rig                   string        `json:"rig"`
-	Name                  string        `json:"name"`
-	State                 polecat.State `json:"state"`
-	Issue                 string        `json:"issue,omitempty"`
-	CleanupStatus         string        `json:"cleanup_status,omitempty"`
-	ActiveMR              string        `json:"active_mr,omitempty"`
-	Branch                string        `json:"branch,omitempty"`
-	Verdict               string        `json:"verdict,omitempty"`
-	Reason                string        `json:"reason,omitempty"`
-	Reusable              bool          `json:"reusable"`
-	SafeToNuke            bool          `json:"safe_to_nuke"`
-	NeedsRecovery         bool          `json:"needs_recovery"`
-	NeedsMQSubmit         bool          `json:"needs_mq_submit"`
-	MQStatus              string        `json:"mq_status,omitempty"`
-	CountsTowardCapacity  bool          `json:"counts_toward_capacity"`
-	ReuseStatus           string        `json:"reuse_status,omitempty"`
-	SessionRunning        bool          `json:"session_running"`
-	Zombie                bool          `json:"zombie,omitempty"`
-	SessionName           string        `json:"session_name,omitempty"`
+	Rig                  string        `json:"rig"`
+	Name                 string        `json:"name"`
+	State                polecat.State `json:"state"`
+	Issue                string        `json:"issue,omitempty"`
+	CleanupStatus        string        `json:"cleanup_status,omitempty"`
+	ActiveMR             string        `json:"active_mr,omitempty"`
+	Branch               string        `json:"branch,omitempty"`
+	Verdict              string        `json:"verdict,omitempty"`
+	Reason               string        `json:"reason,omitempty"`
+	Reusable             bool          `json:"reusable"`
+	SafeToNuke           bool          `json:"safe_to_nuke"`
+	NeedsRecovery        bool          `json:"needs_recovery"`
+	NeedsMQSubmit        bool          `json:"needs_mq_submit"`
+	MQStatus             string        `json:"mq_status,omitempty"`
+	CountsTowardCapacity bool          `json:"counts_toward_capacity"`
+	ReuseStatus          string        `json:"reuse_status,omitempty"`
+	SessionRunning       bool          `json:"session_running"`
+	Zombie               bool          `json:"zombie,omitempty"`
+	SessionName          string        `json:"session_name,omitempty"`
 }
 
 // effectivePolecatState returns the observable state used by polecat list output.
@@ -435,8 +435,11 @@ func activeMRBlocksReuse(bd reuseMRShower, mrID string) bool {
 		return true
 	}
 	mr, err := bd.Show(mrID)
-	if err != nil || mr == nil {
-		return true
+	if err != nil {
+		return !errors.Is(err, beads.ErrNotFound)
+	}
+	if mr == nil {
+		return false
 	}
 	return !beads.IssueStatus(mr.Status).IsTerminal()
 }
@@ -1028,22 +1031,23 @@ func countPatchUniqueCommits(worktreePath, baseRef string) (int, error) {
 
 // RecoveryStatus represents whether a polecat needs recovery or is safe to nuke.
 type RecoveryStatus struct {
-	Rig                   string                `json:"rig"`
-	Polecat               string                `json:"polecat"`
-	CleanupStatus         polecat.CleanupStatus `json:"cleanup_status"`
-	NeedsRecovery         bool                  `json:"needs_recovery"`
-	Verdict               string                `json:"verdict"` // SAFE_TO_NUKE, NEEDS_RECOVERY, or NEEDS_MQ_SUBMIT
-	Reason                string                `json:"reason,omitempty"`
-	Reusable              bool                  `json:"reusable"`
-	SafeToNuke            bool                  `json:"safe_to_nuke"`
-	NeedsMQSubmit         bool                  `json:"needs_mq_submit"`
-	CountsTowardCapacity  bool                  `json:"counts_toward_capacity"`
-	Branch                string                `json:"branch,omitempty"`
-	Issue                 string                `json:"issue,omitempty"`
-	MQStatus              string                `json:"mq_status,omitempty"` // "submitted", "not_submitted", "not_required", "unknown"
-	ActiveMR              string                `json:"active_mr,omitempty"`
-	Blockers              []string              `json:"blockers,omitempty"`
-	Diagnostics           []string              `json:"diagnostics,omitempty"`
+	Rig                  string                `json:"rig"`
+	Polecat              string                `json:"polecat"`
+	CleanupStatus        polecat.CleanupStatus `json:"cleanup_status"`
+	NeedsRecovery        bool                  `json:"needs_recovery"`
+	Verdict              string                `json:"verdict"` // SAFE_TO_NUKE, NEEDS_RECOVERY, or NEEDS_MQ_SUBMIT
+	Reason               string                `json:"reason,omitempty"`
+	Reusable             bool                  `json:"reusable"`
+	SafeToNuke           bool                  `json:"safe_to_nuke"`
+	NeedsMQSubmit        bool                  `json:"needs_mq_submit"`
+	CountsTowardCapacity bool                  `json:"counts_toward_capacity"`
+	ReuseStatus          string                `json:"reuse_status,omitempty"`
+	Branch               string                `json:"branch,omitempty"`
+	Issue                string                `json:"issue,omitempty"`
+	MQStatus             string                `json:"mq_status,omitempty"` // "submitted", "not_submitted", "not_required", "unknown"
+	ActiveMR             string                `json:"active_mr,omitempty"`
+	Blockers             []string              `json:"blockers,omitempty"`
+	Diagnostics          []string              `json:"diagnostics,omitempty"`
 }
 
 func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
@@ -1263,6 +1267,7 @@ func applyWorkstateDispositionToRecoveryStatus(status *RecoveryStatus, dispositi
 	status.NeedsRecovery = disposition.NeedsRecovery
 	status.NeedsMQSubmit = disposition.NeedsMQSubmit
 	status.CountsTowardCapacity = disposition.CountsTowardCapacity
+	status.ReuseStatus = disposition.ReuseStatus
 	status.MQStatus = disposition.MQStatus
 	status.Blockers = disposition.Blockers
 }
