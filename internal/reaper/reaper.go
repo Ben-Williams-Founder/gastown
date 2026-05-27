@@ -21,6 +21,18 @@ import (
 // validDBName matches safe database names (alphanumeric, underscore, hyphen).
 var validDBName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
+// depTargetExpr is the COALESCE of the three typed dependency target columns
+// introduced by beads migration 0041. The reaper queries the rig Dolt DBs (hq,
+// whiz_kb, whiz_web) which were migrated to the typed schema; the legacy
+// single-column `depends_on_id` no longer exists on those DBs. Using this
+// expression as a virtual stand-in keeps the existing SELECT projections and
+// downstream Go mappings valid (alias as `depends_on_id`).
+//
+// LOCAL FORK PATCH 2026-05-27: applied while the upstream tracking bead
+// (hq-43a or equivalent) is unfiled — see Whiz-KB
+// `business/questions/Q-gastown-reaper-schema-fix.md` for the diagnosis.
+const depTargetExpr = "COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external)"
+
 // DefaultDatabases is the static fallback list of known production databases.
 // Used only when SHOW DATABASES fails (server unreachable).
 // GH#2385: Removed legacy "gt" and "bd" names — modern towns use "hq" (town
@@ -200,21 +212,27 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 //	join, where := parentExcludeJoin(dbName)
 //	query := fmt.Sprintf("SELECT ... FROM wisps w %s WHERE ... AND %s", dbName, join, where)
 func parentExcludeJoin(dbName string) (joinClause, whereCondition string) {
-	joinClause = `LEFT JOIN (
+	joinClause = fmt.Sprintf(`LEFT JOIN (
 		SELECT DISTINCT wd.issue_id
 		FROM wisp_dependencies wd
-		LEFT JOIN wisps pw ON pw.id = wd.depends_on_id LEFT JOIN issues pi ON pi.id = wd.depends_on_id
+		LEFT JOIN wisps pw ON pw.id = %[1]s LEFT JOIN issues pi ON pi.id = %[1]s
 		WHERE wd.type = 'parent-child'
 		AND (pw.status IN ('open', 'hooked', 'in_progress') OR pi.status IN ('open', 'in_progress'))
-	) open_parent ON open_parent.issue_id = w.id`
+	) open_parent ON open_parent.issue_id = w.id`, depTargetExpr)
 	whereCondition = "open_parent.issue_id IS NULL"
 	return
 }
 
 // HasReaperSchema checks whether the database has the tables required for reaper
-// operations (wisps and issues). Returns false (no error) when tables are missing
-// — callers use this to skip databases that have incomplete beads schema (e.g.
-// partially initialized databases on the central Dolt server).
+// operations (wisps and issues) AND uses the post-0041 typed dependency columns.
+// Returns false (no error) when tables are missing — callers use this to skip
+// databases that have incomplete beads schema (e.g. partially initialized
+// databases on the central Dolt server, or legacy DBs that predate migration
+// 0041's split of `depends_on_id` into typed columns).
+//
+// LOCAL FORK PATCH 2026-05-27: added the typed-column check so legacy DBs
+// (e.g. the empty `beads` DB on this dev rig) are skipped instead of erroring
+// with "column not found" when the reaper runs its COALESCE-based queries.
 func HasReaperSchema(db *sql.DB) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -225,7 +243,23 @@ func HasReaperSchema(db *sql.DB) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("check reaper schema: %w", err)
 	}
-	return count >= 2, nil
+	if count < 2 {
+		return false, nil
+	}
+
+	// Require the post-0041 typed columns on the dependency tables. Without
+	// them, the reaper's COALESCE-based queries error with "column not found".
+	var typedCount int
+	err = db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM information_schema.columns
+		 WHERE table_schema = DATABASE()
+		   AND table_name IN ('dependencies', 'wisp_dependencies')
+		   AND column_name = 'depends_on_issue_id'`).Scan(&typedCount)
+	if err != nil {
+		return false, fmt.Errorf("check typed dependency columns: %w", err)
+	}
+	// Need depends_on_issue_id on BOTH dependencies and wisp_dependencies.
+	return typedCount >= 2, nil
 }
 
 // Scan counts reaper candidates in a database without modifying anything.
@@ -270,7 +304,7 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 
 	// Count stale issue candidates.
 	// Same caveat: issues/dependencies tables may live on a separate Dolt instance.
-	staleQuery := `
+	staleQuery := fmt.Sprintf(`
 		SELECT COUNT(*) FROM issues i
 		WHERE i.status IN ('open', 'in_progress')
 		AND i.updated_at < ?
@@ -278,14 +312,14 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		AND i.issue_type != 'epic'
 		AND i.id NOT IN (
 			SELECT DISTINCT d.issue_id FROM dependencies d
-			INNER JOIN issues dep ON d.depends_on_id = dep.id
+			INNER JOIN issues dep ON %[1]s = dep.id
 			WHERE dep.status IN ('open', 'in_progress')
 		)
 		AND i.id NOT IN (
-			SELECT DISTINCT d.depends_on_id FROM dependencies d
+			SELECT DISTINCT %[1]s FROM dependencies d
 			INNER JOIN issues blocker ON d.issue_id = blocker.id
 			WHERE blocker.status IN ('open', 'in_progress')
-		)`
+		)`, depTargetExpr)
 	if err := db.QueryRowContext(ctx, staleQuery, now.Add(-staleIssueAge)).Scan(&result.StaleCandidates); err != nil {
 		if !isTableNotFound(err) {
 			return nil, fmt.Errorf("count stale candidates: %w", err)
@@ -300,10 +334,10 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	}
 
 	// Anomaly detection: dangling parent references.
-	danglingQuery := `
+	danglingQuery := fmt.Sprintf(`
 		SELECT COUNT(*) FROM wisp_dependencies wd
-		LEFT JOIN wisps pw ON pw.id = wd.depends_on_id LEFT JOIN issues pi ON pi.id = wd.depends_on_id
-		WHERE wd.type = 'parent-child' AND pw.id IS NULL AND pi.id IS NULL`
+		LEFT JOIN wisps pw ON pw.id = %[1]s LEFT JOIN issues pi ON pi.id = %[1]s
+		WHERE wd.type = 'parent-child' AND pw.id IS NULL AND pi.id IS NULL`, depTargetExpr)
 	var danglingCount int
 	if err := db.QueryRowContext(ctx, danglingQuery).Scan(&danglingCount); err == nil && danglingCount > 0 {
 		result.Anomalies = append(result.Anomalies, Anomaly{
@@ -599,19 +633,19 @@ func AutoClose(db *sql.DB, dbName string, staleAge time.Duration, dryRun bool) (
 		AND i.priority > 1
 		AND i.issue_type != 'epic'
 		AND i.id NOT IN (
-			SELECT DISTINCT l.issue_id FROM `+"`%s`"+`.labels l
+			SELECT DISTINCT l.issue_id FROM `+"`%[1]s`"+`.labels l
 			WHERE l.label IN ('gt:standing-orders', 'gt:keep', 'gt:role', 'gt:rig')
 		)
 		AND i.id NOT IN (
-			SELECT DISTINCT d.issue_id FROM `+"`%s`"+`.dependencies d
-			INNER JOIN `+"`%s`"+`.issues dep ON d.depends_on_id = dep.id
+			SELECT DISTINCT d.issue_id FROM `+"`%[1]s`"+`.dependencies d
+			INNER JOIN `+"`%[1]s`"+`.issues dep ON %[2]s = dep.id
 			WHERE dep.status IN ('open', 'in_progress')
 		)
 		AND i.id NOT IN (
-			SELECT DISTINCT d.depends_on_id FROM `+"`%s`"+`.dependencies d
-			INNER JOIN `+"`%s`"+`.issues blocker ON d.issue_id = blocker.id
+			SELECT DISTINCT %[2]s FROM `+"`%[1]s`"+`.dependencies d
+			INNER JOIN `+"`%[1]s`"+`.issues blocker ON d.issue_id = blocker.id
 			WHERE blocker.status IN ('open', 'in_progress')
-		)`, dbName, dbName, dbName, dbName, dbName)
+		)`, dbName, depTargetExpr)
 
 	// Two-step SELECT-then-UPDATE to avoid self-referencing subquery in UPDATE,
 	// which is not valid MySQL (Error 1093) and fragile in Dolt (dolthub/dolt#10600).
@@ -747,7 +781,7 @@ func batchDeleteRows(ctx context.Context, db *sql.DB, idQuery string, cutoffArg 
 		}
 
 		// Clean up reverse dependency references to prevent dangling parent refs.
-		delReverse := fmt.Sprintf("DELETE FROM wisp_dependencies WHERE depends_on_id IN %s", inClause)
+		delReverse := fmt.Sprintf("DELETE FROM wisp_dependencies WHERE %s IN %s", depTargetExpr, inClause)
 		if _, err := db.ExecContext(ctx, delReverse, args...); err != nil {
 			// Non-fatal.
 		}
