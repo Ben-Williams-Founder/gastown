@@ -269,19 +269,47 @@ func copyAuxiliaryData(workDir string, result *MigrateWispsResult) error {
 }
 
 func copyWispDependencies(workDir string) error {
-	err := bdSQL(workDir, buildWispDependenciesCopyQuery(false))
-	if err == nil || !beads.IsDependencyTargetColumnError(err) {
-		return err
+	splitWispTarget := bdTableHasColumn(workDir, "wisp_dependencies", beads.DependencyTargetWispColumn)
+	splitSourceTarget := false
+
+	err := bdSQL(workDir, buildWispDependenciesCopyQuery(splitSourceTarget, splitWispTarget))
+	if err == nil {
+		return nil
 	}
-	return bdSQL(workDir, buildWispDependenciesCopyQuery(true))
+	if beads.IsDependencyTargetColumnError(err) {
+		splitSourceTarget = true
+		err = bdSQL(workDir, buildWispDependenciesCopyQuery(splitSourceTarget, splitWispTarget))
+	}
+	if !splitWispTarget && beads.IsDependencyTargetGeneratedWriteError(err) {
+		return bdSQL(workDir, buildWispDependenciesCopyQuery(splitSourceTarget, true))
+	}
+	return err
 }
 
-func buildWispDependenciesCopyQuery(splitTarget bool) string {
+func buildWispDependenciesCopyQuery(splitSourceTarget, splitWispTarget bool) string {
+	if splitWispTarget {
+		return fmt.Sprintf(
+			"INSERT IGNORE INTO wisp_dependencies (issue_id, %s, type, created_at, created_by, metadata, thread_id) "+
+				"SELECT d.issue_id, %s, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id",
+			beads.DependencyTargetSplitColumns(),
+			beads.DependencyTargetSplitValuesExprsForWispCopy("d", splitSourceTarget, ""),
+		)
+	}
+
 	return fmt.Sprintf(
 		"INSERT IGNORE INTO wisp_dependencies (issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id) "+
 			"SELECT d.issue_id, %s, d.type, d.created_at, d.created_by, d.metadata, d.thread_id FROM dependencies d INNER JOIN wisps w ON d.issue_id = w.id",
-		beads.DependencyTargetExpr("d", splitTarget),
+		beads.DependencyTargetExpr("d", splitSourceTarget),
 	)
+}
+
+func bdTableHasColumn(workDir, tableName, columnName string) bool {
+	cnt, err := bdSQLCount(workDir, fmt.Sprintf(
+		"SELECT COUNT(*) as cnt FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '%s' AND COLUMN_NAME = '%s'",
+		tableName,
+		columnName,
+	))
+	return err == nil && cnt > 0
 }
 
 // deriveDBName extracts the database name from the workDir relative to townRoot.

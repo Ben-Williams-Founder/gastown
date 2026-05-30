@@ -517,7 +517,7 @@ func bdDepListRawIDsWithSchema(dir, issueID, direction, depType string, splitTar
 	// "down": issueID depends on targets → SELECT target WHERE issue_id = ?
 	// "up":   issueID is depended on → SELECT issue_id WHERE target = ?
 	selectExpr := targetExpr
-	rowKey := "depends_on_id"
+	rowKey := beads.DependencyTargetAlias
 	whereExpr := fmt.Sprintf("issue_id = '%s'", issueID)
 	if direction == "up" {
 		selectExpr = "issue_id"
