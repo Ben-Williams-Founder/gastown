@@ -126,7 +126,8 @@ func IsDependencyTargetColumnError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	missingColumn := strings.Contains(msg, "unknown column") ||
 		strings.Contains(msg, "could not be found") ||
-		strings.Contains(msg, "no such column")
+		strings.Contains(msg, "no such column") ||
+		strings.Contains(msg, "does not have column") // Dolt phrasing (e.g. `table "wd" does not have column "depends_on_id"`)
 	if !missingColumn {
 		return false
 	}
