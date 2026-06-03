@@ -62,12 +62,22 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 			verdict = WorkstateVerdictWorking
 			needsRecovery = false
 		}
-		return WorkstateDisposition{
+		d := WorkstateDisposition{
 			Verdict:              verdict,
 			Reason:               "not-idle",
 			NeedsRecovery:        needsRecovery,
 			CountsTowardCapacity: true,
 		}
+		// hq-k27dd: never surface a blocker-less NEEDS_RECOVERY (the confusing
+		// "unknown recovery predicate" message). A dead/gone session lands here
+		// with a non-idle, non-working state; record the actual state so the
+		// mayor/witness sees the real reason instead of guessing. Does NOT change
+		// the nuke decision — only makes the verdict legible.
+		if needsRecovery {
+			d.ReuseStatus = "idle-recovery-needed"
+			d.Blockers = []string{"state=" + string(in.State)}
+		}
+		return d
 	}
 
 	d := WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke}
