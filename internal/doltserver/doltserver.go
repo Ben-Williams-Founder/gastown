@@ -146,15 +146,17 @@ const (
 	// Controls how long Dolt waits for a client to send a query on an idle connection.
 	// Prevents CLOSE_WAIT accumulation from abandoned connections: when a client times out
 	// and closes its end, Dolt will detect the dead connection within this window.
-	// 5 minutes matches the compactor GC timeout (compactorGCTimeout) so GC ops complete
-	// before the connection is considered stale.
-	DefaultReadTimeoutMs = 5 * 60 * 1000 // 5 minutes in milliseconds
+	// 30s is safe: auto_gc is disabled (no long GC ops), and all healthy bd queries complete
+	// in well under 30s. Prevents the connection-accumulation cascade where hung connections
+	// fill the 1000-slot pool before wait_timeout reclaims them — at the observed 18 conn/s
+	// burst rate, 5-minute timeouts allowed ~5400 connection-seconds of stall before eviction. (hq-60wv)
+	DefaultReadTimeoutMs = 30 * 1000 // 30 seconds in milliseconds
 
 	// DefaultWriteTimeoutMs is the server-side timeout for writing a response back to a client.
-	// When a client closes its TCP connection while a query is running (e.g. compactor GC),
-	// Dolt detects the dead connection within this timeout rather than holding CLOSE_WAIT
-	// for Dolt's default 8 hours. Set to match compactor GC timeout.
-	DefaultWriteTimeoutMs = 5 * 60 * 1000 // 5 minutes in milliseconds
+	// When a client closes its TCP connection while a query is running, Dolt detects the dead
+	// connection within this timeout rather than holding CLOSE_WAIT indefinitely. 30s matches
+	// DefaultReadTimeoutMs — auto_gc is disabled so no long GC write operations are expected. (hq-60wv)
+	DefaultWriteTimeoutMs = 30 * 1000 // 30 seconds in milliseconds
 
 	// DefaultWaitTimeoutSec is how long Dolt keeps an idle session alive before
 	// closing it. Dolt's MySQL-compat default is 28800s (8 hours). Under Gas
