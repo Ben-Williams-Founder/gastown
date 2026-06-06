@@ -241,7 +241,10 @@ func runCommand(ctx context.Context, argv []string, identity string, envOverride
 func (s *Server) rewriteBDCreateRepo(argv []string) ([]string, []string) {
 	rewritten, beadsDir := beads.RewriteBDCreateRepoAlias(s.cfg.TownRoot, argv)
 	if beadsDir != "" {
-		return rewritten, beads.BuildMutationPinnedBDEnv(minimalEnv(), beadsDir)
+		// bd create bootstraps a new database — strip the database selector so bd
+		// doesn't try to connect to a database that doesn't exist yet.
+		env := stripEnvKey(beads.BuildMutationPinnedBDEnv(minimalEnv(), beadsDir), "BEADS_DOLT_SERVER_DATABASE")
+		return rewritten, env
 	}
 	if cmdIndex, ok := beads.BDSubcommandIndex(argv); ok && argv[cmdIndex] == "create" {
 		return argv, beads.BuildMutationNeutralBDEnv(minimalEnv())

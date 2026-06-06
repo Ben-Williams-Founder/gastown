@@ -241,9 +241,9 @@ func OpenDB(host string, port int, dbName string, readTimeout, writeTimeout time
 //
 // Usage:
 //
-//	join, where := parentExcludeJoin(dbName, splitTarget)
-//	query := fmt.Sprintf("SELECT ... FROM wisps w %s WHERE ... AND %s", dbName, join, where)
-func parentExcludeJoin(dbName string, splitTarget bool) (joinClause, whereCondition string) {
+//	join, where := parentExcludeJoin(splitTarget)
+//	query := fmt.Sprintf("SELECT ... FROM wisps w %s WHERE ... AND %s", join, where)
+func parentExcludeJoin(splitTarget bool) (joinClause, whereCondition string) {
 	targetExpr := beads.DependencyTargetExpr("wd", splitTarget)
 	joinClause = fmt.Sprintf(`LEFT JOIN (
 		SELECT DISTINCT wd.issue_id
@@ -257,14 +257,14 @@ func parentExcludeJoin(dbName string, splitTarget bool) (joinClause, whereCondit
 }
 
 func reapCandidatesQuery(dbName string, splitTarget bool) string {
-	parentJoin, parentWhere := parentExcludeJoin(dbName, splitTarget)
+	parentJoin, parentWhere := parentExcludeJoin(splitTarget)
 	return fmt.Sprintf(
 		"SELECT COUNT(*) FROM wisps w %s WHERE w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND w.issue_type != 'agent' AND %s",
 		parentJoin, parentWhere)
 }
 
 func reapIDsQuery(dbName string, splitTarget bool) string {
-	parentJoin, parentWhere := parentExcludeJoin(dbName, splitTarget)
+	parentJoin, parentWhere := parentExcludeJoin(splitTarget)
 	whereClause := fmt.Sprintf(
 		"w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND w.issue_type != 'agent' AND %s", parentWhere)
 	return fmt.Sprintf(

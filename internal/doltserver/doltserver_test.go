@@ -2293,6 +2293,9 @@ func TestInitRigSeedsIssuePrefixEmbedded(t *testing.T) {
 	if _, err := exec.LookPath("dolt"); err != nil {
 		t.Skip("dolt binary not available")
 	}
+	if _, err := exec.LookPath("bd"); err != nil {
+		t.Skip("bd binary not available")
+	}
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("free port: %v", err)
