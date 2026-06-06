@@ -561,6 +561,18 @@ func purgeClosedWisps(db *sql.DB, dbName string, purgeAge time.Duration, dryRun 
 		return totalDeleted, anomalies, err
 	}
 
+	// Remove wisp_dependencies rows that reference purged wisps as targets.
+	// batchDeleteRows cleans the issuer side (issue_id IN purged); this covers
+	// the target side (depends_on_wisp_id IN purged) to prevent accumulation
+	// of dangling parent refs on each purge cycle (hq-mnc1).
+	if _, err := db.ExecContext(ctx,
+		`DELETE FROM wisp_dependencies
+		 WHERE depends_on_wisp_id IS NOT NULL
+		   AND depends_on_wisp_id != ''
+		   AND NOT EXISTS (SELECT 1 FROM wisps WHERE id = depends_on_wisp_id)`); err != nil {
+		return totalDeleted, anomalies, fmt.Errorf("purge reverse wisp_dependencies: %w", err)
+	}
+
 	if totalDeleted > 0 {
 		// Flush SQL transaction to working set before DOLT_COMMIT.
 		if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
