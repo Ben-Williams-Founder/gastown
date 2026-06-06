@@ -19,9 +19,11 @@ import (
 )
 
 var (
-	dashboardPort int
-	dashboardBind string
-	dashboardOpen bool
+	dashboardPort         int
+	dashboardBind         string
+	dashboardOpen         bool
+	dashboardSnapshot     bool
+	dashboardSnapshotPath string
 )
 
 var dashboardCmd = &cobra.Command{
@@ -40,7 +42,8 @@ Example:
   gt dashboard                    # Start on default port 8080
   gt dashboard --port 3000        # Start on port 3000
   gt dashboard --bind 0.0.0.0     # Listen on all interfaces
-  gt dashboard --open             # Start and open browser`,
+  gt dashboard --open             # Start and open browser
+  gt dashboard --snapshot         # Read from cached snapshot (no live bd fan-out)`,
 	RunE: runDashboard,
 }
 
@@ -52,6 +55,8 @@ func init() {
 	}
 	dashboardCmd.Flags().StringVar(&dashboardBind, "bind", defaultBind, "Address to bind to (use 0.0.0.0 for all interfaces)")
 	dashboardCmd.Flags().BoolVar(&dashboardOpen, "open", false, "Open browser automatically")
+	dashboardCmd.Flags().BoolVar(&dashboardSnapshot, "snapshot", false, "Read from cached status-snapshot.json instead of live bd fan-out")
+	dashboardCmd.Flags().StringVar(&dashboardSnapshotPath, "snapshot-path", "", "Path to snapshot file (default: ~/gt/.cache/status-snapshot.json)")
 	rootCmd.AddCommand(dashboardCmd)
 }
 
@@ -76,11 +81,6 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 		// Without this, inherited env vars could point bd at the wrong port.
 		ensureDoltPortEnv(townRoot)
 
-		fetcher, fetchErr := web.NewLiveConvoyFetcher()
-		if fetchErr != nil {
-			return fmt.Errorf("creating convoy fetcher: %w", fetchErr)
-		}
-
 		// Load web timeouts config (nil-safe: NewDashboardMux applies defaults)
 		if ts, loadErr := config.LoadOrCreateTownSettings(config.TownSettingsPath(townRoot)); loadErr == nil {
 			if ts.WebTimeouts != nil {
@@ -88,6 +88,18 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 			}
 		} else {
 			fmt.Fprintf(cmd.ErrOrStderr(), "warning: loading town settings: %v (using defaults)\n", loadErr)
+		}
+
+		var fetcher web.ConvoyFetcher
+		if dashboardSnapshot {
+			fetcher = web.NewSnapshotFetcher(dashboardSnapshotPath)
+			fmt.Fprintf(cmd.OutOrStdout(), "  snapshot mode: reading from %s\n", web.SnapshotPath(dashboardSnapshotPath))
+		} else {
+			var fetchErr error
+			fetcher, fetchErr = web.NewLiveConvoyFetcher()
+			if fetchErr != nil {
+				return fmt.Errorf("creating convoy fetcher: %w", fetchErr)
+			}
 		}
 
 		handler, err = web.NewDashboardMux(fetcher, webCfg)
