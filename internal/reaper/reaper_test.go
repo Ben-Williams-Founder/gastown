@@ -265,7 +265,7 @@ func TestReapExcludesAgentBeads(t *testing.T) {
 // predicate as Reap() for stale open wisps. If Scan counts agent beads but Reap
 // excludes them, the operator sees scan>0 and reap=0 for the same cutoff.
 func TestScanExcludesAgentBeads(t *testing.T) {
-	query := reapCandidatesQuery("gt", false)
+	query := reapCandidatesQuery(false)
 	if !strings.Contains(query, "w.issue_type != 'agent'") {
 		t.Fatalf("expected Scan() eligibility query to exclude agent beads:\n%s", query)
 	}
