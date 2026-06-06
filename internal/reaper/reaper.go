@@ -359,10 +359,11 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	}
 
 	// Anomaly detection: dangling parent references.
+	// Always use splitTarget=true: depends_on_id exists on migrated schemas but
+	// holds only NULLs, so retryDependencyTargetQuery never fires (no SQL error)
+	// and the non-split query treats every record as dangling (hq-3q2c).
 	var danglingCount int
-	if err := retryDependencyTargetQuery(func(splitTarget bool) error {
-		return db.QueryRowContext(ctx, danglingParentQuery(splitTarget)).Scan(&danglingCount)
-	}); err == nil && danglingCount > 0 {
+	if err := db.QueryRowContext(ctx, danglingParentQuery(true)).Scan(&danglingCount); err == nil && danglingCount > 0 {
 		result.Anomalies = append(result.Anomalies, Anomaly{
 			Type:    "dangling_parent_ref",
 			Message: fmt.Sprintf("%d wisp(s) have parent dependency records pointing to purged/missing parents", danglingCount),
