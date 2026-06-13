@@ -2,7 +2,6 @@ package reaper
 
 import (
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 )
@@ -52,15 +51,13 @@ func TestFormatJSON(t *testing.T) {
 }
 
 func TestParentExcludeJoin(t *testing.T) {
-	joinClause, whereCondition := parentExcludeJoin("testdb")
+	joinClause, whereCondition := parentExcludeJoin(false)
 
 	// JOIN clause should reference the correct database.
 	if joinClause == "" {
 		t.Error("parentExcludeJoin joinClause should not be empty")
 	}
-	// parentExcludeJoin no longer qualifies table names with the database — the
-	// reaper connects to a specific database via the DSN, so unqualified names
-	// are correct. The dbName parameter is retained for API compatibility.
+	// parentExcludeJoin connects via DSN so table names are unqualified (correct).
 
 	// JOIN should select wisps with open parents from wisp_dependencies.
 	if !contains(joinClause, "wisp_dependencies") {
@@ -87,9 +84,7 @@ func TestParentExcludeJoin(t *testing.T) {
 // dbName was passed as a Sprintf arg but the format string didn't use it, causing
 // positional shift: "FROM wisps w gt WHERE..." instead of "FROM wisps w LEFT JOIN...".
 func TestReapQueryNoDatabaseNameInjection(t *testing.T) {
-	// Reproduce the exact Sprintf call from Reap() to verify no dbName injection.
-	dbName := "gt"
-	parentJoin, parentWhere := parentExcludeJoin(dbName)
+	parentJoin, parentWhere := parentExcludeJoin(false)
 	whereClause := fmt.Sprintf(
 		"w.status IN ('open', 'hooked', 'in_progress') AND w.created_at < ? AND %s", parentWhere)
 
@@ -98,8 +93,6 @@ func TestReapQueryNoDatabaseNameInjection(t *testing.T) {
 		"SELECT w.id FROM wisps w %s WHERE %s LIMIT %d",
 		parentJoin, whereClause, DefaultBatchSize)
 
-	// The query must NOT contain the literal database name as a bare token.
-	// Before the fix, "gt" appeared between "wisps w" and "WHERE".
 	if strings.Contains(idQuery, "wisps w gt") {
 		t.Errorf("Reap idQuery contains injected database name: %s", idQuery)
 	}
@@ -108,6 +101,48 @@ func TestReapQueryNoDatabaseNameInjection(t *testing.T) {
 	}
 	if !strings.Contains(idQuery, fmt.Sprintf("LIMIT %d", DefaultBatchSize)) {
 		t.Errorf("Reap idQuery should end with LIMIT %d, got: %s", DefaultBatchSize, idQuery)
+	}
+}
+
+func TestParentExcludeJoinUsesSplitWispDependencyTarget(t *testing.T) {
+	joinClause, _ := parentExcludeJoin(true)
+	targetExpr := "COALESCE(wd.depends_on_issue_id, wd.depends_on_wisp_id, wd.depends_on_external)"
+
+	if strings.Contains(joinClause, "wd.depends_on_id") {
+		t.Fatalf("split parent join should not use legacy depends_on_id column:\n%s", joinClause)
+	}
+	if !strings.Contains(joinClause, "LEFT JOIN wisps pw ON pw.id = "+targetExpr) {
+		t.Fatalf("split parent join should use %s for wisp parents:\n%s", targetExpr, joinClause)
+	}
+	if !strings.Contains(joinClause, "LEFT JOIN issues pi ON pi.id = "+targetExpr) {
+		t.Fatalf("split parent join should use %s for issue parents:\n%s", targetExpr, joinClause)
+	}
+}
+
+func TestDanglingParentQueryUsesSplitWispDependencyTarget(t *testing.T) {
+	query := danglingParentQuery(true)
+	targetExpr := "COALESCE(wd.depends_on_issue_id, wd.depends_on_wisp_id, wd.depends_on_external)"
+
+	if strings.Contains(query, "wd.depends_on_id") {
+		t.Fatalf("split dangling-parent query should not use legacy depends_on_id column:\n%s", query)
+	}
+	if !strings.Contains(query, "LEFT JOIN wisps pw ON pw.id = "+targetExpr) {
+		t.Fatalf("split dangling-parent query should use %s for wisp parents:\n%s", targetExpr, query)
+	}
+	if !strings.Contains(query, "LEFT JOIN issues pi ON pi.id = "+targetExpr) {
+		t.Fatalf("split dangling-parent query should use %s for issue parents:\n%s", targetExpr, query)
+	}
+}
+
+func TestReverseWispDependencyDeleteQueryUsesSplitTarget(t *testing.T) {
+	query := reverseWispDependencyDeleteQuery("(?,?)", true)
+	targetExpr := "COALESCE(wisp_dependencies.depends_on_issue_id, wisp_dependencies.depends_on_wisp_id, wisp_dependencies.depends_on_external)"
+
+	if strings.Contains(query, "depends_on_id") {
+		t.Fatalf("split reverse dependency cleanup should not use legacy depends_on_id column:\n%s", query)
+	}
+	if !strings.Contains(query, targetExpr+" IN (?,?)") {
+		t.Fatalf("split reverse dependency cleanup should match through %s:\n%s", targetExpr, query)
 	}
 }
 
@@ -230,19 +265,70 @@ func TestReapExcludesAgentBeads(t *testing.T) {
 // predicate as Reap() for stale open wisps. If Scan counts agent beads but Reap
 // excludes them, the operator sees scan>0 and reap=0 for the same cutoff.
 func TestScanExcludesAgentBeads(t *testing.T) {
-	sourcePath := "reaper.go"
-	data, err := os.ReadFile(sourcePath)
+	query := reapCandidatesQuery(false)
+	if !strings.Contains(query, "w.issue_type != 'agent'") {
+		t.Fatalf("expected Scan() eligibility query to exclude agent beads:\n%s", query)
+	}
+}
+
+func TestScanStaleCandidatesQueryUsesSplitDependencyTarget(t *testing.T) {
+	query := scanStaleCandidatesQuery(true)
+	targetExpr := "COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external)"
+
+	if strings.Contains(query, "d.depends_on_id") {
+		t.Fatalf("split schema query should not use legacy depends_on_id column:\n%s", query)
+	}
+	if !strings.Contains(query, "INNER JOIN issues dep ON "+targetExpr+" = dep.id") {
+		t.Fatalf("split schema query should join active dependencies through %s:\n%s", targetExpr, query)
+	}
+	if !strings.Contains(query, "SELECT DISTINCT "+targetExpr+" FROM dependencies d") {
+		t.Fatalf("split schema query should exclude issues that are active dependency targets through %s:\n%s", targetExpr, query)
+	}
+}
+
+func TestRetryDependencyTargetQueryFallsBackToSplitTarget(t *testing.T) {
+	var calls []bool
+	err := retryDependencyTargetQuery(func(splitTarget bool) error {
+		calls = append(calls, splitTarget)
+		if !splitTarget {
+			return fmt.Errorf(`query failed: unknown column "d.depends_on_id"`)
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("read %s: %v", sourcePath, err)
+		t.Fatalf("retryDependencyTargetQuery returned error: %v", err)
 	}
-	source := string(data)
-	scanStart := strings.Index(source, "func Scan(")
-	reapStart := strings.Index(source, "func Reap(")
-	if scanStart == -1 || reapStart == -1 || reapStart <= scanStart {
-		t.Fatalf("could not isolate Scan() body in %s", sourcePath)
+	if len(calls) != 2 || calls[0] || !calls[1] {
+		t.Fatalf("retryDependencyTargetQuery calls = %v, want [false true]", calls)
 	}
-	scanBody := source[scanStart:reapStart]
-	if !strings.Contains(scanBody, "w.issue_type != 'agent'") {
-		t.Fatalf("expected Scan() eligibility to exclude agent beads, scan body was:\n%s", scanBody)
+}
+
+func TestRetryDependencyTargetQueryDoesNotRetryUnrelatedError(t *testing.T) {
+	var calls []bool
+	wantErr := fmt.Errorf("connection refused")
+	err := retryDependencyTargetQuery(func(splitTarget bool) error {
+		calls = append(calls, splitTarget)
+		return wantErr
+	})
+	if err != wantErr {
+		t.Fatalf("retryDependencyTargetQuery error = %v, want %v", err, wantErr)
+	}
+	if len(calls) != 1 || calls[0] {
+		t.Fatalf("retryDependencyTargetQuery calls = %v, want [false]", calls)
+	}
+}
+
+func TestAutoCloseWhereClauseUsesSplitDependencyTarget(t *testing.T) {
+	whereClause := autoCloseWhereClause("hq", true)
+	targetExpr := "COALESCE(d.depends_on_issue_id, d.depends_on_wisp_id, d.depends_on_external)"
+
+	if strings.Contains(whereClause, "d.depends_on_id") {
+		t.Fatalf("split schema where clause should not use legacy depends_on_id column:\n%s", whereClause)
+	}
+	if !strings.Contains(whereClause, "INNER JOIN `hq`.issues dep ON "+targetExpr+" = dep.id") {
+		t.Fatalf("split schema where clause should join active dependencies through %s:\n%s", targetExpr, whereClause)
+	}
+	if !strings.Contains(whereClause, "SELECT DISTINCT "+targetExpr+" FROM `hq`.dependencies d") {
+		t.Fatalf("split schema where clause should exclude active dependency targets through %s:\n%s", targetExpr, whereClause)
 	}
 }
