@@ -289,6 +289,41 @@ func reverseWispDependencyDeleteQuery(inClause string, splitTarget bool) string 
 	return fmt.Sprintf("DELETE FROM wisp_dependencies WHERE %s IN %s", targetExpr, inClause)
 }
 
+// cleanDanglingParentRefs deletes orphaned parent-child dependency rows whose
+// parent exists in neither wisps nor issues — the exact condition
+// danglingParentQuery detects — then commits to Dolt. This is the deterministic
+// self-resolution of the dangling_parent_ref anomaly: these rows are benign
+// leftovers from squashing/closing a parent wisp, and the purge path already
+// removes them on reap cycles (hq-mnc1). Running it on the scan path too means a
+// benign, self-healing condition no longer escalates an LLM-visible anomaly to
+// the mayor. Returns the number of rows removed.
+func cleanDanglingParentRefs(ctx context.Context, db *sql.DB, dbName string) (int64, error) {
+	res, err := db.ExecContext(ctx,
+		`DELETE FROM wisp_dependencies
+		 WHERE type = 'parent-child'
+		   AND depends_on_wisp_id IS NOT NULL
+		   AND depends_on_wisp_id != ''
+		   AND NOT EXISTS (SELECT 1 FROM wisps  WHERE id = depends_on_wisp_id)
+		   AND NOT EXISTS (SELECT 1 FROM issues WHERE id = depends_on_wisp_id)`)
+	if err != nil {
+		return 0, fmt.Errorf("delete dangling parent refs: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return 0, nil
+	}
+	// Flush the SQL transaction to the Dolt working set, then DOLT_COMMIT
+	// (mirrors the purge path's commit handling).
+	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+		return n, fmt.Errorf("sql commit after dangling-ref clean: %w", err)
+	}
+	commitMsg := fmt.Sprintf("reaper: auto-clean %d dangling parent ref(s) in %s", n, dbName)
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		return n, fmt.Errorf("dolt commit after dangling-ref clean: %w", err)
+	}
+	return n, nil
+}
+
 // HasReaperSchema checks whether the database has the tables required for reaper
 // operations (wisps and issues). Returns false (no error) when tables are missing
 // — callers use this to skip databases that have incomplete beads schema (e.g.
@@ -366,13 +401,32 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	// Always use splitTarget=true: depends_on_id exists on migrated schemas but
 	// holds only NULLs, so retryDependencyTargetQuery never fires (no SQL error)
 	// and the non-split query treats every record as dangling (hq-3q2c).
+	//
+	// Self-resolution over escalation: these are benign, self-healing orphans.
+	// Auto-clean them here (the same delete the purge path runs) and only escalate
+	// if the cleanup does NOT clear them — i.e. a genuine, non-self-healing anomaly.
 	var danglingCount int
 	if err := db.QueryRowContext(ctx, danglingParentQuery(true)).Scan(&danglingCount); err == nil && danglingCount > 0 {
-		result.Anomalies = append(result.Anomalies, Anomaly{
-			Type:    "dangling_parent_ref",
-			Message: fmt.Sprintf("%d wisp(s) have parent dependency records pointing to purged/missing parents", danglingCount),
-			Count:   danglingCount,
-		})
+		cleaned, cerr := cleanDanglingParentRefs(ctx, db, dbName)
+		if cerr != nil {
+			// Cleanup failed — escalate so it is not silently dropped.
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "dangling_parent_ref",
+				Message: fmt.Sprintf("%d dangling parent ref(s); auto-clean failed: %v", danglingCount, cerr),
+				Count:   danglingCount,
+			})
+		} else {
+			var remaining int
+			if rerr := db.QueryRowContext(ctx, danglingParentQuery(true)).Scan(&remaining); rerr == nil && remaining > 0 {
+				// Persisted past cleanup — a real anomaly worth surfacing.
+				result.Anomalies = append(result.Anomalies, Anomaly{
+					Type:    "dangling_parent_ref",
+					Message: fmt.Sprintf("%d dangling parent ref(s) persist after auto-clean (removed %d)", remaining, cleaned),
+					Count:   remaining,
+				})
+			}
+			// else: cleaned to zero — deterministic self-resolution, no escalation.
+		}
 	}
 
 	return result, nil
