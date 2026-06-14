@@ -253,6 +253,47 @@ type sqlRunner interface {
 	QueryRowContext(context.Context, string, ...interface{}) *sql.Row
 }
 
+// cleanDanglingParentRefs deletes orphaned parent-child dependency rows whose
+// parent exists in neither wisps nor issues — exactly the condition the scan's
+// danglingQuery detects — then commits to Dolt. This is the deterministic
+// self-resolution of the dangling_parent_ref anomaly: these rows are benign
+// leftovers from squashing/closing a parent wisp, and the purge path already
+// removes them on reap cycles (hq-mnc1). Running it on the scan path too means a
+// benign, self-healing condition no longer escalates an LLM-visible anomaly to
+// the mayor. Returns the number of rows removed.
+//
+// The DELETE predicate mirrors the detection query's typed-column semantics
+// (depends_on_wisp_id / depends_on_issue_id with the depends_on_external guard)
+// so cleanup removes precisely the rows detection counts — a dangling row whose
+// missing parent is an issue (not a wisp) is cleaned too, not left to re-escalate.
+func cleanDanglingParentRefs(ctx context.Context, db *sql.DB, dbName string) (int64, error) {
+	res, err := db.ExecContext(ctx,
+		`DELETE wd FROM wisp_dependencies wd
+		 LEFT JOIN wisps  pw ON pw.id = wd.depends_on_wisp_id
+		 LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id
+		 WHERE wd.type = 'parent-child'
+		   AND wd.depends_on_external IS NULL
+		   AND (wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL)
+		   AND pw.id IS NULL AND pi.id IS NULL`)
+	if err != nil {
+		return 0, fmt.Errorf("delete dangling parent refs: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return 0, nil
+	}
+	// Flush the SQL transaction to the Dolt working set, then DOLT_COMMIT
+	// (mirrors the purge path's commit handling).
+	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+		return n, fmt.Errorf("sql commit after dangling-ref clean: %w", err)
+	}
+	commitMsg := fmt.Sprintf("reaper: auto-clean %d dangling parent ref(s) in %s", n, dbName)
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+		return n, fmt.Errorf("dolt commit after dangling-ref clean: %w", err)
+	}
+	return n, nil
+}
+
 // HasReaperSchema checks whether the database has the tables required for reaper
 // operations (wisps and issues). Returns false (no error) when tables are missing
 // — callers use this to skip databases that have incomplete beads schema (e.g.
@@ -390,17 +431,41 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 	}
 
 	// Anomaly detection: dangling parent references.
+	//
+	// Self-resolution over escalation (fork patch, hq-mnc1): these are benign,
+	// self-healing orphans left when a parent wisp is squashed/closed, and the
+	// purge path already removes them on reap cycles. Auto-clean them here on the
+	// scan path too (same condition as detection) and only escalate if the cleanup
+	// fails or the refs persist — i.e. a genuine, non-self-healing anomaly. This
+	// keeps a benign, recurring condition from escalating a HIGH anomaly to the
+	// mayor on every polecat completion. Detection uses upstream's typed query
+	// (depends_on_wisp_id / depends_on_issue_id, external-null guarded).
 	danglingQuery := `
 		SELECT COUNT(*) FROM wisp_dependencies wd
 		LEFT JOIN wisps pw ON pw.id = wd.depends_on_wisp_id LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id
 		WHERE wd.type = 'parent-child' AND wd.depends_on_external IS NULL AND (wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL) AND pw.id IS NULL AND pi.id IS NULL`
 	var danglingCount int
 	if err := db.QueryRowContext(ctx, danglingQuery).Scan(&danglingCount); err == nil && danglingCount > 0 {
-		result.Anomalies = append(result.Anomalies, Anomaly{
-			Type:    "dangling_parent_ref",
-			Message: fmt.Sprintf("%d wisp(s) have parent dependency records pointing to purged/missing parents", danglingCount),
-			Count:   danglingCount,
-		})
+		cleaned, cerr := cleanDanglingParentRefs(ctx, db, dbName)
+		if cerr != nil {
+			// Cleanup failed — escalate so it is not silently dropped.
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "dangling_parent_ref",
+				Message: fmt.Sprintf("%d dangling parent ref(s); auto-clean failed: %v", danglingCount, cerr),
+				Count:   danglingCount,
+			})
+		} else {
+			var remaining int
+			if rerr := db.QueryRowContext(ctx, danglingQuery).Scan(&remaining); rerr == nil && remaining > 0 {
+				// Persisted past cleanup — a real anomaly worth surfacing.
+				result.Anomalies = append(result.Anomalies, Anomaly{
+					Type:    "dangling_parent_ref",
+					Message: fmt.Sprintf("%d dangling parent ref(s) persist after auto-clean (removed %d)", remaining, cleaned),
+					Count:   remaining,
+				})
+			}
+			// else: cleaned to zero — deterministic self-resolution, no escalation.
+		}
 	}
 
 	return result, nil
