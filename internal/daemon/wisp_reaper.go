@@ -89,6 +89,16 @@ func (d *Daemon) reapWisps() {
 	maxAge := wispReaperMaxAge(d.patrolConfig)
 	deleteAge := wispDeleteAge(d.patrolConfig)
 
+	// Determinism: skip dispatching a reaper Dog when there is nothing to reap.
+	// A quiet town otherwise spawns an hourly Dog that finds no work, never self-
+	// completes (no `gt dog done`), and is force-cleared as "stuck" 2h later —
+	// producing the recurring HIGH "slung but hook empty" escalation churn. The
+	// candidate scan also auto-cleans benign dangling parent-refs in passing.
+	if !d.reaperHasWork(config, maxAge, deleteAge) {
+		d.logger.Printf("wisp_reaper: nothing to reap, skipping Dog dispatch")
+		return
+	}
+
 	vars := map[string]string{
 		"max_age":         maxAge.String(),
 		"purge_age":       deleteAge.String(),
@@ -120,6 +130,42 @@ func (d *Daemon) reapWisps() {
 	}
 
 	d.logger.Printf("wisp_reaper: dispatched to Dog for formula-driven execution")
+}
+
+// reaperHasWork scans the reaper databases for any reap/purge/mail/stale
+// candidates or anomalies. Returns false when the town is quiet, so reapWisps
+// can skip dispatching a Dog (and the working-state churn + escalations that
+// follow). On any scan error it returns true (conservative — let the Dog run).
+// The scan itself auto-cleans benign dangling parent-refs (see reaper.Scan).
+func (d *Daemon) reaperHasWork(config *WispReaperConfig, maxAge, deleteAge time.Duration) bool {
+	databases := config.Databases
+	if len(databases) == 0 {
+		databases = reaper.DiscoverDatabases("127.0.0.1", d.doltServerPort())
+	}
+	port := d.doltServerPort()
+	for _, dbName := range databases {
+		if err := reaper.ValidateDBName(dbName); err != nil {
+			continue
+		}
+		db, err := reaper.OpenDB("127.0.0.1", port, dbName, 10*time.Second, 10*time.Second)
+		if err != nil {
+			return true
+		}
+		ok, _ := reaper.HasReaperSchema(db)
+		if !ok {
+			db.Close()
+			continue
+		}
+		res, err := reaper.Scan(db, dbName, maxAge, deleteAge, defaultMailDeleteAge, defaultStaleIssueAge)
+		db.Close()
+		if err != nil {
+			return true
+		}
+		if res.ReapCandidates+res.PurgeCandidates+res.MailCandidates+res.StaleCandidates > 0 || len(res.Anomalies) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // dispatchReaperDog dispatches the mol-dog-reaper formula to a Dog via gt sling.
