@@ -121,14 +121,12 @@ func (d *Daemon) reapWisps() {
 		d.logger.Printf("wisp_reaper: DRY RUN — reporting only, no changes will be made")
 	}
 
-	// Try dispatching to a Dog for formula-driven execution.
-	if err := d.dispatchReaperDog(vars); err != nil {
-		d.logger.Printf("wisp_reaper: Dog dispatch failed (%v), running inline fallback", err)
-		d.reapWispsInline(config, maxAge, deleteAge, mol)
-		return
-	}
-
-	d.logger.Printf("wisp_reaper: dispatched to Dog for formula-driven execution")
+	// Reap inline (deterministic). Reaping is mechanical SQL; running it in-process
+	// avoids the LLM-Dog lifecycle — a dispatched Dog that never self-completes
+	// (no `gt dog done`) leaves candidates piling up, is force-cleared as "stuck"
+	// at 2h, and produces the recurring "slung but hook empty" escalation churn.
+	// Determinism over LLM-orchestration. (dispatchReaperDog retained for reference.)
+	d.reapWispsInline(config, maxAge, deleteAge, mol)
 }
 
 // reaperHasWork scans the reaper databases for any reap/purge/mail/stale
