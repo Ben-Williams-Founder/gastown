@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -164,6 +165,11 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 			return getReadySlingContexts(townRoot)
 		},
 		Validate: func(b capacity.PendingBead) error {
+			// Option B (governor admission, ADVISORY/log-only first cut): consult the
+			// resource-aware admit gate for EVERY autonomous scheduler dispatch and
+			// record the verdict to the bake — the data the wrapper-only path can't see.
+			// Fail-open + never blocks here; the enforce flip is a separate founder-gated step.
+			governorSchedulerBake(townRoot, b)
 			return validatePendingBeadForDispatch(townRoot, b, true)
 		},
 		Execute: func(b capacity.PendingBead) error {
@@ -624,6 +630,34 @@ func validateDryRunDispatchPlan(townRoot string, plan capacity.DispatchPlan) cap
 		plan.Reason = "validation"
 	}
 	return plan
+}
+
+// governorSchedulerBake consults the Governor admit-gate (presling) for an autonomous
+// scheduler dispatch and records the verdict to the bake log. Option B, ADVISORY/log-only
+// first cut: it is a pure side-effect — it NEVER affects whether the bead dispatches (any
+// error, timeout, or HOLD is ignored = fail-open). This gives the governor the full-volume
+// dispatch bake the wrapper-only path can't see; the enforce flip (respect a HOLD here) is a
+// separate, founder-gated step. Deployed as a gastown fork-patch (town-build), reversible by
+// removing this call or restoring the prior binary.
+func governorSchedulerBake(townRoot string, b capacity.PendingBead) {
+	rig := b.TargetRig
+	bead := b.WorkBeadID
+	if rig == "" || bead == "" {
+		return
+	}
+	repo := filepath.Join(townRoot, ".gov-tools")
+	if _, err := os.Stat(filepath.Join(repo, "tools", "governor")); err != nil {
+		return // governor tooling absent — fail-open, no-op
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "python3", "-m", "tools.governor", "presling",
+		"--rig", rig, "--bead", bead)
+	cmd.Dir = repo
+	cmd.Env = append(os.Environ(),
+		"PATH=/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin",
+		"GOVERNOR_BAKE_LOG="+filepath.Join(townRoot, "experiments", "governor-bake", "advisory.jsonl"))
+	_ = cmd.Run() // fail-open: ignore result entirely; the bake is a side-effect, dispatch never blocks
 }
 
 func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, escalate bool) error {
