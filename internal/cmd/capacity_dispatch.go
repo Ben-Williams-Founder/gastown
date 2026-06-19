@@ -165,11 +165,16 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 			return getReadySlingContexts(townRoot)
 		},
 		Validate: func(b capacity.PendingBead) error {
-			// Option B (governor admission, ADVISORY/log-only first cut): consult the
-			// resource-aware admit gate for EVERY autonomous scheduler dispatch and
-			// record the verdict to the bake — the data the wrapper-only path can't see.
-			// Fail-open + never blocks here; the enforce flip is a separate founder-gated step.
-			governorSchedulerBake(townRoot, b)
+			// Option B (governor admission, ENFORCE flip — founder-authorized 2026-06-19):
+			// consult the resource-aware admit gate for EVERY autonomous scheduler
+			// dispatch, record the verdict to the bake, AND defer the dispatch when the
+			// gate returns HOLD in enforce mode (presling exit 10). The defer requeues
+			// the bead cleanly (OnFailure leaves it queued, no circuit-breaker quota
+			// consumed). off/advisory rigs never defer (presling exits 0). Fail-open on
+			// any other gate error. Reversible: governor.yaml mode=off/advisory.
+			if deferErr := governorSchedulerBake(townRoot, b); deferErr != nil {
+				return deferErr
+			}
 			return validatePendingBeadForDispatch(townRoot, b, true)
 		},
 		Execute: func(b capacity.PendingBead) error {
@@ -196,6 +201,15 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		OnFailure: func(b capacity.PendingBead, err error) {
 			var onSuccessErr *capacity.ErrOnSuccessFailed
 			var admissionErr *polecatCapacityAdmissionError
+			var govDeferErr *governorDeferError
+			if errors.As(err, &govDeferErr) {
+				// Governor enforce DEFER: leave the context queued, do NOT record a
+				// dispatch failure (must not consume the circuit-breaker quota — the
+				// bead re-dispatches on the next ADMIT). A bead is never lost.
+				fmt.Fprintf(os.Stderr, "%s Governor deferred %s (resource pressure); leaving context queued\n",
+					style.Dim.Render("○"), b.WorkBeadID)
+				return
+			}
 			if errors.As(err, &onSuccessErr) {
 				// Polecat launched but context close failed — not a true dispatch failure.
 				// Log a distinct warning so operators can distinguish from "polecat never launched".
@@ -639,15 +653,39 @@ func validateDryRunDispatchPlan(townRoot string, plan capacity.DispatchPlan) cap
 // dispatch bake the wrapper-only path can't see; the enforce flip (respect a HOLD here) is a
 // separate, founder-gated step. Deployed as a gastown fork-patch (town-build), reversible by
 // removing this call or restoring the prior binary.
-func governorSchedulerBake(townRoot string, b capacity.PendingBead) {
+// governorDeferError signals the governor admission gate returned HOLD/DEFER
+// (presling exit 10, which happens ONLY in enforce mode). OnFailure treats this
+// as a clean requeue — the bead stays ready and re-dispatches on the next ADMIT —
+// NOT a dispatch failure. It must NOT flow through recordDispatchFailure (that
+// would consume the circuit-breaker quota and eventually drop the work; the
+// governor.yaml contract is "a bead is never lost").
+type governorDeferError struct {
+	Rig  string
+	Bead string
+}
+
+func (e *governorDeferError) Error() string {
+	if e == nil {
+		return "governor: deferred"
+	}
+	return fmt.Sprintf("governor: admission gate deferred dispatch (rig %s, bead %s)", e.Rig, e.Bead)
+}
+
+// governorSchedulerBake consults the resource-aware admit gate for an autonomous
+// scheduler dispatch and records the verdict to the bake. presling exit codes:
+// 0 = PROCEED, 10 = DEFER, 2 = usage. presling returns 10 ONLY in enforce mode on
+// a HOLD (off/advisory always return 0), so a non-nil return here occurs ONLY when
+// the rig is in enforce mode AND the box is under pressure. Fail-open on every
+// other error (timeout, missing tooling, usage) — dispatch proceeds.
+func governorSchedulerBake(townRoot string, b capacity.PendingBead) error {
 	rig := b.TargetRig
 	bead := b.WorkBeadID
 	if rig == "" || bead == "" {
-		return
+		return nil
 	}
 	repo := filepath.Join(townRoot, ".gov-tools")
 	if _, err := os.Stat(filepath.Join(repo, "tools", "governor")); err != nil {
-		return // governor tooling absent — fail-open, no-op
+		return nil // governor tooling absent — fail-open, no-op
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -657,7 +695,17 @@ func governorSchedulerBake(townRoot string, b capacity.PendingBead) {
 	cmd.Env = append(os.Environ(),
 		"PATH=/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin",
 		"GOVERNOR_BAKE_LOG="+filepath.Join(townRoot, "experiments", "governor-bake", "advisory.jsonl"))
-	_ = cmd.Run() // fail-open: ignore result entirely; the bake is a side-effect, dispatch never blocks
+	err := cmd.Run()
+	if err == nil {
+		return nil // PROCEED (exit 0)
+	}
+	// Only exit 10 (DEFER, enforce-mode HOLD) enforces. Every other error is
+	// fail-open (timeout / usage / python missing → proceed, never block).
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 10 {
+		return &governorDeferError{Rig: rig, Bead: bead}
+	}
+	return nil // fail-open
 }
 
 func validatePendingBeadForDispatch(townRoot string, b capacity.PendingBead, escalate bool) error {
