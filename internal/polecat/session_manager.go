@@ -475,6 +475,12 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		envVars[runtimeConfig.Session.ConfigDirEnv] = opts.RuntimeConfigDir
 	}
 
+	// Optionally place the polecat's process tree under a cgroup slice so the
+	// box-optimizer actuator has a real CPUWeight throttle target (wkb-1dy6).
+	// INERT unless GT_POLECAT_SLICE is set; fail-open on non-systemd hosts. See
+	// slice_wrap.go — this is polecat-scoped by construction (T0/T1 never wrapped).
+	command = wrapInSlice(command)
+
 	// Create session with command and env vars via -e flags so the initial
 	// shell — and Claude's subprocesses (notably bd) — inherit them from the start.
 	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)
