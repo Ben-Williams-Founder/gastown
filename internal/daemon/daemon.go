@@ -693,6 +693,20 @@ func (d *Daemon) Run() (err error) {
 		d.logger.Printf("Scheduled maintenance ticker started (check interval %v, window %s)", interval, window)
 	}
 
+	// Start dedicated dispatch ticker (always on). Dispatch was previously only
+	// invoked inside runScheduledMaintenance(), which is window- and commit-threshold
+	// -gated and fires every 5min — so ready beads sat undispatched in free slots for
+	// 15-36min+. This frequent, pressure-gated sweep dispatches promptly, independent
+	// of the maintenance cycle. (wkb-8x35)
+	var dispatchTicker *time.Ticker
+	var dispatchChan <-chan time.Time
+	{
+		dispatchTicker = time.NewTicker(45 * time.Second)
+		dispatchChan = dispatchTicker.C
+		defer dispatchTicker.Stop()
+		d.logger.Printf("Dispatch ticker started (interval 45s)")
+	}
+
 	// Start main-branch test runner ticker if configured.
 	// Periodically runs quality gates on each rig's main branch to catch regressions.
 	var mainBranchTestTicker *time.Ticker
@@ -810,6 +824,18 @@ func (d *Daemon) Run() (err error) {
 			// and runs `gt maintain --force` when commit counts exceed threshold.
 			if !d.isShutdownInProgress() {
 				d.runScheduledMaintenance()
+			}
+
+		case <-dispatchChan:
+			// Dedicated dispatch sweep (wkb-8x35): dispatch ready beads into free
+			// slots promptly, independent of the window/threshold-gated maintenance
+			// cycle. Pressure-gated, same as the maintenance-path dispatch.
+			if !d.isShutdownInProgress() {
+				if p := d.checkPressure("polecat"); !p.OK {
+					d.logger.Printf("Deferring polecat dispatch (sweep): %s", p.Reason)
+				} else {
+					d.dispatchQueuedWork()
+				}
 			}
 
 		case <-mainBranchTestChan:
