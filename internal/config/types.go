@@ -521,6 +521,28 @@ type PolecatConfig struct {
 	// Values: "per_bead" (default), "every_n_beads:<N>", "never".
 	// Parsed by polecat.ParseTargetCleanPolicy.
 	TargetCleanPolicy string `json:"target_clean_policy,omitempty"`
+
+	// Slice is the persisted systemd --user cgroup slice into which polecat
+	// process trees are placed (e.g. "polecat.slice"), giving the box-optimizer
+	// actuator a real CPUWeight throttle target (wkb-1dy6, wkb-h468).
+	//
+	// This is the deploy-neutral, ambient-env-independent counterpart to the
+	// GT_POLECAT_SLICE env var: when GT_POLECAT_SLICE is absent from the spawning
+	// process's environment (e.g. a manual `gt scheduler run` / `gt sling` from a
+	// shell that lacks the daemon unit's Environment= line) placement falls back
+	// to this config key, so EVERY dispatch path places consistently.
+	//
+	// Resolution precedence (see internal/polecat/slice_wrap.go):
+	//   GT_POLECAT_SLICE env  →  polecat.slice config  →  empty (no placement).
+	//
+	// DEPLOY-NEUTRAL: unset (empty) ⇒ behavior is byte-identical to env-only —
+	// the binary ships inert and the operator opts in once via
+	// `gt config set polecat.slice polecat.slice`.
+	//
+	// KILL-SWITCH: a value of "off", "none", or "" disables placement even if
+	// otherwise configured; a `$GT_TOWN_ROOT/NO_POLECAT_PLACEMENT` sentinel file
+	// force-disables placement regardless of env or config.
+	Slice string `json:"slice,omitempty"`
 }
 
 // ParseDurationOrDefault parses a Go duration string, returning fallback on error or empty input.

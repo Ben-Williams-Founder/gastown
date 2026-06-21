@@ -499,9 +499,12 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 
 	// Optionally place the polecat's process tree under a cgroup slice so the
 	// box-optimizer actuator has a real CPUWeight throttle target (wkb-1dy6).
-	// INERT unless GT_POLECAT_SLICE is set; fail-open on non-systemd hosts. See
-	// slice_wrap.go — this is polecat-scoped by construction (T0/T1 never wrapped).
-	command = wrapInSlice(command)
+	// Slice is resolved from GT_POLECAT_SLICE env → polecat.slice config → off,
+	// so EVERY dispatch path (daemon OR manual gt) places consistently regardless
+	// of the spawning shell's ambient env (wkb-h468). INERT until the env or config
+	// is set; fail-open on non-systemd hosts; kill-switch via NO_POLECAT_PLACEMENT
+	// sentinel. See slice_wrap.go — polecat-scoped by construction (T0/T1 never wrapped).
+	command = wrapInSlice(command, townRoot)
 
 	// Create session with command and env vars via -e flags so the initial
 	// shell — and Claude's subprocesses (notably bd) — inherit them from the start.
