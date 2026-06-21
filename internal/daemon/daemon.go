@@ -979,6 +979,13 @@ func (d *Daemon) heartbeat(state *State) {
 	// Kill sessions that have been idle longer than the configured threshold.
 	d.reapIdlePolecats()
 
+	// 12c. (WS2 Rung-3) Deterministically close the mol-polecat-work step-wisp
+	// chain of any polecat whose active_mr is CONFIRMED merged. Inert unless
+	// $GT_COMPLETION_CLOSE is set, so default behaviour is unchanged. Folds the
+	// external ~15min sweeper timer's work into the daemon (event-driven on a
+	// known fact). Fail-open: never closes an in-flight chain, never crashes.
+	d.completionCloseCycle()
+
 	// 13. Clean up orphaned claude subagent processes (memory leak prevention)
 	// These are Task tool subagents that didn't clean up after completion.
 	// This is a safety net - Deacon patrol also does this more frequently.
