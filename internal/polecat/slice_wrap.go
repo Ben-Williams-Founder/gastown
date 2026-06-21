@@ -54,8 +54,24 @@ func wrapInSliceWith(command, slice, goos string, lookPath func(string) (string,
 	// Run the original shell line verbatim under a transient --user scope in the slice.
 	// Single-quote the line so its own quoting/exec/env survive intact.
 	quoted := "'" + strings.ReplaceAll(command, "'", `'\''`) + "'"
+	// RUNTIME FAIL-OPEN (wkb-h468 regression fix). `systemd-run --user` connects to
+	// the per-user systemd manager via $XDG_RUNTIME_DIR / $DBUS_SESSION_BUS_ADDRESS.
+	// Those are NOT propagated into the polecat's tmux pane on the daemon dispatch
+	// path, so systemd-run exits 1 there and — when the line begins with `exec` — the
+	// pane dies and the polecat never starts (spawn fails → dispatch fails → the sling
+	// context circuit-breaks → "Scheduled: 0", a town-wide dispatch outage).
+	//
+	// Two guards make placement strictly best-effort and NEVER able to block spawn:
+	//   1. NO leading `exec`: systemd-run runs as a child, not a process replacement.
+	//   2. `|| exec /bin/sh -c <cmd>`: if placement fails for ANY reason (no user bus,
+	//      slice missing, transient scope-name clash), fall through and run the polecat
+	//      UNPLACED rather than not at all. Worst case = an unthrottled polecat (the
+	//      pre-feature default), never a dead one.
+	// On success the inner command is exec-replaced inside the scope, so the `||`
+	// branch is never reached — placement still works exactly as before where the bus
+	// is reachable.
 	return fmt.Sprintf(
-		"exec systemd-run --user --scope --slice=%s --quiet --collect -- /bin/sh -c %s",
-		slice, quoted,
+		"systemd-run --user --scope --slice=%s --quiet --collect -- /bin/sh -c %s || exec /bin/sh -c %s",
+		slice, quoted, quoted,
 	)
 }
