@@ -43,6 +43,38 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			in:   WorkstateInput{State: StateWorking, CleanupStatus: CleanupClean},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictWorking, Reason: "not-idle", NeedsRecovery: false, CountsTowardCapacity: true},
 		},
+		{
+			// THE LIVE CASE the headTreeEqual git heuristic missed: a polecat
+			// whose work squash-merged so its bead closed, with pre-squash
+			// checkpoint commits still counted as unpushed (HEAD sits behind an
+			// advanced origin/main, so the 2-dot tree diff is non-empty and
+			// `git cherry` reports every checkpoint as unmerged). Clean worktree.
+			// WorkBeadClosed must make this SAFE_TO_NUKE, not NEEDS_RECOVERY.
+			name: "closed work bead with unpushed checkpoints is safe",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/nitro", UnpushedCommits: 36, WorkBeadClosed: true, MQCheckRequired: true, HasSubmittableWork: true, AssignedBeadTerminal: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, MQStatus: "submitted", ReuseStatus: "idle-preserved"},
+		},
+		{
+			// Regression: bead still OPEN with real unpushed content must STILL
+			// flag NEEDS_RECOVERY (no work loss). WorkBeadClosed=false.
+			name: "open bead with unpushed content still needs recovery",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/nitro", UnpushedCommits: 12, WorkBeadClosed: false},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "git-unpushed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed"},
+		},
+		{
+			// Regression: closed bead but DIRTY worktree (uncommitted live WIP)
+			// must STILL flag. WorkBeadClosed only suppresses unpushed commits,
+			// never uncommitted/stash state.
+			name: "closed bead with dirty worktree still flags",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/nitro", UnpushedCommits: 36, GitDirty: true, GitDirtyReason: "git_state=has_uncommitted uncommitted_files=3", WorkBeadClosed: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "git-dirty", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed"},
+		},
+		{
+			// Regression: closed bead but a STASH present must STILL flag.
+			name: "closed bead with stash still flags",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/nitro", UnpushedCommits: 36, StashCount: 1, WorkBeadClosed: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "git-stash", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed"},
+		},
 	}
 
 	for _, tt := range tests {

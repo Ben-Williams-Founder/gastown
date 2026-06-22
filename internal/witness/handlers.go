@@ -1068,6 +1068,10 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	input.MQCheckRequired = input.Branch != ""
 	input.HasSubmittableWork = witnessHasSubmittableWork(clonePath)
 	input.AssignedBeadTerminal = witnessIssueTerminal(rigBeads, issueID)
+	// Work bead closed (assigned OR source OR hook terminal) ⇒ HEAD's unpushed
+	// commits are pre-squash checkpoints whose content already merged; they must
+	// not produce a false NEEDS_RECOVERY. Mirrors check-recovery's workTerminal.
+	input.WorkBeadClosed = input.AssignedBeadTerminal || sourceTerminal || hookTerminal
 	if polecat.CanIgnoreStaleCleanupStatus(input.CleanupStatus, input.AssignedBeadTerminal || sourceTerminal || hookTerminal, hookSafe, activeMRSafe, gitSafe) {
 		input.IgnoreCleanupStatus = true
 	}
