@@ -521,6 +521,16 @@ type PolecatConfig struct {
 	// Values: "per_bead" (default), "every_n_beads:<N>", "never".
 	// Parsed by polecat.ParseTargetCleanPolicy.
 	TargetCleanPolicy string `json:"target_clean_policy,omitempty"`
+
+	// CgroupSlice is the systemd --user slice that polecat process trees are
+	// placed under at spawn (wkb-h468), giving the box-optimizer actuator a real
+	// CPUWeight throttle target. Durable, env-independent source so MANUAL
+	// dispatch (`gt sling`/`gt scheduler run` from a shell without
+	// GT_POLECAT_SLICE) still places polecats in the slice. Precedence:
+	// GT_POLECAT_SLICE env (if present, wins) → this key → "polecat.slice".
+	// Placement is always best-effort/fail-open; empty falls back to the default.
+	// Example: "polecat.slice". Set "" then rely on env to disable via daemon flip.
+	CgroupSlice string `json:"cgroup_slice,omitempty"`
 }
 
 // ParseDurationOrDefault parses a Go duration string, returning fallback on error or empty input.
