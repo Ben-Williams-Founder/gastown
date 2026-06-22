@@ -1205,26 +1205,15 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 		}
 	}
 
-	// 1. Close source issue with reference to MR.
-	// Use ForceCloseWithReason to bypass dependency checks — the source issue
-	// may have an attached molecule (wisp) whose open steps would block a
-	// normal close. This matches how gt done handles closures.
-	if mr.SourceIssue != "" {
-		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
-		if result.MergeCommit != "" {
-			closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, result.MergeCommit)
-		}
-		if err := e.beads.ForceCloseWithReason(closeReason, mr.SourceIssue); err != nil {
-			// Check if already closed (by polecat's gt done) — that's fine
-			if issue, showErr := e.beads.Show(mr.SourceIssue); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Source issue already closed: %s\n", mr.SourceIssue)
-			} else {
-				_, _ = fmt.Fprintf(e.output, "[Engineer] Warning: failed to close source issue %s: %v\n", mr.SourceIssue, err)
-			}
-		} else {
-			_, _ = fmt.Fprintf(e.output, "[Engineer] Closed source issue: %s\n", mr.SourceIssue)
-		}
-	}
+	// 1. Close the work bead that this MR merged.
+	// This is the fix for the re-dispatch-churn bug: when an MR merges but its
+	// work bead stays open, the scheduler re-dispatches a polecat onto already
+	// merged work, which redoes it and then wedges in NEEDS_RECOVERY.
+	// closeMergedWorkBead resolves the bead (preferring source_issue, falling
+	// back to the worker agent bead's active_mr/last_source_issue), is
+	// idempotent on already-terminal beads, and is only ever reached on a real
+	// merge success (HandleMRInfoFailure never calls it).
+	closeMergedWorkBead(e.beads, e.output, mr, result.MergeCommit)
 
 	// 1.2. Close conflict-resolution tasks that this land has made moot (hq-jnap).
 	// Conflict beads otherwise outlive the successful re-land of their content
@@ -1289,6 +1278,100 @@ func (e *Engineer) HandleMRInfoSuccess(mr *MRInfo, result ProcessResult) {
 
 func (e *Engineer) clearAgentActiveMR(agentBeadID string) error {
 	return e.beads.ForAgentBead().UpdateAgentActiveMR(agentBeadID, "")
+}
+
+// workBeadCloser is the minimal slice of *beads.Beads that
+// closeMergedWorkBead needs. Extracting it as an interface lets the
+// merge->bead-closed behaviour be unit-tested with a fake, without a live
+// Dolt server.
+type workBeadCloser interface {
+	Show(id string) (*beads.Issue, error)
+	ForceCloseWithReason(reason string, ids ...string) error
+}
+
+// resolveMergedWorkBead determines which work bead a merged MR closes.
+//
+// Preference order:
+//  1. mr.SourceIssue — the source_issue field stamped on the MR at submit time
+//     (the normal, populated case).
+//  2. The worker agent bead's last_source_issue — the active_mr -> bead mapping.
+//     This is the fallback for MRs whose source_issue field is missing/blank
+//     (the case that produced re-dispatch churn: a real merge with nothing to
+//     close, so the work bead stayed open and got re-slung).
+//
+// Returns "" when no work bead can be resolved (e.g. an MR with no source_issue
+// and no resolvable agent bead) — callers treat that as "nothing to close".
+func resolveMergedWorkBead(bd workBeadCloser, mr *MRInfo) string {
+	if mr == nil {
+		return ""
+	}
+	if mr.SourceIssue != "" {
+		return mr.SourceIssue
+	}
+	if mr.AgentBead == "" {
+		return ""
+	}
+	agent, err := bd.Show(mr.AgentBead)
+	if err != nil || agent == nil {
+		return ""
+	}
+	fields := beads.ParseAgentFields(agent.Description)
+	if fields == nil {
+		return ""
+	}
+	return fields.LastSourceIssue
+}
+
+// closeMergedWorkBead closes the work bead associated with a successfully
+// merged MR. It MUST only be called on a real merge success — never on a
+// reject, conflict, or slot timeout (HandleMRInfoFailure does not call it).
+//
+// Properties:
+//   - Idempotent: if the bead is already terminal (e.g. closed by the polecat's
+//     `gt done`), it is a no-op and never reports an error.
+//   - Force-closes to bypass open-molecule-step dependency checks, matching how
+//     `gt done` closes work beads.
+//   - Resolves the bead via resolveMergedWorkBead (source_issue, then the agent
+//     bead's active_mr -> last_source_issue fallback).
+func closeMergedWorkBead(bd workBeadCloser, out io.Writer, mr *MRInfo, mergeCommit string) {
+	logf := func(format string, args ...interface{}) {
+		if out != nil {
+			_, _ = fmt.Fprintf(out, format, args...)
+		}
+	}
+
+	workBead := resolveMergedWorkBead(bd, mr)
+	if workBead == "" {
+		logf("[Engineer] Note: merged MR %s has no resolvable work bead to close\n", mr.ID)
+		return
+	}
+
+	// Idempotency guard: if the work bead is already terminal, do nothing.
+	// A re-run of post-merge cleanup (or a polecat that already ran `gt done`)
+	// must never error here.
+	if issue, err := bd.Show(workBead); err == nil && issue != nil &&
+		beads.IssueStatus(issue.Status).IsTerminal() {
+		logf("[Engineer] Work bead already closed: %s\n", workBead)
+		return
+	}
+
+	closeReason := fmt.Sprintf("Merged in %s", mr.ID)
+	if mergeCommit != "" {
+		closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.Target, mergeCommit)
+	}
+
+	if err := bd.ForceCloseWithReason(closeReason, workBead); err != nil {
+		// Lost a race with another closer (polecat `gt done`, a concurrent
+		// post-merge) — re-check terminal state before warning.
+		if issue, showErr := bd.Show(workBead); showErr == nil && issue != nil &&
+			beads.IssueStatus(issue.Status).IsTerminal() {
+			logf("[Engineer] Work bead already closed: %s\n", workBead)
+		} else {
+			logf("[Engineer] Warning: failed to close work bead %s: %v\n", workBead, err)
+		}
+		return
+	}
+	logf("[Engineer] Closed work bead: %s\n", workBead)
 }
 
 // HandleMRInfoFailure handles a failed merge from MRInfo.
