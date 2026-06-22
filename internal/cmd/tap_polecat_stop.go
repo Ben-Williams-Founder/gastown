@@ -97,20 +97,23 @@ func runTapPolecatStop(cmd *cobra.Command, args []string) error {
 		return nil // On default branch — nothing to submit
 	}
 
-	// Check for commits ahead of origin/main
-	aheadCmd := exec.Command("git", "-C", cloneDir, "rev-list", "--count", "origin/main..HEAD")
-	aheadOut, err := aheadCmd.Output()
-	if err != nil {
-		return nil // Can't check — exit quietly (don't block session stop)
-	}
-	ahead := strings.TrimSpace(string(aheadOut))
-	if ahead == "0" {
-		return nil // No commits ahead — nothing to submit
+	// Decide whether the polecat has work to submit. This covers BOTH:
+	//   - committed-but-unpushed work (commits ahead of origin/main), and
+	//   - uncommitted work in the working tree (files written but never committed).
+	// The second case is the stranding bug this fix targets: the agent wrote
+	// implementation files, finished its turn (firing Stop), but never ran
+	// `git commit && gt done` — so there are 0 commits ahead and the old check
+	// bailed, leaving the work to rot into NEEDS_RECOVERY. gt done's gt-pvx
+	// auto-commit safety net commits dirty work before submitting, so handing
+	// the uncommitted case to gt done lands the work instead of stranding it.
+	decision := polecatStopPendingWork(cloneDir)
+	if !decision.HasWork {
+		return nil // Nothing to submit — exit quietly
 	}
 
 	// Polecat has pending work! Run gt done as a safety net.
 	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "⚠️  Polecat %s has %s unpushed commit(s) on branch %s\n", polecatName, ahead, branch)
+	fmt.Fprintf(os.Stderr, "⚠️  Polecat %s has unsubmitted work on branch %s (%s)\n", polecatName, branch, decision.Reason)
 	fmt.Fprintf(os.Stderr, "   Auto-running gt done as safety net...\n")
 	fmt.Fprintf(os.Stderr, "\n")
 
@@ -136,4 +139,57 @@ func runTapPolecatStop(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// polecatStopDecision is the pure result of inspecting a polecat worktree for
+// unsubmitted work at session-Stop time.
+type polecatStopDecision struct {
+	HasWork bool
+	Reason  string // human-readable description of what triggered the submit
+}
+
+// polecatStopPendingWork inspects a polecat's git worktree and reports whether
+// it holds work that should be submitted via gt done.
+//
+// It returns HasWork=true when EITHER:
+//   - there are commits ahead of origin/main (committed-but-unpushed work), OR
+//   - the working tree is dirty (uncommitted work — files written but never
+//     committed before the session's turn ended).
+//
+// The uncommitted-work case is the core of the submit-reliability fix: gt done
+// auto-commits dirty work (gt-pvx) before submitting, so routing it through gt
+// done lands the work instead of letting it strand into NEEDS_RECOVERY. This is
+// safe to do on Stop because the Claude Code Stop hook fires only when the agent
+// finishes its turn normally — it does NOT fire on context-limit (PreCompact),
+// crash, or API error — so a Stop is a genuine completion signal, not a snapshot
+// of an in-flight edit. Git errors fail closed (HasWork=false) so a transient
+// git failure never blocks session stop.
+func polecatStopPendingWork(cloneDir string) polecatStopDecision {
+	// Committed-but-unpushed: commits ahead of origin/main.
+	aheadOut, err := exec.Command("git", "-C", cloneDir, "rev-list", "--count", "origin/main..HEAD").Output()
+	if err == nil {
+		ahead := strings.TrimSpace(string(aheadOut))
+		if ahead != "" && ahead != "0" {
+			return polecatStopDecision{
+				HasWork: true,
+				Reason:  ahead + " unpushed commit(s)",
+			}
+		}
+	}
+
+	// Uncommitted work: dirty working tree. `git status --porcelain` prints one
+	// line per changed/untracked path; any output means there is work that gt
+	// done will auto-commit and submit. gt done itself filters out runtime/overlay
+	// artifacts (CLAUDE.local.md, .runtime, etc.) before committing, so a strict
+	// emptiness check here is intentionally conservative: if anything is dirty we
+	// hand off to gt done, which makes the authoritative include/exclude decision.
+	statusOut, err := exec.Command("git", "-C", cloneDir, "status", "--porcelain").Output()
+	if err == nil && strings.TrimSpace(string(statusOut)) != "" {
+		return polecatStopDecision{
+			HasWork: true,
+			Reason:  "uncommitted changes",
+		}
+	}
+
+	return polecatStopDecision{HasWork: false}
 }
