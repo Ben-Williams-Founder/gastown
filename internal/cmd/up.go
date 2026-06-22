@@ -8,9 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -146,15 +146,20 @@ aren't already running.`,
 }
 
 var (
-	upQuiet   bool
-	upRestore bool
-	upJSON    bool
+	upQuiet      bool
+	upRestore    bool
+	upJSON       bool
+	adaptiveRole string
 )
 
 func init() {
 	upCmd.Flags().BoolVarP(&upQuiet, "quiet", "q", false, "Only show errors (ignored with --json)")
 	upCmd.Flags().BoolVar(&upRestore, "restore", false, "Also restore crew (from settings) and polecats (from hooks)")
 	upCmd.Flags().BoolVar(&upJSON, "json", false, "Output as JSON")
+	upCmd.Flags().StringVar(&adaptiveRole, "role", "",
+		"Explicit host role for machine-adaptive boot tuning: town-host|sandbox|dev. "+
+			"town-host applies the derived scheduler/governor settings; sandbox/dev propose only. "+
+			"Omit (or set GT_TOWN_HOST_ROLE) to leave gt up's behavior unchanged (propose-only).")
 	rootCmd.AddCommand(upCmd)
 }
 
@@ -425,6 +430,18 @@ func runUp(cmd *cobra.Command, args []string) error {
 		}
 		_ = events.LogFeed(events.TypeBoot, "gt", events.BootPayload("town", startedServices))
 	}
+
+	// Machine-adaptive boot tuning (hq-lgay). Fully fail-open + additive: this
+	// never changes `services`/`allOK` and never makes gt up fail. With no
+	// explicit role it only proposes (preserving historical behavior); an
+	// explicit --role town-host applies the derived scheduler/governor settings.
+	// In JSON mode we suppress the human-facing notes (discard writer) so JSON
+	// output stays machine-parseable; the script's apply still runs.
+	adaptiveOut := io.Writer(os.Stdout)
+	if upJSON {
+		adaptiveOut = io.Discard
+	}
+	runAdaptiveBoot(townRoot, adaptiveOut, upQuiet || upJSON)
 
 	// Output JSON or text
 	if upJSON {
@@ -1065,4 +1082,3 @@ func recoverOrphanedBeads(townRoot string, rigs []string, prefetchedRigs map[str
 
 	return services
 }
-
