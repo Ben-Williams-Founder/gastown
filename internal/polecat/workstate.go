@@ -18,6 +18,14 @@ type WorkstateInput struct {
 	CleanupStatus                  CleanupStatus
 	IgnoreCleanupStatus            bool
 	PartialSpawnWithoutDurableHook bool
+	// WorkBeadClosed is true when the polecat's work bead (assigned issue, hook
+	// bead, or active-MR source issue) is terminal — i.e. the MR merged and the
+	// bead was closed. When the work bead is closed, the polecat's HEAD commits
+	// are pre-squash checkpoints whose content already landed on the target
+	// branch via the squash commit, so a positive UnpushedCommits count is not
+	// at-risk work and must not block cleanup. Live uncommitted/stash/dirty
+	// state (real WIP) is still flagged independently. (fork patch M, c3c8d7bf)
+	WorkBeadClosed                 bool
 	PushFailed                     bool
 	MRFailed                       bool
 	Branch                         string
@@ -137,7 +145,14 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	if in.StashCount > 0 {
 		block("git-stash", "git_state=has_stash stash_count="+itoa(in.StashCount), true)
 	}
-	if in.UnpushedCommits > 0 {
+	// Unpushed/ahead commits only signal at-risk work when the work bead is
+	// still open. Once the bead is closed (MR merged), those commits are the
+	// pre-squash checkpoints whose content already landed via the squash commit;
+	// counting them as unpushed is exactly the false NEEDS_RECOVERY that the
+	// 2-dot tree-diff heuristic failed to catch. Dirty/stash/uncommitted state is
+	// handled above and is NOT suppressed here, so genuine live WIP on a
+	// closed-bead worktree still flags. (fork patch M, c3c8d7bf)
+	if in.UnpushedCommits > 0 && !in.WorkBeadClosed {
 		block("git-unpushed", "git_state=has_unpushed unpushed_commits="+itoa(in.UnpushedCommits), true)
 	}
 	activeMRBlocks := in.ActiveMRBlocker != ""

@@ -30,6 +30,9 @@ type SlotReuseInput struct {
 	AssignedBeadTerminal bool
 	MRSubmitted          bool
 	MQLookupFailed       bool
+	// WorkBeadClosed: the work bead (assigned/source/hook) is terminal, so
+	// unpushed pre-squash checkpoint commits are not at-risk work.
+	WorkBeadClosed bool
 }
 
 // SlotReuseDecision explains whether a polecat can be reused and why not.
@@ -63,6 +66,7 @@ func DecideSlotReuse(in SlotReuseInput) SlotReuseDecision {
 		AssignedBeadTerminal: in.AssignedBeadTerminal,
 		MRSubmitted:          in.MRSubmitted,
 		MQLookupFailed:       in.MQLookupFailed,
+		WorkBeadClosed:       in.WorkBeadClosed,
 	})
 	return SlotReuseDecision{Reusable: d.Reusable, Reason: d.Reason}
 }
