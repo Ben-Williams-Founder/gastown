@@ -18,23 +18,31 @@ type WorkstateInput struct {
 	CleanupStatus                  CleanupStatus
 	IgnoreCleanupStatus            bool
 	PartialSpawnWithoutDurableHook bool
-	PushFailed                     bool
-	MRFailed                       bool
-	Branch                         string
-	GitDirty                       bool
-	GitDirtyReason                 string
-	StashCount                     int
-	UnpushedCommits                int
-	GitCheckFailed                 bool
-	GitCheckFailedReason           string
-	ActiveMR                       string
-	ActiveMRBlocker                string
-	MQCheckRequired                bool
-	HasSubmittableWork             bool
-	MQNotRequired                  bool
-	AssignedBeadTerminal           bool
-	MRSubmitted                    bool
-	MQLookupFailed                 bool
+	// WorkBeadClosed is true when the polecat's work bead (assigned issue, hook
+	// bead, or active-MR source issue) is terminal — i.e. the MR merged and the
+	// bead was closed. When the work bead is closed, the polecat's HEAD commits
+	// are pre-squash checkpoints whose content already landed on the target
+	// branch via the squash commit, so a positive UnpushedCommits count is not
+	// at-risk work and must not block cleanup. Live uncommitted/stash/dirty
+	// state (real WIP) is still flagged independently.
+	WorkBeadClosed       bool
+	PushFailed           bool
+	MRFailed             bool
+	Branch               string
+	GitDirty             bool
+	GitDirtyReason       string
+	StashCount           int
+	UnpushedCommits      int
+	GitCheckFailed       bool
+	GitCheckFailedReason string
+	ActiveMR             string
+	ActiveMRBlocker      string
+	MQCheckRequired      bool
+	HasSubmittableWork   bool
+	MQNotRequired        bool
+	AssignedBeadTerminal bool
+	MRSubmitted          bool
+	MQLookupFailed       bool
 }
 
 // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
@@ -117,7 +125,15 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	if in.StashCount > 0 {
 		block("git-stash", "git_state=has_stash stash_count="+itoa(in.StashCount))
 	}
-	if in.UnpushedCommits > 0 {
+	// Unpushed/ahead commits only signal at-risk work when the work bead is
+	// still open. Once the bead is closed (MR merged), those commits are the
+	// pre-squash checkpoints whose content already landed via the squash commit;
+	// counting them as unpushed is exactly the false NEEDS_RECOVERY that the
+	// 2-dot tree-diff heuristic failed to catch (HEAD sits behind an advanced
+	// origin/main, so the tree diff is non-empty and cherry counts every
+	// checkpoint). Dirty/stash/uncommitted state is handled above and is NOT
+	// suppressed here, so genuine live WIP on a closed-bead worktree still flags.
+	if in.UnpushedCommits > 0 && !in.WorkBeadClosed {
 		block("git-unpushed", "git_state=has_unpushed unpushed_commits="+itoa(in.UnpushedCommits))
 	}
 	activeMRBlocks := in.ActiveMRBlocker != ""

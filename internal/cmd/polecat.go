@@ -1247,6 +1247,10 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 	}
 	input.MQCheckRequired = true
 	input.AssignedBeadTerminal = beadTerminal
+	// beadTerminal here is workTerminal (assigned bead OR hook bead OR active-MR
+	// source terminal). When the work bead is closed, pre-squash checkpoint
+	// commits are not at-risk and must not produce a false NEEDS_RECOVERY.
+	input.WorkBeadClosed = beadTerminal
 	input.HasSubmittableWork = hasSubmittableWorkForRecovery(worktreePath, targetRefs, gitState, gitErr)
 	input.MQNotRequired = isMQNotRequiredSource(bd, status.Issue)
 	if !input.HasSubmittableWork || input.MQNotRequired || input.AssignedBeadTerminal {
