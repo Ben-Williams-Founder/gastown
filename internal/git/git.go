@@ -2702,6 +2702,21 @@ func (g *Git) preservationAgainstRef(ref string) (BranchPreservationStatus, erro
 		status.Preserved = true
 		return status, nil
 	}
+	// Content-equivalence check (squash-safe). `git cherry` compares by patch-id,
+	// which fails to recognize squash-merged work: when a polecat's pre-squash
+	// checkpoint commits are combined into a single squashed commit on the
+	// comparison base, none of the individual checkpoint patch-ids match the
+	// squashed commit, so cherry reports every checkpoint as unmerged ("+").
+	// If HEAD's tree is byte-for-byte identical to the comparison base's tree,
+	// every line of HEAD's work is already represented in the base — there is
+	// zero content at risk regardless of commit topology. This recognizes
+	// squash-merged checkpoint history as safe while still flagging genuinely
+	// unmerged content (any tree difference) for recovery.
+	if equivalent, err := g.headTreeEqual(ref); err == nil && equivalent {
+		status.Preserved = true
+		status.Evidence = "content_equivalent"
+		return status, nil
+	}
 	out, err := g.Cherry(ref, "HEAD")
 	if err != nil {
 		return status, err
@@ -2709,6 +2724,33 @@ func (g *Git) preservationAgainstRef(ref string) (BranchPreservationStatus, erro
 	status.UnpreservedPatchCount = CountCherryUnmergedCommits(out)
 	status.Preserved = status.UnpreservedPatchCount == 0
 	return status, nil
+}
+
+// headTreeEqual reports whether HEAD's tree is identical to ref's tree, i.e.
+// the working content of HEAD is exactly what ref already holds. It uses the
+// two-dot `git diff <ref> HEAD --quiet`, which compares the two trees directly
+// (not the commit history). An empty diff (exit 0) means the trees match —
+// the squash-merge signature, where ref's single squashed commit reproduces
+// the exact final tree of HEAD's checkpoint commits. A non-empty diff (exit 1)
+// means the content states differ, so real unmerged work may exist and must
+// still trigger recovery. Two-dot (not three-dot) is required: three-dot would
+// diff from the merge-base and report squash-merged content as still-present.
+func (g *Git) headTreeEqual(ref string) (bool, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return false, fmt.Errorf("empty comparison ref")
+	}
+	_, err := g.run("diff", "--quiet", ref, "HEAD")
+	if err == nil {
+		// Exit 0: trees identical — HEAD's content is fully represented in ref.
+		return true, nil
+	}
+	// `git diff --quiet` exits 1 when differences exist; that is not an error
+	// condition, it is the negative answer. Any other failure is a real error.
+	if strings.Contains(err.Error(), "exit status 1") {
+		return false, nil
+	}
+	return false, err
 }
 
 // CountCherryUnmergedCommits counts `git cherry` lines whose patches are not

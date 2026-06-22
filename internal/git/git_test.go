@@ -3170,6 +3170,181 @@ func TestUnpushedCommitsPrefersExactRemoteBranchOverUpstream(t *testing.T) {
 	}
 }
 
+// TestBranchPreservationSquashMergedCheckpointsAreSafe reproduces the furiosa
+// false-NEEDS_RECOVERY incident (2026-06-22, bead wkb-hoim). A polecat made
+// several pre-squash checkpoint commits, the work was squash-merged into
+// origin/main (one combined commit), and the polecat branch was pushed. The
+// local HEAD still points at the checkpoint commits, so it is neither an
+// ancestor of origin/main nor patch-id-equal via `git cherry` (the squash
+// changed the patch-ids). Without the content-equivalence check the predicate
+// reports the checkpoints as unpushed work and falsely flags recovery, even
+// though every line is already merged. After the fix the diff is empty so the
+// work is Preserved with zero unpreserved patches.
+func TestBranchPreservationSquashMergedCheckpointsAreSafe(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/furiosa-wkb-hoim"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	// Several checkpoint commits — the kind gt auto-checkpoint produces.
+	for i := 1; i <= 3; i++ {
+		if err := os.WriteFile(filepath.Join(localDir, "feature.go"),
+			[]byte(fmt.Sprintf("package feature\n\n// step %d\n", i)), 0644); err != nil {
+			t.Fatalf("write step %d: %v", i, err)
+		}
+		if err := g.Add("feature.go"); err != nil {
+			t.Fatalf("Add step %d: %v", i, err)
+		}
+		if err := g.Commit(fmt.Sprintf("checkpoint %d", i)); err != nil {
+			t.Fatalf("Commit step %d: %v", i, err)
+		}
+	}
+	// Push the work branch to origin (the polecat did push its branch).
+	if err := g.Push("origin", branch, false); err != nil {
+		t.Fatalf("Push branch: %v", err)
+	}
+
+	// Squash-merge the branch content into main (one combined commit), as a
+	// squash PR does. This is the crux: the resulting commit's patch-id matches
+	// none of the three checkpoint patch-ids.
+	if err := g.Checkout(mainBranch); err != nil {
+		t.Fatalf("Checkout main: %v", err)
+	}
+	runGit(t, localDir, "merge", "--squash", branch)
+	if err := g.Commit("squash: feature (#389)"); err != nil {
+		t.Fatalf("Commit squash: %v", err)
+	}
+	if err := g.Push("origin", mainBranch, false); err != nil {
+		t.Fatalf("Push main: %v", err)
+	}
+	runGit(t, localDir, "fetch", "origin")
+
+	// Back on the polecat branch with HEAD at the checkpoints.
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout branch: %v", err)
+	}
+
+	// Sanity: cherry against origin/main alone would report the checkpoints as
+	// unmerged (the pre-fix false positive). Confirm the content diff is what
+	// makes them safe.
+	status, err := g.BranchTargetStatus(branch, "origin", []string{mainBranch})
+	if err != nil {
+		t.Fatalf("BranchTargetStatus: %v", err)
+	}
+	if !status.Preserved {
+		t.Fatalf("squash-merged checkpoints should be Preserved, got %+v", status)
+	}
+	if status.UnpreservedPatchCount != 0 {
+		t.Fatalf("UnpreservedPatchCount = %d, want 0 for squash-merged work", status.UnpreservedPatchCount)
+	}
+
+	// UnpushedCommits (the field that feeds NEEDS_RECOVERY) must be 0.
+	unpushed, err := g.UnpushedCommits()
+	if err != nil {
+		t.Fatalf("UnpushedCommits: %v", err)
+	}
+	if unpushed != 0 {
+		t.Fatalf("UnpushedCommits = %d, want 0 for squash-merged+pushed work (furiosa false-positive)", unpushed)
+	}
+}
+
+// TestBranchPreservationGenuineUnmergedStillRecovers guards against a new false
+// NEGATIVE: real local commits whose content is NOT on origin/main must still
+// be reported as unpreserved so work is never silently lost.
+func TestBranchPreservationGenuineUnmergedStillRecovers(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "polecat/genuine-unmerged"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "unmerged.go"),
+		[]byte("package main\n\n// real work not on origin\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("unmerged.go"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("genuine unmerged work"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	// Deliberately NOT pushed and NOT merged anywhere.
+
+	status, err := g.BranchPreservationStatus(branch, "origin", []string{mainBranch})
+	if err != nil {
+		t.Fatalf("BranchPreservationStatus: %v", err)
+	}
+	if status.Preserved {
+		t.Fatalf("genuine unmerged work must NOT be Preserved, got %+v", status)
+	}
+	if status.UnpreservedPatchCount < 1 {
+		t.Fatalf("UnpreservedPatchCount = %d, want >= 1 for genuine unmerged content", status.UnpreservedPatchCount)
+	}
+
+	unpushed, err := g.UnpushedCommits()
+	if err != nil {
+		t.Fatalf("UnpushedCommits: %v", err)
+	}
+	if unpushed < 1 {
+		t.Fatalf("UnpushedCommits = %d, want >= 1 — genuine work must still trigger recovery", unpushed)
+	}
+}
+
+// TestBranchPreservationStaleBranchBehindOriginIgnored verifies that a stale
+// local branch whose content is fully behind origin/main (a huge-deletion diff
+// relative to a stale local main) is treated as content-preserved. These are
+// the ~25 leftover merge/wkb-* branches in the furiosa incident — they must not
+// count as unpushed work at risk. Only when HEAD adds content origin lacks is
+// it flagged.
+func TestBranchPreservationStaleBranchBehindOriginIgnored(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+
+	// Advance origin/main with new content the local stale branch will lack.
+	if err := os.WriteFile(filepath.Join(localDir, "advanced.go"),
+		[]byte("package main\n\n// advanced on main\n"), 0644); err != nil {
+		t.Fatalf("write advanced: %v", err)
+	}
+	if err := g.Add("advanced.go"); err != nil {
+		t.Fatalf("Add advanced: %v", err)
+	}
+	if err := g.Commit("advance main"); err != nil {
+		t.Fatalf("Commit advance: %v", err)
+	}
+	if err := g.Push("origin", mainBranch, false); err != nil {
+		t.Fatalf("Push main: %v", err)
+	}
+	runGit(t, localDir, "fetch", "origin")
+
+	// Create a stale branch pointing at the OLD initial commit (behind origin).
+	// Its tree is a strict subset of origin/main — it adds nothing new.
+	staleBase, err := g.Rev("HEAD~1")
+	if err != nil {
+		t.Fatalf("Rev HEAD~1: %v", err)
+	}
+	runGit(t, localDir, "checkout", "-b", "merge/wkb-stale", strings.TrimSpace(staleBase))
+
+	status, err := g.BranchPreservationStatus("merge/wkb-stale", "origin", []string{mainBranch})
+	if err != nil {
+		t.Fatalf("BranchPreservationStatus: %v", err)
+	}
+	if !status.Preserved {
+		t.Fatalf("stale branch behind origin must be Preserved (adds no content), got %+v", status)
+	}
+	if status.UnpreservedPatchCount != 0 {
+		t.Fatalf("UnpreservedPatchCount = %d, want 0 for stale-behind-origin branch", status.UnpreservedPatchCount)
+	}
+}
+
 // TestBranchPushedToRemote_NoPushURL verifies baseline behavior: when fetch and
 // push URLs are the same, BranchPushedToRemote works normally.
 func TestBranchPushedToRemote_NoPushURL(t *testing.T) {

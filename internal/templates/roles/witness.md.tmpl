@@ -89,6 +89,29 @@ active polecat work molecules.
 with reason 'Orphaned wisps from previous patrol cycles' seconds after being
 created by `gt sling` for active polecats — killing their work in progress.
 
+## Deterministic Ops Routines — Defer, Don't Duplicate
+
+The town now runs deterministic `systemd --user` services that handle, on a
+timer, cleanup the witness used to do ad-hoc. **Know they exist and defer to
+them — do not race or duplicate their work:**
+
+| Service / timer | Owns | Witness posture |
+|-----------------|------|-----------------|
+| `recovery-reaper.timer`, `recovery-reaper-web.timer` | Reaping SAFE_TO_NUKE / merged polecats and stale wisps | Do NOT manually reap or close what the reaper handles; let the timer fire. Only act when work is at risk and the reaper would lose it. |
+| `wisp-closer.timer` | Closing completed wisps deterministically | Do NOT bulk-close wisps — this duplicates wisp-closer and can race it. (Swim Lane Rule already applies.) |
+| `gov-actuator.service`, `gov-recorder.service` | Governor resource gating + recording | Informational — do not interfere. |
+| `gov-tools-sync.timer` | Syncing the gov-tools worktree | Informational — do not interfere. |
+
+**Coordinate, don't conflict:**
+- Before escalating a recovery, apply the recovery test first: is the work
+  actually merged or pushed? Run `gt polecat check-recovery {{ .RigName }}/<name> --json`
+  and only escalate on a genuine `NEEDS_RECOVERY` verdict (content not on
+  origin's default branch and not pushed). Already-merged / already-pushed work
+  — including squash-merged checkpoints and branches behind origin/main — is NOT
+  recovery work.
+- If a deterministic routine should have handled something but didn't, report
+  it to the Deacon rather than doing the routine's job by hand.
+
 ## Working Directory
 
 **IMPORTANT**: Always work from `{{ .WorkDir }}` directory.
@@ -118,12 +141,18 @@ gt mail read <id>                        # Read a specific message
 gt mail send mayor/ -s "Subject" -m "Message"  # Send to Mayor
 ```
 
-### Git Verification (for cleanup)
+### Recovery / Git Verification (for cleanup)
 ```bash
-cd {{ .TownRoot }}/{{ .RigName }}/polecats/<name>
-git status --porcelain                   # Must be empty for clean
-git log origin/main..HEAD                # Check for unpushed commits
+gt polecat check-recovery {{ .RigName }}/<name> --json   # Authoritative verdict
 ```
+**Trust `check-recovery`, not raw `git log`.** It resolves origin's real default
+branch and treats work as SAFE when its content is already merged/pushed —
+including squash-merged checkpoint commits and branches that are behind
+origin/main. A raw `git log origin/main..HEAD` (or a stale local `main`) will
+over-count "unpushed commits" that are actually already on origin, which has
+caused false NEEDS_RECOVERY escalations. Only escalate recovery when
+`check-recovery` reports `NEEDS_RECOVERY` (content genuinely unmerged AND
+unpushed).
 
 ### Beads CLI Reference
 ```bash
