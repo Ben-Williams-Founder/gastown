@@ -133,7 +133,9 @@ func (d *Daemon) reapWisps() {
 // candidates or anomalies. Returns false when the town is quiet, so reapWisps
 // can skip dispatching a Dog (and the working-state churn + escalations that
 // follow). On any scan error it returns true (conservative — let the Dog run).
-// The scan itself auto-cleans benign dangling parent-refs (see reaper.Scan).
+// The scan auto-cleans benign dangling parent-refs only on a non-dry-run tick;
+// config.DryRun is threaded into reaper.Scan so a dry-run daemon tick stays
+// strictly read-only (see reaper.Scan).
 func (d *Daemon) reaperHasWork(config *WispReaperConfig, maxAge, deleteAge time.Duration) bool {
 	databases := config.Databases
 	if len(databases) == 0 {
@@ -153,7 +155,7 @@ func (d *Daemon) reaperHasWork(config *WispReaperConfig, maxAge, deleteAge time.
 			db.Close()
 			continue
 		}
-		res, err := reaper.Scan(db, dbName, maxAge, deleteAge, defaultMailDeleteAge, defaultStaleIssueAge)
+		res, err := reaper.Scan(db, dbName, maxAge, deleteAge, defaultMailDeleteAge, defaultStaleIssueAge, config.DryRun)
 		db.Close()
 		if err != nil {
 			return true
