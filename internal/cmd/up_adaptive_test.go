@@ -108,8 +108,9 @@ func TestDecideAdaptiveBoot(t *testing.T) {
 			t.Fatalf("got run=%v mode=%q, want run=true mode=apply", d.run, d.mode)
 		}
 		joined := strings.Join(d.args, " ")
-		if !strings.Contains(joined, "--role town-host") || !strings.Contains(joined, "--apply") {
-			t.Errorf("args = %v, want --role town-host --apply", d.args)
+		// Apply mode = mode=apply default (no --print). There is no --apply flag.
+		if !strings.Contains(joined, "--role town-host") || strings.Contains(joined, "--print") {
+			t.Errorf("args = %v, want --role town-host in apply mode (no --print)", d.args)
 		}
 		if strings.Contains(joined, "--yes") {
 			t.Errorf("interactive apply should not pass --yes; args = %v", d.args)

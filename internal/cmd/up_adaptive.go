@@ -133,7 +133,10 @@ func decideAdaptiveBoot(scriptExists bool, role, roleSource string, explicit, in
 	}
 
 	if explicit && adaptiveApplyRoles[role] {
-		args := []string{"--role", role, "--apply"}
+		// Apply is the script's DEFAULT mode (mode=apply unless --print/--selftest);
+		// there is no --apply flag. --yes (added below when non-interactive) auto-accepts
+		// the confirm; interactive runs prompt "Apply this proposal? [y/N]".
+		args := []string{"--role", role}
 		note := fmt.Sprintf("applying host tuning for role %q (from %s)", role, roleSource)
 		if !interactive {
 			args = append(args, "--yes")
