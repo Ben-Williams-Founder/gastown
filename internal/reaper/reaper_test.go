@@ -389,7 +389,7 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	maxAge := 24 * time.Hour
-	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour, false)
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
@@ -461,6 +461,126 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 		)
 		t.Logf("real Reap used pinned connection %d", connID)
 	}
+}
+
+// danglingFixture builds a fake reaper DB containing exactly one dangling
+// parent-child dependency row: child "orphan-child" points at parent
+// "missing-parent", which exists in neither wisps nor issues. There are no
+// reap/molecule-step/stale candidates, so the dangling ref is the only signal.
+func danglingFixture(t *testing.T) (*fakeReaperState, *sql.DB) {
+	t.Helper()
+	now := time.Now().UTC()
+	state := &fakeReaperState{
+		wisps: map[string]*fakeWisp{
+			"orphan-child": {id: "orphan-child", status: "open", issueType: "task", createdAt: now},
+		},
+		deps: []fakeDep{
+			{issueID: "orphan-child", dependsOnID: "missing-parent", depType: "parent-child"},
+		},
+		ops: map[int][]string{},
+	}
+	db := openFakeReaperDB(t, state)
+	t.Cleanup(func() { _ = db.Close() })
+	return state, db
+}
+
+// TestScanDryRunDoesNotCleanDanglingRefs asserts that a dry-run Scan DETECTS and
+// COUNTS the dangling parent-ref (surfacing it as an anomaly) but performs NO
+// DELETE and NO DOLT_COMMIT — the row count is unchanged. This is the BLOCK-1
+// regression guard: scan/dry-run must be strictly read-only.
+func TestScanDryRunDoesNotCleanDanglingRefs(t *testing.T) {
+	state, db := danglingFixture(t)
+
+	before := state.opCounts()
+	scan, err := Scan(db, "testdb", 24*time.Hour, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour, true)
+	if err != nil {
+		t.Fatalf("dry-run Scan: %v", err)
+	}
+
+	// The dangling ref must still be present (not deleted).
+	state.mu.Lock()
+	remaining := len(state.danglingRefIndexesLocked())
+	depCount := len(state.deps)
+	state.mu.Unlock()
+	if remaining != 1 || depCount != 1 {
+		t.Fatalf("dry-run Scan mutated wisp_dependencies: dangling=%d depCount=%d, want 1/1", remaining, depCount)
+	}
+
+	// It must still be surfaced as an anomaly so it is not silently dropped.
+	if !hasAnomaly(scan.Anomalies, "dangling_parent_ref") {
+		t.Fatalf("dry-run Scan should surface dangling_parent_ref anomaly, got %#v", scan.Anomalies)
+	}
+
+	// No mutating ops may have run on any connection.
+	for connID, ops := range state.opsSince(before) {
+		for _, op := range ops {
+			if strings.HasPrefix(op, "EXEC DELETE") || strings.Contains(op, "DOLT_COMMIT") || op == "EXEC COMMIT" {
+				t.Fatalf("dry-run Scan issued mutating op %q on conn %d", op, connID)
+			}
+		}
+	}
+}
+
+// TestScanRealCleansDanglingRefsOnPinnedConn asserts that a non-dry-run Scan
+// auto-cleans the dangling parent-ref (determinism-first self-resolution
+// preserved — BLOCK-1) AND that the DELETE → COMMIT → DOLT_COMMIT sequence runs
+// on a single pinned connection (BLOCK-2). After cleanup the row is gone and the
+// anomaly is NOT escalated (cleaned to zero = no surfaced anomaly).
+func TestScanRealCleansDanglingRefsOnPinnedConn(t *testing.T) {
+	state, db := danglingFixture(t)
+
+	before := state.opCounts()
+	scan, err := Scan(db, "testdb", 24*time.Hour, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour, false)
+	if err != nil {
+		t.Fatalf("real Scan: %v", err)
+	}
+
+	// The dangling ref must be removed.
+	state.mu.Lock()
+	remaining := len(state.danglingRefIndexesLocked())
+	depCount := len(state.deps)
+	state.mu.Unlock()
+	if remaining != 0 || depCount != 0 {
+		t.Fatalf("real Scan did not clean dangling ref: dangling=%d depCount=%d, want 0/0", remaining, depCount)
+	}
+
+	// Cleaned to zero — deterministic self-resolution, no escalated anomaly.
+	if hasAnomaly(scan.Anomalies, "dangling_parent_ref") {
+		t.Fatalf("real Scan should NOT escalate after clean-to-zero, got %#v", scan.Anomalies)
+	}
+
+	// BLOCK-2: the DELETE/COMMIT/DOLT_COMMIT must all land on ONE pinned
+	// connection (the cleanup session), in order, bracketed by autocommit
+	// toggles. Find the connection that ran the DELETE and assert the sequence.
+	opsSince := state.opsSince(before)
+	var cleanupConns []int
+	for connID, ops := range opsSince {
+		for _, op := range ops {
+			if strings.HasPrefix(op, "EXEC DELETE") {
+				cleanupConns = append(cleanupConns, connID)
+				break
+			}
+		}
+	}
+	if len(cleanupConns) != 1 {
+		t.Fatalf("cleanup DELETE ran on %d connections, want exactly 1: %#v", len(cleanupConns), opsSince)
+	}
+	assertOpsContainInOrder(t, opsSince[cleanupConns[0]],
+		"EXEC SET @@autocommit = 0",
+		"EXEC DELETE",
+		"EXEC COMMIT",
+		"EXEC CALL DOLT_COMMIT",
+		"EXEC SET @@autocommit = 1",
+	)
+}
+
+func hasAnomaly(anomalies []Anomaly, typ string) bool {
+	for _, a := range anomalies {
+		if a.Type == typ {
+			return true
+		}
+	}
+	return false
 }
 
 var fakeReaperDriverID uint64
@@ -647,6 +767,50 @@ func (c *fakeReaperConn) Begin() (driver.Tx, error) { return fakeReaperTx{}, nil
 
 func (c *fakeReaperConn) CheckNamedValue(*driver.NamedValue) error { return nil }
 
+// danglingRefIndexesLocked returns the indexes into s.deps of parent-child
+// dependency rows whose parent exists in neither wisps nor issues — the exact
+// condition the scan's danglingQuery / cleanDanglingParentRefs target. The fake
+// models only a wisps table (no issues), so a dangling ref is a parent-child dep
+// with a non-empty wisp parent id that is absent from s.wisps and no external
+// target.
+func (s *fakeReaperState) danglingRefIndexesLocked() []int {
+	var idx []int
+	for i, dep := range s.deps {
+		if dep.depType != "parent-child" {
+			continue
+		}
+		if dep.dependsOnExternal != "" {
+			continue
+		}
+		if dep.dependsOnID == "" {
+			continue
+		}
+		if _, ok := s.wisps[dep.dependsOnID]; !ok {
+			idx = append(idx, i)
+		}
+	}
+	return idx
+}
+
+func (s *fakeReaperState) deleteDanglingRefsLocked() int64 {
+	idx := s.danglingRefIndexesLocked()
+	if len(idx) == 0 {
+		return 0
+	}
+	drop := make(map[int]bool, len(idx))
+	for _, i := range idx {
+		drop[i] = true
+	}
+	kept := s.deps[:0:0]
+	for i, dep := range s.deps {
+		if !drop[i] {
+			kept = append(kept, dep)
+		}
+	}
+	s.deps = kept
+	return int64(len(idx))
+}
+
 func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	normalized := normalizeSQL(query)
 	c.state.mu.Lock()
@@ -671,7 +835,7 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM issues"):
 		return fakeCountRows(0), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisp_dependencies wd"):
-		return fakeCountRows(0), nil
+		return fakeCountRows(len(c.state.danglingRefIndexesLocked())), nil
 	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
@@ -704,6 +868,8 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 			}
 		}
 		return fakeReaperResult(affected), nil
+	case strings.HasPrefix(normalized, "DELETE wd FROM wisp_dependencies wd"):
+		return fakeReaperResult(c.state.deleteDanglingRefsLocked()), nil
 	case normalized == "SET @@autocommit = 0" || normalized == "SET @@autocommit = 1" || normalized == "ROLLBACK" || normalized == "COMMIT" || strings.HasPrefix(normalized, "CALL DOLT_COMMIT"):
 		return fakeReaperResult(0), nil
 	default:

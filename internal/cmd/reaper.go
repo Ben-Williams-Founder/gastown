@@ -122,7 +122,11 @@ var reaperScanCmd = &cobra.Command{
 When --db is provided, scans a single database. When omitted, auto-discovers
 all databases on the Dolt server and scans each one, printing a summary.
 
-Returns counts and anomaly detection results without modifying any data.
+Returns counts and anomaly detection results. Scan is read-only EXCEPT that,
+on a non-dry-run scan, a detected dangling-parent-ref anomaly is auto-cleaned
+in place (the deterministic self-resolution the purge path also performs).
+Pass --dry-run to make scan strictly read-only: dangling refs are then only
+detected and counted (reported as an anomaly), never deleted.
 The Dog uses this to understand the state before deciding what to reap.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		maxAge, err := time.ParseDuration(reaperMaxAge)
@@ -169,7 +173,7 @@ The Dog uses this to understand the state before deciding what to reap.`,
 				continue
 			}
 
-			result, err := reaper.Scan(db, dbName, maxAge, purgeAge, mailAge, staleAge)
+			result, err := reaper.Scan(db, dbName, maxAge, purgeAge, mailAge, staleAge, reaperDryRun)
 			db.Close()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s: scan error: %v\n", dbName, err)
@@ -533,7 +537,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			}
 
 			// Scan
-			scanResult, err := reaper.Scan(db, dbName, maxAge, purgeAge, mailAge, staleAge)
+			scanResult, err := reaper.Scan(db, dbName, maxAge, purgeAge, mailAge, staleAge, reaperDryRun)
 			if err != nil {
 				fmt.Printf("%s: scan error: %v\n", dbName, err)
 				db.Close()

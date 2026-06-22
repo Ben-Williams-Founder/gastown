@@ -267,7 +267,31 @@ type sqlRunner interface {
 // so cleanup removes precisely the rows detection counts — a dangling row whose
 // missing parent is an issue (not a wisp) is cleaned too, not left to re-escalate.
 func cleanDanglingParentRefs(ctx context.Context, db *sql.DB, dbName string) (int64, error) {
-	res, err := db.ExecContext(ctx,
+	// Pin a single connection for the whole DELETE → COMMIT → DOLT_COMMIT
+	// sequence. OpenDB's *sql.DB is a pool with no SetMaxOpenConns cap, so
+	// issuing these as separate db.ExecContext calls could land them on
+	// different connections — the DOLT_COMMIT could run on a connection that
+	// never saw the DELETE (and so commit "nothing"). Mirrors the autocommit
+	// discipline Reap/Purge use so the DELETE working set and the DOLT_COMMIT
+	// provably share one session.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("pin connection: %w", err)
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, "SET @@autocommit = 0"); err != nil {
+		return 0, fmt.Errorf("disable autocommit: %w", err)
+	}
+	sqlCommitted := false
+	defer func() {
+		if !sqlCommitted {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+		_, _ = conn.ExecContext(context.Background(), "SET @@autocommit = 1")
+	}()
+
+	res, err := conn.ExecContext(ctx,
 		`DELETE wd FROM wisp_dependencies wd
 		 LEFT JOIN wisps  pw ON pw.id = wd.depends_on_wisp_id
 		 LEFT JOIN issues pi ON pi.id = wd.depends_on_issue_id
@@ -283,12 +307,13 @@ func cleanDanglingParentRefs(ctx context.Context, db *sql.DB, dbName string) (in
 		return 0, nil
 	}
 	// Flush the SQL transaction to the Dolt working set, then DOLT_COMMIT
-	// (mirrors the purge path's commit handling).
-	if _, err := db.ExecContext(ctx, "COMMIT"); err != nil {
+	// (mirrors the Reap/Purge commit handling), all on the pinned connection.
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return n, fmt.Errorf("sql commit after dangling-ref clean: %w", err)
 	}
+	sqlCommitted = true
 	commitMsg := fmt.Sprintf("reaper: auto-clean %d dangling parent ref(s) in %s", n, dbName)
-	if _, err := db.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("CALL DOLT_COMMIT('--allow-empty', '-Am', '%s')", commitMsg)); err != nil { //nolint:gosec // G201: commitMsg from safe values
 		return n, fmt.Errorf("dolt commit after dangling-ref clean: %w", err)
 	}
 	return n, nil
@@ -346,8 +371,14 @@ func hasColumns(ctx context.Context, db *sql.DB, table string, columns ...string
 	return count == len(columns), err
 }
 
-// Scan counts reaper candidates in a database without modifying anything.
-func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssueAge time.Duration) (*ScanResult, error) {
+// Scan counts reaper candidates in a database. It is read-only EXCEPT for the
+// deterministic dangling-parent-ref auto-clean: when dryRun is false, a detected
+// dangling-parent-ref anomaly is self-resolved in place (the same DELETE the
+// purge path runs) instead of being escalated. When dryRun is true, Scan only
+// DETECTS and COUNTS the dangling refs (surfacing them as an anomaly) and makes
+// no changes — so `gt reaper scan --dry-run`, `gt reaper run --dry-run`, and a
+// dry-run daemon tick are genuinely non-mutating.
+func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssueAge time.Duration, dryRun bool) (*ScanResult, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), DefaultQueryTimeout)
 	defer cancel()
 
@@ -446,6 +477,17 @@ func Scan(db *sql.DB, dbName string, maxAge, purgeAge, mailDeleteAge, staleIssue
 		WHERE wd.type = 'parent-child' AND wd.depends_on_external IS NULL AND (wd.depends_on_wisp_id IS NOT NULL OR wd.depends_on_issue_id IS NOT NULL) AND pw.id IS NULL AND pi.id IS NULL`
 	var danglingCount int
 	if err := db.QueryRowContext(ctx, danglingQuery).Scan(&danglingCount); err == nil && danglingCount > 0 {
+		if dryRun {
+			// Dry-run / read-only scan: DETECT and COUNT only, never mutate.
+			// Surface the count as an anomaly so the dangling refs are still
+			// visible; the real (non-dry) reap path performs the auto-clean.
+			result.Anomalies = append(result.Anomalies, Anomaly{
+				Type:    "dangling_parent_ref",
+				Message: fmt.Sprintf("%d dangling parent ref(s) (dry-run: not auto-cleaned)", danglingCount),
+				Count:   danglingCount,
+			})
+			return result, nil
+		}
 		cleaned, cerr := cleanDanglingParentRefs(ctx, db, dbName)
 		if cerr != nil {
 			// Cleanup failed — escalate so it is not silently dropped.
