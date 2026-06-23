@@ -343,8 +343,8 @@ func TestBuildRefineryPatrolVars_BoolFormat(t *testing.T) {
 	trueVal := true
 	falseVal2 := false
 	mq := &config.MergeQueueConfig{
-		Enabled:                         true,
-		IntegrationBranchAutoLand:       &trueVal,
+		Enabled:                          true,
+		IntegrationBranchAutoLand:        &trueVal,
 		IntegrationBranchRefineryEnabled: &trueVal,
 		RunTests:                         &trueVal,
 		SetupCommand:                     "npm ci",
@@ -634,8 +634,9 @@ func setupPatrolTestDB(t *testing.T) (string, *beads.Beads) {
 func createHookedPatrol(t *testing.T, b *beads.Beads, molName, assignee string, withOpenChild bool) string {
 	t.Helper()
 	root, err := b.Create(beads.CreateOptions{
-		Title:    molName + " (wisp)",
-		Priority: -1,
+		Title:     molName + " (wisp)",
+		Priority:  -1,
+		Ephemeral: true, // patrol roots are ephemeral wisps (match production)
 	})
 	if err != nil {
 		t.Fatalf("create patrol root: %v", err)
