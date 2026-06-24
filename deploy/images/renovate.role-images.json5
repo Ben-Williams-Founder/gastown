@@ -1,0 +1,48 @@
+// Renovate rule — STEP 3 of automated pin-propagation (the VM-side digest bump).
+//
+// Goal: when `role-images.yml` publishes a newer role-image digest to GHCR,
+// Renovate opens a PR bumping the PINNED digest the VM runs — and STOPS there.
+// The metal updates only when Ben merges. No silent auto-update (matches
+// DEC-OPS-town-host-container-deployment: "deliberate gated digest bump").
+//
+// Place this in the repo that holds the VM's Quadlet/pin files (the town/deploy
+// repo), NOT the gastown fork. The Quadlet `.container` (or a PINS.env) must
+// pin by digest, e.g.:
+//   Image=ghcr.io/whiz-digital-vc/gastown-townhost:2026-06-24-v149@sha256:abc…
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  // Find the pinned role-image digests wherever the VM references them.
+  customManagers: [
+    {
+      customType: "regex",
+      description: "Gas Town role-image digest pins (Quadlet / deploy pins)",
+      managerFilePatterns: [
+        "/deploy/.*\\.container$/",
+        "/deploy/.*PINS\\.env$/",
+      ],
+      matchStrings: [
+        "ghcr\\.io/whiz-digital-vc/(?<depName>gastown-[a-z]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]+)",
+      ],
+      datasourceTemplate: "docker",
+      registryUrlTemplate: "https://ghcr.io",
+    },
+  ],
+
+  packageRules: [
+    {
+      description: "Role-images: HUMAN-GATED digest bumps — never automerge",
+      matchDatasources: ["docker"],
+      matchPackageNames: [
+        "ghcr.io/whiz-digital-vc/gastown-sandbox",
+        "ghcr.io/whiz-digital-vc/gastown-ci",
+        "ghcr.io/whiz-digital-vc/gastown-townhost",
+      ],
+      automerge: false,
+      labels: ["deploy", "role-image", "needs-founder-review"],
+      // pin-bumps + digest tracking so the PR moves the digest, not just the tag
+      rangeStrategy: "pin",
+      commitMessageTopic: "{{depName}} image",
+    },
+  ],
+}
