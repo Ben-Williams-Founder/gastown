@@ -272,10 +272,20 @@ func parseChildrenJSON(raw string) ([]childInfo, error) {
 		return arr, nil
 	}
 
-	var wrapped map[string][]childInfo
-	if err := json.Unmarshal(data, &wrapped); err == nil {
-		for _, children := range wrapped {
-			return children, nil
+	// Envelope keyed by parent ID, possibly with sibling metadata keys such as
+	// "schema_version": {"<parent-id>": [children...], "schema_version": N}.
+	// Parse loosely and return the first value that is an array of children;
+	// metadata keys (whose values are not child arrays) are skipped.
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err == nil {
+		for k, v := range envelope {
+			if k == "schema_version" {
+				continue
+			}
+			var children []childInfo
+			if err := json.Unmarshal(v, &children); err == nil {
+				return children, nil
+			}
 		}
 		return nil, nil
 	}
