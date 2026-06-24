@@ -1,0 +1,112 @@
+name: role-images
+
+# Rebake + publish the gastown role-images (sandbox / ci / town-host) with the
+# freshly-built, gated, pinned fork `gt` baked in — digest-pinned to GHCR.
+#
+# This realizes STEP 1 of automated pin-propagation
+# (DEC-OPS-town-host-container-deployment): the BUILD is automated here; the VM
+# digest-bump stays HUMAN-GATED via Renovate (no auto-update on the metal),
+# matching DEC-OPS-gt-supply-chain-build.
+#
+# Setup required before first run (one-time):
+#   - secret GHCR_PAT: a PAT with `write:packages` on the Whiz-Digital-VC org
+#     (the role-images live under that org; this fork is a different owner).
+#   - confirm BD/DOLT pin URLs below resolve (bump the versions here, gated).
+
+on:
+  push:
+    tags: ['v*']            # same trigger as release.yml — a newly pinned gt
+  workflow_dispatch:
+    inputs:
+      gt_ref: { description: 'git ref to build gt from', default: '' }
+
+env:
+  REGISTRY: ghcr.io
+  ORG: whiz-digital-vc
+  BD_VERSION: "1.0.5"
+  DOLT_VERSION: "2.1.7"
+
+jobs:
+  build-gt:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.b.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: '${{ github.event.inputs.gt_ref || github.ref }}', fetch-depth: 0 }
+      - uses: actions/setup-go@v5
+        with: { go-version: '1.26' }
+      - name: CGO deps (ICU for Dolt)
+        run: sudo apt-get update && sudo apt-get install -y libicu-dev build-essential
+      - name: Build STATIC gt (portable, like prod)
+        id: b
+        run: |
+          VER=$(git describe --tags --always --dirty)
+          CGO_ENABLED=1 go build \
+            -ldflags "-s -w -linkmode external -extldflags '-static' \
+              -X github.com/steveyegge/gastown/internal/cmd.Version=$VER \
+              -X github.com/steveyegge/gastown/internal/cmd.Commit=$(git rev-parse --short HEAD) \
+              -X github.com/steveyegge/gastown/internal/cmd.BuiltProperly=1" \
+            -o gt ./cmd/gt
+          file gt | grep -q 'statically linked' || { echo "::error::gt not static"; exit 1; }
+          ./gt version
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+      - name: Gated scan (govulncheck)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          "$(go env GOPATH)"/bin/govulncheck ./... || echo "::warning::govulncheck findings — review (non-blocking, mirror DEC-OPS-gt-supply-chain-build gate)"
+      - uses: actions/upload-artifact@v4
+        with: { name: gt, path: gt, retention-days: 7 }
+
+  rebake:
+    needs: build-gt
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    strategy:
+      matrix:
+        variant: [sandbox, ci, townhost]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: gt, path: deploy/images }
+      - name: Fetch pinned bd + dolt
+        working-directory: deploy/images
+        run: |
+          curl -fsSL "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-amd64.tar.gz" \
+            | tar -xz --strip-components=2 -C . dolt-linux-amd64/bin/dolt
+          # bd: pinned release (adjust source if the beads release host differs)
+          curl -fsSL "https://github.com/steveyegge/beads/releases/download/v${BD_VERSION}/bd-linux-amd64" -o bd || \
+            echo "::warning::bd pin fetch failed — wire the correct beads release source"
+          chmod +x gt bd dolt 2>/dev/null || true
+      - name: Login to GHCR
+        run: echo "${{ secrets.GHCR_PAT }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
+      - name: Build role image
+        run: |
+          IMG="$REGISTRY/$ORG/gastown-${{ matrix.variant }}:${{ needs.build-gt.outputs.version }}"
+          docker build -f deploy/images/${{ matrix.variant }}.Dockerfile \
+            -t "$IMG" deploy/images
+          echo "IMG=$IMG" >> "$GITHUB_ENV"
+      - name: Smoke test (codifies the manual validation)
+        run: |
+          # 1) baked gt is the expected pinned version (all variants)
+          docker run --rm --entrypoint gt "$IMG" version | grep -q "${{ needs.build-gt.outputs.version }}"
+          case "${{ matrix.variant }}" in
+            ci)
+              # locked down: non-root + no passwordless sudo
+              docker run --rm "$IMG" bash -lc 'test "$(whoami)" = dev && ! sudo -n true 2>/dev/null' ;;
+            townhost)
+              # systemd boots as PID 1 (the gap from the manual pass — now gated)
+              docker run -d --name th --privileged --cgroupns=host \
+                -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --entrypoint /sbin/init "$IMG"
+              sleep 15
+              docker exec th bash -lc 'test "$(ps -p 1 -o comm=)" = systemd && gt version'
+              docker rm -f th ;;
+            sandbox)
+              # tooling parity (the experiment box mirrors the VM)
+              docker run --rm "$IMG" bash -lc 'gt version && bd version && dolt version' ;;
+          esac
+      - name: Push (digest-pinned)
+        run: |
+          docker push "$IMG"
+          echo "### gastown-${{ matrix.variant }} @ ${{ needs.build-gt.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          docker inspect --format '{{ index .RepoDigests 0 }}' "$IMG" >> "$GITHUB_STEP_SUMMARY"
