@@ -23,7 +23,12 @@ on:
 env:
   REGISTRY: ghcr.io
   ORG: whiz-digital-vc
-  BD_VERSION: "1.0.5"
+  # bd: latest PUBLISHED release on gastownhall/beads. NOTE: the live dev VM
+  # currently runs bd 1.0.5 (a87493bae) — a dev build AHEAD of this tag, not a
+  # published artifact. Pinning to a published release is the supply-chain-clean
+  # choice (container ≡ VM); resolve the skew by aligning the VM to a published
+  # release, or bump this when gastownhall cuts v1.0.5.
+  BD_VERSION: "1.0.4"
   DOLT_VERSION: "2.1.7"
 
 jobs:
@@ -69,15 +74,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: gt, path: deploy/images }
-      - name: Fetch pinned bd + dolt
+      - name: Fetch pinned bd + dolt (arch from matrix; checksum-verified)
         working-directory: deploy/images
         run: |
-          curl -fsSL "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-amd64.tar.gz" \
-            | tar -xz --strip-components=2 -C . dolt-linux-amd64/bin/dolt
-          # bd: pinned release (adjust source if the beads release host differs)
-          curl -fsSL "https://github.com/steveyegge/beads/releases/download/v${BD_VERSION}/bd-linux-amd64" -o bd || \
-            echo "::warning::bd pin fetch failed — wire the correct beads release source"
-          chmod +x gt bd dolt 2>/dev/null || true
+          ARCH=amd64   # TODO: derive from --platform when arm64 town-host bake lands (beads_*_linux_arm64.tar.gz exists)
+          # dolt (dolthub/dolt) — published release tarball
+          curl -fsSL "https://github.com/dolthub/dolt/releases/download/v${DOLT_VERSION}/dolt-linux-${ARCH}.tar.gz" \
+            | tar -xz --strip-components=2 -C . "dolt-linux-${ARCH}/bin/dolt"
+          # bd (gastownhall/beads) — published release tarball, verified against checksums.txt
+          BASE="https://github.com/gastownhall/beads/releases/download/v${BD_VERSION}"
+          ASSET="beads_${BD_VERSION}_linux_${ARCH}.tar.gz"
+          curl -fsSL "${BASE}/${ASSET}" -o "$ASSET"
+          curl -fsSL "${BASE}/checksums.txt" -o bd-checksums.txt
+          grep " ${ASSET}\$" bd-checksums.txt | sha256sum -c - || { echo "::error::bd checksum mismatch"; exit 1; }
+          tar -xzf "$ASSET" -C . bd
+          rm -f "$ASSET" bd-checksums.txt
+          chmod +x gt bd dolt
       - name: Login to GHCR
         run: echo "${{ secrets.GHCR_PAT }}" | docker login "$REGISTRY" -u "${{ github.actor }}" --password-stdin
       - name: Build role image

@@ -24,7 +24,11 @@ No silent auto-update on the metal — matches `DEC-OPS-town-host-container-depl
 - **secret `GHCR_PAT`** — PAT with `write:packages` on the **Whiz-Digital-VC** org
   (images live there; this fork is a different owner, so the default `GITHUB_TOKEN`
   can't push to the org registry).
-- **confirm bd/dolt pin sources** — `BD_VERSION`/`DOLT_VERSION` env in the workflow;
-  verify the bd release URL resolves (wire the correct beads release host if not).
+- **bd/dolt pins** — `BD_VERSION`/`DOLT_VERSION` env. Sources confirmed:
+  dolt = `dolthub/dolt` releases; bd = **`gastownhall/beads`** releases
+  (`beads_<ver>_linux_<arch>.tar.gz`, checksum-verified against `checksums.txt`).
+  ⚠️ The live VM runs bd **1.0.5** (a dev build); latest **published** release is
+  **1.0.4** — the workflow pins the published one. Align the VM to a published
+  release (or bump `BD_VERSION` when gastownhall cuts 1.0.5) to keep container ≡ VM.
 - **arm64 for the A1 town-host** — today's build is amd64; add `GOARCH=arm64` +
   `--platform linux/arm64` (buildx/QEMU) before deploying town-host to OCI A1.
