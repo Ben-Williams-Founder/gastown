@@ -1873,8 +1873,27 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 			if unchecked := beads.HasUncheckedCriteria(hookedBead); unchecked > 0 {
 				style.PrintWarning("hooked bead %s has %d unchecked acceptance criteria — skipping close", hookedBeadID, unchecked)
 				fmt.Fprintf(os.Stderr, "  The bead will remain open for witness/mayor review.\n")
+			} else if openMRs, mrErr := bd.FindOpenMRsForIssue(hookedBeadID); mrErr == nil && len(openMRs) > 0 {
+				// close-on-merge (hq-y6fs follow-up): this bead has an open MR awaiting
+				// the refinery. Do NOT close the source bead at submit — closing here
+				// releases bd-dependents onto a base whose code PR has not merged yet
+				// (stale-base dispatch), and the engineer's post-merge already closes
+				// the source AFTER the real merge. Mark it blocked instead:
+				// non-dispatchable (so no re-dispatch loop, the gt-pftz concern) AND
+				// non-terminal (so dependents stay blocked) — until post-merge closes it.
+				mergePending := "blocked"
+				if err := bd.Update(hookedBeadID, beads.UpdateOptions{Status: &mergePending}); err != nil {
+					// Fall back to closing so the bead isn't stuck hooked.
+					fmt.Fprintf(os.Stderr, "Warning: couldn't mark hooked bead %s merge-pending: %v\n", hookedBeadID, err)
+					if closeErr := bd.Close(hookedBeadID); closeErr != nil {
+						fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, closeErr)
+					}
+				} else {
+					_, _ = bd.Run("comments", "add", hookedBeadID,
+						fmt.Sprintf("merge-pending: awaiting refinery merge of %s", openMRs[0].ID))
+				}
 			} else if err := bd.Close(hookedBeadID); err != nil {
-				// Non-fatal: warn but continue
+				// No-MR path (no-merge / direct already handled earlier): close at done.
 				fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
 			}
 		}
