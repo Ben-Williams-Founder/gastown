@@ -102,7 +102,7 @@ func schedulerDoltPort() string {
 func cleanupSchedulerBeadsDatabases(t *testing.T, prefixes ...string) {
 	t.Helper()
 	t.Cleanup(func() {
-		port := os.Getenv("GT_DOLT_PORT")
+		port := schedulerDoltPort()
 		if port == "" {
 			port = "3307"
 		}
