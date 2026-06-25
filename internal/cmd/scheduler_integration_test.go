@@ -38,8 +38,9 @@ var schedulerTestCounter atomic.Int32
 // shared Dolt test server. Uses local init (bd init --prefix --server-port)
 // which reliably creates the schema and records the ephemeral port in
 // metadata.json so subsequent bd commands reach the test server.
-func initBeadsDBForServer(t *testing.T, dir, prefix string) {
+func initBeadsDBForServer(t *testing.T, dir, prefix, homeDir string) {
 	t.Helper()
+	initSchedulerGitRepo(t, dir, homeDir)
 
 	args := []string{"init", "--prefix", prefix}
 	// Forward GT_DOLT_PORT so bd connects to the ephemeral test server
@@ -51,6 +52,7 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	}
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
+	cmd.Env = schedulerBDInitEnv(homeDir, filepath.Join(dir, ".beads"))
 	out, err := cmd.CombinedOutput()
 	t.Logf("bd init --prefix %s in %s: exit=%v\n%s", prefix, dir, err, out)
 	if err != nil {
@@ -67,6 +69,52 @@ func initBeadsDBForServer(t *testing.T, dir, prefix string) {
 	if err := beads.EnsureCustomTypes(filepath.Join(dir, ".beads")); err != nil {
 		t.Fatalf("ensure custom types in %s: %v", dir, err)
 	}
+}
+
+func initSchedulerGitRepo(t *testing.T, dir, homeDir string) {
+	t.Helper()
+	cmd := exec.Command("git", "init", "--quiet")
+	cmd.Dir = dir
+	cmd.Env = cleanSchedulerTestEnv(homeDir)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init in %s: %v\n%s", dir, err, out)
+	}
+}
+
+func schedulerBDInitEnv(homeDir, beadsDir string) []string {
+	env := beads.StripBDTargetEnv(cleanSchedulerTestEnv(homeDir))
+	env = append(env, "BEADS_DIR="+beadsDir)
+	if p := os.Getenv("GT_DOLT_PORT"); p != "" {
+		env = append(env, "BEADS_DOLT_SERVER_PORT="+p, "BEADS_DOLT_PORT="+p)
+	}
+	return env
+}
+
+func cleanupSchedulerBeadsDatabases(t *testing.T, prefixes ...string) {
+	t.Helper()
+	t.Cleanup(func() {
+		port := os.Getenv("GT_DOLT_PORT")
+		if port == "" {
+			port = "3307"
+		}
+		dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/", port)
+		db, err := sql.Open("mysql", dsn)
+		if err != nil {
+			t.Logf("cleanup: could not connect to drop test databases: %v", err)
+			return
+		}
+		defer db.Close()
+		for _, prefix := range prefixes {
+			for _, dbName := range []string{prefix, "beads_" + prefix} {
+				if _, err := db.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
+					t.Logf("cleanup: failed to drop %s: %v", dbName, err)
+				}
+			}
+		}
+		if _, err := db.Exec("CALL dolt_purge_dropped_databases()"); err != nil {
+			t.Logf("cleanup: failed to purge dropped databases: %v", err)
+		}
+	})
 }
 
 // setupSchedulerIntegrationTown creates a minimal town filesystem for scheduler tests.
@@ -95,10 +143,11 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	configureTestGitIdentity(t, tmpDir)
 
 	// Generate unique prefixes per test to avoid cross-test data leakage on
-	// the shared Dolt server. Each test gets its own databases (e.g., beads_h3, beads_r3).
+	// the shared Dolt server. Each test gets its own databases (e.g., h3, r3).
 	n := schedulerTestCounter.Add(1)
 	hqPrefix := fmt.Sprintf("h%d", n)
 	rigPrefix := fmt.Sprintf("r%d", n)
+	cleanupSchedulerBeadsDatabases(t, hqPrefix, rigPrefix)
 
 	hqPath = filepath.Join(tmpDir, "test-hq")
 	rigPath = filepath.Join(hqPath, "testrig", "mayor", "rig")
@@ -150,34 +199,13 @@ func setupSchedulerIntegrationTown(t *testing.T) (hqPath, rigPath, gtBinary stri
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
 	}
-	initBeadsDBForServer(t, hqPath, hqPrefix)
+	initBeadsDBForServer(t, hqPath, hqPrefix, tmpDir)
 
 	// --- testrig directory (loadRig checks os.Stat on townRoot/<rigName>) ---
 	if err := os.MkdirAll(rigPath, 0755); err != nil {
 		t.Fatalf("mkdir rigPath: %v", err)
 	}
-	initBeadsDBForServer(t, rigPath, rigPrefix)
-
-	// Drop test databases on cleanup to prevent orphaned databases on the Dolt server.
-	t.Cleanup(func() {
-		port := os.Getenv("GT_DOLT_PORT")
-		if port == "" {
-			port = "3307"
-		}
-		dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/", port)
-		db, err := sql.Open("mysql", dsn)
-		if err != nil {
-			t.Logf("cleanup: could not connect to drop test databases: %v", err)
-			return
-		}
-		defer db.Close()
-		for _, prefix := range []string{hqPrefix, rigPrefix} {
-			dbName := "beads_" + prefix
-			if _, err := db.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
-				t.Logf("cleanup: failed to drop %s: %v", dbName, err)
-			}
-		}
-	})
+	initBeadsDBForServer(t, rigPath, rigPrefix, tmpDir)
 
 	// Redirect: testrig/.beads/ → mayor/rig/.beads
 	// beadsSearchDirs scans townRoot/<dir>/.beads — the redirect lets bd commands
@@ -592,6 +620,7 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	hqPrefix := fmt.Sprintf("h%d", n)
 	rig1Prefix := fmt.Sprintf("r%d", n)
 	rig2Prefix := fmt.Sprintf("s%d", n)
+	cleanupSchedulerBeadsDatabases(t, hqPrefix, rig1Prefix, rig2Prefix)
 
 	hqPath = filepath.Join(tmpDir, "test-hq")
 	rig1Path = filepath.Join(hqPath, "rig1", "mayor", "rig")
@@ -649,13 +678,13 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err := beads.WriteRoutes(townBeadsDir, routes); err != nil {
 		t.Fatalf("write routes: %v", err)
 	}
-	initBeadsDBForServer(t, hqPath, hqPrefix)
+	initBeadsDBForServer(t, hqPath, hqPrefix, tmpDir)
 
 	// --- rig1 ---
 	if err := os.MkdirAll(rig1Path, 0755); err != nil {
 		t.Fatalf("mkdir rig1Path: %v", err)
 	}
-	initBeadsDBForServer(t, rig1Path, rig1Prefix)
+	initBeadsDBForServer(t, rig1Path, rig1Prefix, tmpDir)
 	// Write routes to rig1's .beads/ so bd can resolve cross-rig IDs (needed for
 	// cross-rig dep creation via external refs).
 	if err := beads.WriteRoutes(filepath.Join(rig1Path, ".beads"), routes); err != nil {
@@ -673,7 +702,7 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err := os.MkdirAll(rig2Path, 0755); err != nil {
 		t.Fatalf("mkdir rig2Path: %v", err)
 	}
-	initBeadsDBForServer(t, rig2Path, rig2Prefix)
+	initBeadsDBForServer(t, rig2Path, rig2Prefix, tmpDir)
 	if err := beads.WriteRoutes(filepath.Join(rig2Path, ".beads"), routes); err != nil {
 		t.Fatalf("write rig2 routes: %v", err)
 	}
@@ -684,29 +713,6 @@ func setupMultiRigSchedulerTown(t *testing.T) (hqPath, rig1Path, rig2Path, gtBin
 	if err := os.WriteFile(filepath.Join(rig2Redirect, "redirect"), []byte("mayor/rig/.beads"), 0644); err != nil {
 		t.Fatalf("write rig2 redirect: %v", err)
 	}
-
-	// Drop test databases on cleanup to prevent orphaned databases on the Dolt
-	// server. Without this, databases from multi-rig tests persist and can
-	// contaminate subsequent tests sharing the same server (see #2832).
-	t.Cleanup(func() {
-		port := os.Getenv("GT_DOLT_PORT")
-		if port == "" {
-			port = "3307"
-		}
-		dsn := fmt.Sprintf("root@tcp(127.0.0.1:%s)/", port)
-		db, err := sql.Open("mysql", dsn)
-		if err != nil {
-			t.Logf("cleanup: could not connect to drop test databases: %v", err)
-			return
-		}
-		defer db.Close()
-		for _, prefix := range []string{hqPrefix, rig1Prefix, rig2Prefix} {
-			dbName := "beads_" + prefix
-			if _, err := db.Exec("DROP DATABASE IF EXISTS `" + dbName + "`"); err != nil {
-				t.Logf("cleanup: failed to drop %s: %v", dbName, err)
-			}
-		}
-	})
 
 	// --- Environment ---
 	env = cleanSchedulerTestEnv(tmpDir)
