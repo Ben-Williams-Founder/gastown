@@ -1940,13 +1940,41 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 				}
 			}
 
-			// Acceptance criteria gate: skip close if criteria are unchecked.
-			if unchecked := beads.HasUncheckedCriteria(hookedBead); unchecked > 0 {
+			// Decide the hooked source bead's disposition. Extracted to the pure
+			// helper hookedBeadDoneAction so the close-on-merge decision is unit-tested.
+			unchecked := beads.HasUncheckedCriteria(hookedBead)
+			var openMRID string
+			if openMRs, mrErr := bd.FindOpenMRsForIssue(hookedBeadID); mrErr == nil && len(openMRs) > 0 {
+				openMRID = openMRs[0].ID
+			}
+			switch hookedBeadDoneAction(hookedBead.Status, unchecked, openMRID != "") {
+			case hookedDoneSkip:
+				// Unchecked acceptance criteria: leave open for witness/mayor review.
 				style.PrintWarning("hooked bead %s has %d unchecked acceptance criteria — skipping close", hookedBeadID, unchecked)
 				fmt.Fprintf(os.Stderr, "  The bead will remain open for witness/mayor review.\n")
-			} else if err := bd.Close(hookedBeadID); err != nil {
-				// Non-fatal: warn but continue
-				fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
+			case hookedDoneBlock:
+				// close-on-merge (hq-y6fs follow-up): an MR is awaiting the refinery.
+				// Do NOT close at submit — that releases bd-dependents onto a base whose
+				// code PR has not merged yet (stale-base dispatch), and the engineer's
+				// post-merge already closes the source AFTER the real merge. Mark it
+				// blocked instead: non-dispatchable (no re-dispatch loop, the gt-pftz
+				// concern) AND non-terminal (deps stay blocked) until post-merge closes it.
+				mergePending := "blocked"
+				if err := bd.Update(hookedBeadID, beads.UpdateOptions{Status: &mergePending}); err != nil {
+					// Fall back to closing so the bead isn't stuck hooked.
+					fmt.Fprintf(os.Stderr, "Warning: couldn't mark hooked bead %s merge-pending: %v\n", hookedBeadID, err)
+					if closeErr := bd.Close(hookedBeadID); closeErr != nil {
+						fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, closeErr)
+					}
+				} else {
+					_, _ = bd.Run("comments", "add", hookedBeadID,
+						fmt.Sprintf("merge-pending: awaiting refinery merge of %s", openMRID))
+				}
+			case hookedDoneClose:
+				// No MR awaiting merge (no-merge / direct already handled earlier): close.
+				if err := bd.Close(hookedBeadID); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: couldn't close hooked bead %s: %v\n", hookedBeadID, err)
+				}
 			}
 		}
 	}
@@ -2165,6 +2193,35 @@ func assignedIssueIDs(assigned []*beads.Issue) []string {
 // branch guard and the hook fallback silently no-op'd (same class of bug as
 // gt-pftz in the close path). Hooked wins over in_progress when both exist.
 // Returns empty string if no assignment bead is found.
+
+// Hooked source-bead disposition at `gt done`.
+const (
+	hookedDoneSkip  = "skip"  // leave open: already terminal, or unchecked acceptance criteria
+	hookedDoneBlock = "block" // hold merge-pending (blocked): an MR is awaiting the refinery
+	hookedDoneClose = "close" // close now: no MR awaiting merge
+)
+
+// hookedBeadDoneAction decides what `gt done` does with the hooked source bead.
+//
+// close-on-merge rule: when an MR is awaiting the refinery, the bead is held
+// merge-pending (blocked) rather than closed at submit. Closing at submit would
+// release bd-dependents onto a base whose code PR has not merged yet (stale-base
+// dispatch); the engineer's post-merge closes the source AFTER the real merge.
+// "blocked" is non-dispatchable (so no re-dispatch loop — the gt-pftz concern)
+// and non-terminal (so dependents stay blocked) until post-merge closes it.
+func hookedBeadDoneAction(status string, uncheckedCriteria int, hasOpenMR bool) string {
+	if beads.IssueStatus(status).IsTerminal() {
+		return hookedDoneSkip
+	}
+	if uncheckedCriteria > 0 {
+		return hookedDoneSkip
+	}
+	if hasOpenMR {
+		return hookedDoneBlock
+	}
+	return hookedDoneClose
+}
+
 func findHookedBeadForAgent(bd *beads.Beads, agentID string) string {
 	issueID, _ := selectAssignedIssue("", assignedIssueIDs(queryAssignedBeads(bd, agentID)))
 	return issueID
