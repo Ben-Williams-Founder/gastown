@@ -1700,6 +1700,131 @@ func TestRollbackSlingArtifactsKeepsMetadataWhenMoleculeBurnFails(t *testing.T) 
 	assertHasRawReviewMetadata(t, desc)
 }
 
+func TestRollbackSlingArtifactsClearsRawReviewOnlyMetadataAfterMoleculeBurnSucceeds(t *testing.T) {
+	initial := strings.Join([]string{
+		"attached_molecule: gt-wisp-stale",
+		"no_merge: true",
+		"review_only: true",
+		"",
+		"Keep this body.",
+	}, "\n")
+	townRoot, _, descPath := setupMutableBDRawSlingTest(t, initial)
+
+	prevCollect := collectExistingMoleculesForRollback
+	prevBurn := burnExistingMoleculesForRollback
+	t.Cleanup(func() {
+		collectExistingMoleculesForRollback = prevCollect
+		burnExistingMoleculesForRollback = prevBurn
+	})
+	collectExistingMoleculesForRollback = func(info *beadInfo) []string {
+		return []string{"gt-wisp-stale"}
+	}
+	burnExistingMoleculesForRollback = func(molecules []string, beadID, townRoot string) error {
+		if len(molecules) != 1 || molecules[0] != "gt-wisp-stale" {
+			t.Fatalf("unexpected molecules: %#v", molecules)
+		}
+		updated := strings.Join([]string{
+			"no_merge: true",
+			"review_only: true",
+			"",
+			"Keep this body.",
+		}, "\n")
+		if err := os.WriteFile(descPath, []byte(updated), 0644); err != nil {
+			t.Fatalf("simulate molecule burn: %v", err)
+		}
+		return nil
+	}
+
+	rollbackSlingArtifacts(&SpawnedPolecatInfo{
+		RigName:     "gastown",
+		PolecatName: "toast",
+		ClonePath:   filepath.Join(townRoot, "gastown", "polecats", "toast"),
+	}, "gt-rawrollback", filepath.Join(townRoot, "gastown", "polecats", "toast"), "")
+
+	desc := readMutableBDDescription(t, descPath)
+	assertNoRawReviewMetadata(t, desc)
+	if strings.Contains(desc, "attached_molecule: gt-wisp-stale") {
+		t.Fatalf("rollback reintroduced stale attached molecule:\n%s", desc)
+	}
+	if !strings.Contains(desc, "Keep this body.") {
+		t.Fatalf("rollback did not preserve description body:\n%s", desc)
+	}
+}
+
+func TestRestoreRollbackRawWorkflowFieldsFromCurrentRestoresOriginalValues(t *testing.T) {
+	current := strings.Join([]string{
+		"no_merge: true",
+		"review_only: true",
+		"dispatched_by: mayor/",
+		"",
+		"Keep this body.",
+	}, "\n")
+	townRoot, _, descPath := setupMutableBDRawSlingTest(t, current)
+	original := &beadInfo{Description: strings.Join([]string{
+		"no_merge: true",
+		"",
+		"Original body.",
+	}, "\n")}
+
+	restoreRollbackRawWorkflowFieldsFromCurrent("gt-rawrollback", townRoot, filepath.Join(townRoot, "gastown", "polecats", "toast"), original)
+
+	desc := readMutableBDDescription(t, descPath)
+	fields := beads.ParseAttachmentFields(&beads.Issue{Description: desc})
+	if fields == nil || !fields.NoMerge || fields.ReviewOnly {
+		t.Fatalf("rollback did not restore original workflow values: %+v\n%s", fields, desc)
+	}
+	if !strings.Contains(desc, "dispatched_by: mayor/") || !strings.Contains(desc, "Keep this body.") {
+		t.Fatalf("rollback did not preserve current metadata/body:\n%s", desc)
+	}
+}
+
+func TestRunSlingRawReviewOnlyExistingTargetHookFailureClearsPreHookMetadata(t *testing.T) {
+	townRoot, _, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
+	workDir := filepath.Join(townRoot, "gastown", "crew", "toast")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatalf("mkdir workDir: %v", err)
+	}
+
+	prevHookRaw := slingHookRawBead
+	prevNoMerge := slingNoMerge
+	prevReviewOnly := slingReviewOnly
+	prevNoConvoy := slingNoConvoy
+	prevDryRun := slingDryRun
+	prevResolve := resolveTargetAgentFn
+	prevHook := hookBeadWithRetryFn
+	t.Cleanup(func() {
+		slingHookRawBead = prevHookRaw
+		slingNoMerge = prevNoMerge
+		slingReviewOnly = prevReviewOnly
+		slingNoConvoy = prevNoConvoy
+		slingDryRun = prevDryRun
+		resolveTargetAgentFn = prevResolve
+		hookBeadWithRetryFn = prevHook
+	})
+	slingHookRawBead = true
+	slingNoMerge = true
+	slingReviewOnly = true
+	slingNoConvoy = true
+	slingDryRun = false
+	resolveTargetAgentFn = func(target string) (string, string, string, error) {
+		return "gastown/crew/toast", "", workDir, nil
+	}
+	hookBeadWithRetryFn = func(beadID, targetAgent, hookDir string) error {
+		assertHasRawReviewMetadata(t, readMutableBDDescription(t, descPath))
+		return errors.New("forced hook failure")
+	}
+
+	err := runSling(nil, []string{"gt-rawrollback", "gastown/crew/toast"})
+	if err == nil {
+		t.Fatal("expected hook failure from runSling")
+	}
+	desc := readMutableBDDescription(t, descPath)
+	assertNoRawReviewMetadata(t, desc)
+	if !strings.Contains(desc, "Keep this body.") {
+		t.Fatalf("rollback did not preserve description body:\n%s", desc)
+	}
+}
+
 func TestExecuteSlingRawReviewOnlyHookFailureClearsPreHookMetadata(t *testing.T) {
 	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, "Keep this body.")
 
@@ -1736,6 +1861,56 @@ func TestExecuteSlingRawReviewOnlyHookFailureClearsPreHookMetadata(t *testing.T)
 		t.Fatal("expected hook failure from executeSling")
 	}
 	assertNoRawReviewMetadata(t, readMutableBDDescription(t, descPath))
+}
+
+func TestExecuteSlingRawReviewOnlyHookFailureRestoresOriginalMetadata(t *testing.T) {
+	initial := strings.Join([]string{
+		"no_merge: true",
+		"",
+		"Keep this body.",
+	}, "\n")
+	townRoot, rigPath, descPath := setupMutableBDRawSlingTest(t, initial)
+
+	prevSpawn := spawnPolecatForSling
+	prevHook := hookBeadWithRetryWithTownRootFn
+	t.Cleanup(func() {
+		spawnPolecatForSling = prevSpawn
+		hookBeadWithRetryWithTownRootFn = prevHook
+	})
+	spawnPolecatForSling = func(rigName string, opts SlingSpawnOptions) (*SpawnedPolecatInfo, error) {
+		return &SpawnedPolecatInfo{
+			RigName:     rigName,
+			PolecatName: "toast",
+			ClonePath:   filepath.Join(townRoot, "gastown", "polecats", "toast"),
+		}, nil
+	}
+	hookBeadWithRetryWithTownRootFn = func(beadID, targetAgent, hookDir, townRoot string) error {
+		assertHasRawReviewMetadata(t, readMutableBDDescription(t, descPath))
+		return errors.New("forced hook failure")
+	}
+
+	_, err := executeSling(SlingParams{
+		BeadID:      "gt-rawrollback",
+		RigName:     "gastown",
+		TownRoot:    townRoot,
+		BeadsDir:    filepath.Join(rigPath, ".beads"),
+		HookRawBead: true,
+		NoMerge:     true,
+		ReviewOnly:  true,
+		NoConvoy:    true,
+		NoBoot:      true,
+	})
+	if err == nil {
+		t.Fatal("expected hook failure from executeSling")
+	}
+	desc := readMutableBDDescription(t, descPath)
+	fields := beads.ParseAttachmentFields(&beads.Issue{Description: desc})
+	if fields == nil || !fields.NoMerge || fields.ReviewOnly {
+		t.Fatalf("rollback did not restore original asymmetric metadata: %+v\n%s", fields, desc)
+	}
+	if !strings.Contains(desc, "Keep this body.") {
+		t.Fatalf("rollback did not preserve description body:\n%s", desc)
+	}
 }
 
 func TestExecuteSlingRawReviewOnlySuccessKeepsMetadata(t *testing.T) {

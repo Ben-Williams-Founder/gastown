@@ -260,6 +260,14 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 
 	// 4. Auto-convoy (if !NoConvoy)
 	convoyID := ""
+	rollbackSpawnedPolecat := func(rollbackBeadID, reason string) {
+		fmt.Printf("  %s %s, rolling back spawned polecat %s...\n", style.Warning.Render("⚠"), reason, spawnInfo.PolecatName)
+		rollbackSlingArtifactsFn(spawnInfo, rollbackBeadID, hookWorkDir, convoyID)
+		restoreRollbackRawWorkflowFieldsFromCurrent(rollbackBeadID, townRoot, hookWorkDir, info)
+		if params.Force && info.Status == "pinned" {
+			restorePinnedBead(townRoot, params.BeadID, info.Assignee)
+		}
+	}
 	if !params.NoConvoy {
 		existingConvoy := isTrackedByConvoy(params.BeadID)
 		if existingConvoy == "" {
@@ -282,7 +290,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		if err := CookFormula(params.FormulaName, workDir, townRoot); err != nil {
 			if params.FormulaFailFatal {
 				// Rollback spawned polecat on fatal cook failure
-				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyID)
+				rollbackSpawnedPolecat(params.BeadID, "Formula cook failed")
 				result.ErrMsg = fmt.Sprintf("cook failed: %v", err)
 				return result, fmt.Errorf("cooking formula %s: %w", params.FormulaName, err)
 			}
@@ -321,7 +329,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		if err != nil {
 			if params.FormulaFailFatal {
 				// Rollback spawned polecat on fatal formula failure
-				rollbackSlingArtifactsFn(spawnInfo, params.BeadID, hookWorkDir, convoyID)
+				rollbackSpawnedPolecat(params.BeadID, "Formula instantiation failed")
 				result.ErrMsg = fmt.Sprintf("formula failed: %v", err)
 				return result, fmt.Errorf("instantiating formula %s: %w", params.FormulaName, err)
 			}
@@ -374,6 +382,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	if attachedMoleculeID == "" && (params.NoMerge || params.ReviewOnly) {
 		if err := storeFieldsInBeadFromTownRoot(townRoot, beadToHook, fieldUpdates); err != nil {
 			cleanupSpawnedPolecat(spawnInfo, params.RigName, convoyID)
+			restoreRollbackRawWorkflowFieldsFromCurrent(beadToHook, townRoot, hookWorkDir, info)
 			result.ErrMsg = "raw sling metadata failed"
 			return result, fmt.Errorf("storing raw sling metadata before hook: %w", err)
 		}
@@ -381,10 +390,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	hookDir := beads.ResolveHookDir(townRoot, beadToHook, hookWorkDir)
 	if err := hookBeadWithRetryWithTownRootFn(beadToHook, targetAgent, hookDir, townRoot); err != nil {
 		// Clean up all partial sling state, including raw metadata stored before hook.
-		rollbackSlingArtifactsFn(spawnInfo, beadToHook, hookWorkDir, convoyID)
-		if params.Force && info.Status == "pinned" {
-			restorePinnedBead(townRoot, params.BeadID, info.Assignee)
-		}
+		rollbackSpawnedPolecat(beadToHook, "Hook failed")
 		result.ErrMsg = "hook failed"
 		return result, fmt.Errorf("failed to hook bead: %w", err)
 	}
@@ -412,7 +418,7 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	pane, err := spawnInfo.StartSession()
 	if err != nil {
 		fmt.Printf("  %s Could not start session: %v, cleaning up partial state...\n", style.Dim.Render("✗"), err)
-		rollbackSlingArtifactsFn(spawnInfo, beadToHook, hookWorkDir, convoyID)
+		rollbackSpawnedPolecat(beadToHook, "Session failed")
 		result.ErrMsg = fmt.Sprintf("session failed: %v", err)
 		return result, fmt.Errorf("starting polecat session: %w", err)
 	}
