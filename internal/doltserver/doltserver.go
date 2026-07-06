@@ -475,20 +475,31 @@ func NewSQLServerCommand(doltPath, dataDir, configPath string) *exec.Cmd {
 }
 
 func doltSQLServerEnv(env []string) []string {
+	return doltSQLServerEnvForGOOS(env, runtime.GOOS)
+}
+
+func doltSQLServerEnvForGOOS(env []string, goos string) []string {
 	out := append([]string(nil), env...)
-	out = appendEnvDefault(out, "GOMEMLIMIT", defaultDoltSQLServerGoMemLimit)
-	out = appendEnvDefault(out, "GOGC", defaultDoltSQLServerGOGC)
+	out = appendEnvDefault(out, "GOMEMLIMIT", defaultDoltSQLServerGoMemLimit, goos)
+	out = appendEnvDefault(out, "GOGC", defaultDoltSQLServerGOGC, goos)
 	return out
 }
 
-func appendEnvDefault(env []string, key, value string) []string {
-	prefix := key + "="
+func appendEnvDefault(env []string, key, value, goos string) []string {
 	for _, entry := range env {
-		if strings.HasPrefix(entry, prefix) {
+		entryKey, _, ok := strings.Cut(entry, "=")
+		if ok && envKeyMatches(entryKey, key, goos) {
 			return env
 		}
 	}
-	return append(env, prefix+value)
+	return append(env, key+"="+value)
+}
+
+func envKeyMatches(entryKey, key, goos string) bool {
+	if goos == "windows" {
+		return strings.EqualFold(entryKey, key)
+	}
+	return entryKey == key
 }
 
 // RigDatabaseDir returns the database directory for a specific rig.

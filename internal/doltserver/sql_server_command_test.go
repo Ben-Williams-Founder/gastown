@@ -3,6 +3,7 @@ package doltserver
 import (
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -71,6 +72,57 @@ func TestDoltSQLServerEnvTreatsEmptyAndOffAsOverrides(t *testing.T) {
 	}
 }
 
+func TestDoltSQLServerEnvPreservesWindowsCaseInsensitiveRuntimeOverrides(t *testing.T) {
+	tests := []struct {
+		name string
+		env  []string
+		want map[string]string
+	}{
+		{
+			name: "lowercase",
+			env:  []string{"gomemlimit=24GiB", "gogc=100"},
+			want: map[string]string{"GOMEMLIMIT": "24GiB", "GOGC": "100"},
+		},
+		{
+			name: "mixed empty off",
+			env:  []string{"GoMemLimit=off", "GoGc="},
+			want: map[string]string{"GOMEMLIMIT": "off", "GOGC": ""},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := doltSQLServerEnvForGOOS(tt.env, "windows")
+			for key, want := range tt.want {
+				got, ok := envValueForGOOS(env, key, "windows")
+				if !ok || got != want {
+					t.Fatalf("%s = %q (found %v), want %q", key, got, ok, want)
+				}
+				if got := envKeyCountForGOOS(env, key, "windows"); got != 1 {
+					t.Fatalf("%s count = %d, want 1", key, got)
+				}
+			}
+		})
+	}
+}
+
+func TestDoltSQLServerEnvKeepsPOSIXRuntimeKeysCaseSensitive(t *testing.T) {
+	env := doltSQLServerEnvForGOOS([]string{"gomemlimit=24GiB", "GoGc=100"}, "linux")
+
+	if got := envValue(env, "GOMEMLIMIT"); got != defaultDoltSQLServerGoMemLimit {
+		t.Fatalf("GOMEMLIMIT = %q, want default", got)
+	}
+	if got := envValue(env, "GOGC"); got != defaultDoltSQLServerGOGC {
+		t.Fatalf("GOGC = %q, want default", got)
+	}
+	if got := envValue(env, "gomemlimit"); got != "24GiB" {
+		t.Fatalf("gomemlimit = %q, want preserved lowercase value", got)
+	}
+	if got := envValue(env, "GoGc"); got != "100" {
+		t.Fatalf("GoGc = %q, want preserved mixed-case value", got)
+	}
+}
+
 func unsetEnv(t *testing.T, key string) {
 	t.Helper()
 	old, ok := os.LookupEnv(key)
@@ -97,10 +149,24 @@ func envValue(env []string, key string) string {
 }
 
 func envKeyCount(env []string, key string) int {
-	prefix := key + "="
+	return envKeyCountForGOOS(env, key, "")
+}
+
+func envValueForGOOS(env []string, key, goos string) (string, bool) {
+	for _, entry := range env {
+		entryKey, value, ok := strings.Cut(entry, "=")
+		if ok && envKeyMatches(entryKey, key, goos) {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func envKeyCountForGOOS(env []string, key, goos string) int {
 	count := 0
 	for _, entry := range env {
-		if len(entry) >= len(prefix) && entry[:len(prefix)] == prefix {
+		entryKey, _, ok := strings.Cut(entry, "=")
+		if ok && envKeyMatches(entryKey, key, goos) {
 			count++
 		}
 	}
