@@ -460,7 +460,7 @@ func (m *Manager) issueToMR(issue *beads.Issue) *MergeRequest {
 		return &MergeRequest{
 			ID:           issue.ID,
 			IssueID:      issue.ID,
-			Status:       MROpen,
+			Status:       mrStatusFromIssue(issue),
 			CreatedAt:    parseTime(issue.CreatedAt),
 			TargetBranch: defaultBranch,
 		}
@@ -476,12 +476,28 @@ func (m *Manager) issueToMR(issue *beads.Issue) *MergeRequest {
 		ID:           issue.ID,
 		Branch:       fields.Branch,
 		Worker:       fields.Worker,
+		AgentBead:    fields.AgentBead,
 		IssueID:      fields.SourceIssue,
 		TargetBranch: target,
 		MergeCommit:  fields.MergeCommit,
-		Status:       MROpen,
+		Status:       mrStatusFromIssue(issue),
+		CloseReason:  CloseReason(fields.CloseReason),
 		CreatedAt:    parseTime(issue.CreatedAt),
 	}
+}
+
+func mrStatusFromIssue(issue *beads.Issue) MRStatus {
+	if issue == nil {
+		return MROpen
+	}
+	status := beads.IssueStatus(strings.TrimSpace(issue.Status))
+	if status.IsTerminal() {
+		return MRClosed
+	}
+	if status == "in_progress" {
+		return MRInProgress
+	}
+	return MROpen
 }
 
 // parseTime parses a time string, returning zero time on error.
@@ -550,6 +566,25 @@ func (m *Manager) FindMR(idOrBranch string) (*MergeRequest, error) {
 	}
 
 	return nil, ErrMRNotFound
+}
+
+func (m *Manager) findMRForTerminalCleanup(idOrBranch string, b *beads.Beads) (*MergeRequest, error) {
+	mr, err := m.FindMR(idOrBranch)
+	if err == nil {
+		return mr, nil
+	}
+	if !errors.Is(err, ErrMRNotFound) {
+		return nil, err
+	}
+
+	issue, showErr := b.Show(idOrBranch)
+	if showErr != nil {
+		return nil, err
+	}
+	if issue == nil || !beads.HasLabel(issue, "gt:merge-request") {
+		return nil, err
+	}
+	return m.issueToMR(issue), nil
 }
 
 // Retry is deprecated - the Refinery agent handles retry logic autonomously.
