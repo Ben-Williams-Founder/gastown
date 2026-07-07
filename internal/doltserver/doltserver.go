@@ -51,6 +51,7 @@ import (
 	"github.com/steveyegge/gastown/internal/atomicfile"
 	"github.com/steveyegge/gastown/internal/beads"
 	configpkg "github.com/steveyegge/gastown/internal/config"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/style"
 )
 
@@ -2672,6 +2673,12 @@ func EnsureRigIssuePrefix(townRoot, rigName string, serverMode bool) error {
 	}
 	if err := beads.EnsureConfigYAML(beadsDir, prefix); err != nil {
 		return fmt.Errorf("ensuring config.yaml: %w", err)
+	}
+	if err := beads.EnsureConfigYAMLValue(beadsDir, "types.custom", constants.BeadsCustomTypes); err != nil {
+		return fmt.Errorf("ensuring types.custom in config.yaml: %w", err)
+	}
+	if err := beads.EnsureConfigYAMLValue(beadsDir, "types.infra", constants.BeadsInfraTypes); err != nil {
+		return fmt.Errorf("ensuring types.infra in config.yaml: %w", err)
 	}
 	if err := EnsureMetadataForBeadsDir(townRoot, beadsDir, rigName, rigName); err != nil {
 		return fmt.Errorf("ensuring metadata.json: %w", err)

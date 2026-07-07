@@ -454,9 +454,8 @@ func TestEnsureCustomTypesConfigYAML(t *testing.T) {
 		t.Fatalf("config.yaml kept rig in infra types:\n%s", config)
 	}
 
-	sentinel := strings.TrimSpace(string(mustReadFile(t, filepath.Join(beadsDir, typesSentinel))))
-	if sentinel != TypeConfigSentinelValue() {
-		t.Fatalf("types sentinel = %q, want %q", sentinel, TypeConfigSentinelValue())
+	if _, err := os.Stat(filepath.Join(beadsDir, typesSentinel)); !os.IsNotExist(err) {
+		t.Fatalf("YAML-only type config must not write DB-verified sentinel, stat err: %v", err)
 	}
 }
 

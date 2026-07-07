@@ -232,8 +232,6 @@ func EnsureCustomTypesConfigYAML(beadsDir string) error {
 	if err := EnsureConfigYAMLValue(beadsDir, "types.infra", infraTypes); err != nil {
 		return err
 	}
-	_ = os.WriteFile(filepath.Join(beadsDir, typesSentinel), []byte(TypeConfigSentinelValue()+"\n"), 0644)
-	ensuredDirs[beadsDir] = true
 	return nil
 }
 
