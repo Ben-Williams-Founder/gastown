@@ -534,7 +534,7 @@ type AddOptions struct {
 	HookBead   string // Bead ID to set as hook_bead at spawn time (atomic assignment)
 	BaseBranch string // Override base branch for worktree (e.g., "origin/integration/gt-epic")
 	// ResumeBranch reuses an existing branch (typically a PR head) for the polecat
-	// worktree instead of creating a fresh polecat/<name>/<bead>@<ts> branch (gh#3602).
+	// worktree instead of creating a fresh polecat/<name>/<bead>+<ts> branch (gh#3602).
 	// When set, the polecat's branch IS this branch — pushes go back to the same ref,
 	// updating the existing PR. Mutually exclusive with BaseBranch (resume implies its
 	// own start point). When empty, normal fresh-branch behavior is used.
@@ -555,7 +555,7 @@ type AddOptions struct {
 // - {timestamp}: unique timestamp
 //
 // If no template is configured or template is empty, uses default format:
-// - polecat/{name}/{issue}@{timestamp} when issue is available
+// - polecat/{name}/{issue}+{timestamp} when issue is available
 // - polecat/{name}-{timestamp} otherwise
 func (m *Manager) buildBranchName(name, issue string) string {
 	template := m.rig.GetStringConfig("polecat_branch_template")
@@ -563,10 +563,7 @@ func (m *Manager) buildBranchName(name, issue string) string {
 	// No template configured - use default behavior for backward compatibility
 	if template == "" {
 		timestamp := strconv.FormatInt(time.Now().UnixMilli(), 36)
-		if issue != "" {
-			return fmt.Sprintf("polecat/%s/%s@%s", name, issue, timestamp)
-		}
-		return fmt.Sprintf("polecat/%s-%s", name, timestamp)
+		return FormatGeneratedBranchName(name, issue, timestamp)
 	}
 
 	// Build template variables
@@ -1501,7 +1498,7 @@ func (m *Manager) RepairWorktreeWithOptions(name string, force bool, opts AddOpt
 
 	if opts.ResumeBranch != "" {
 		// Resume an existing branch: fetch and attach the temp worktree directly
-		// to the named branch instead of creating a fresh polecat/<name>/<bead>@<ts>.
+		// to the named branch instead of creating a fresh polecat/<name>/<bead>+<ts>.
 		if err := repoGit.FetchBranch("origin", opts.ResumeBranch); err != nil {
 			style.PrintWarning("could not fetch resume branch %s: %v", opts.ResumeBranch, err)
 		}
@@ -1779,7 +1776,7 @@ func (m *Manager) ReuseIdlePolecat(name string, opts AddOptions) (*Polecat, erro
 
 	// Create or reset the branch tracking the start point. For resume, the branch
 	// IS opts.ResumeBranch (so pushes go back to the existing PR head). For fresh
-	// work, build a new polecat/<name>/<bead>@<ts> branch.
+	// work, build a new polecat/<name>/<bead>+<ts> branch.
 	branchName := m.buildBranchName(name, opts.HookBead)
 	if opts.ResumeBranch != "" {
 		branchName = opts.ResumeBranch

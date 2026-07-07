@@ -724,7 +724,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if doneIssue == "" && info.Issue != "" && sender != "" {
 		if hookIssue, ambiguous := selectAssignedIssue(info.Issue, loadAssignedIssueIDs()); isStaleBranchIssue(info.Issue, hookIssue) {
 			style.PrintWarning("branch %q embeds issue %s but your hooked bead is %s — submitting for %s (stale branch reuse?)", branch, info.Issue, hookIssue, hookIssue)
-			fmt.Printf("  Fresh branches must be named polecat/<name>/<bead-id>@<suffix> for the bead you are working.\n")
+			fmt.Printf("  Fresh branches must be named polecat/<name>/<bead-id>+<suffix> for the bead you are working.\n")
 			fmt.Printf("  Use --issue to override if the branch-derived id is actually correct.\n\n")
 			issueID = hookIssue
 		} else if ambiguous {

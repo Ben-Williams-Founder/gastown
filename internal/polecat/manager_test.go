@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -1097,7 +1098,7 @@ func TestBuildBranchName(t *testing.T) {
 			name:     "default_with_issue",
 			template: "", // Empty template = default behavior
 			issue:    "gt-123",
-			want:     "polecat/alpha/gt-123@", // timestamp suffix varies
+			want:     "polecat/alpha/gt-123+", // timestamp suffix varies
 		},
 		{
 			name:     "default_without_issue",
@@ -1169,6 +1170,44 @@ func TestBuildBranchName(t *testing.T) {
 						t.Errorf("buildBranchName() = %q, want %q", got, tt.want)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestBuildBranchName_ClaudeActionCompatible(t *testing.T) {
+	tmpDir := t.TempDir()
+	gitCmd := exec.Command("git", "init")
+	gitCmd.Dir = tmpDir
+	if err := gitCmd.Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+
+	r := &rig.Rig{Name: "test-rig", Path: tmpDir}
+	g := git.NewGit(tmpDir)
+	m := NewManager(r, g, nil)
+
+	validator := regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9/_.#+,-]*$`)
+	cases := []struct {
+		name    string
+		polecat string
+		issue   string
+	}{
+		{name: "simple issue", polecat: "mutant", issue: "gt-abc"},
+		{name: "dotted subtask", polecat: "raider", issue: "gt-4kp9.5.5.1"},
+		{name: "hq prefix", polecat: "pipboy", issue: "hq-571c"},
+		{name: "no issue", polecat: "ghoul", issue: ""},
+		{name: "long polecat name", polecat: "thunderchief", issue: "gt-jns7.1"},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := m.buildBranchName(c.polecat, c.issue)
+			if strings.Contains(got, "@") {
+				t.Fatalf("buildBranchName(%q, %q) = %q contains @", c.polecat, c.issue, got)
+			}
+			if !validator.MatchString(got) {
+				t.Fatalf("buildBranchName(%q, %q) = %q rejected by claude-code-action head-ref validator", c.polecat, c.issue, got)
 			}
 		})
 	}
@@ -1479,7 +1518,7 @@ func TestReuseIdlePolecat_UsesCanonicalOriginDefaultBranch(t *testing.T) {
 
 // TestAddWithOptions_ResumeBranch verifies gh#3602: when ResumeBranch is set,
 // AddWithOptions checks out the named existing branch instead of creating a
-// fresh polecat/<name>/<bead>@<ts> branch. This lets `gt sling --branch/--pr`
+// fresh polecat/<name>/<bead>+<ts> branch. This lets `gt sling --branch/--pr`
 // resume work on an existing PR branch without creating duplicates.
 func TestAddWithOptions_ResumeBranch(t *testing.T) {
 	mgr, mayorRig := setupCanonicalBranchManagerTest(t)
