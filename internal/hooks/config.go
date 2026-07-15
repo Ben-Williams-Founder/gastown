@@ -155,7 +155,14 @@ func HasClaudePromptDefaults(s *SettingsJSON) bool {
 	if raw, ok := s.Extra["permissions"]; !ok || json.Unmarshal(raw, &permissions) != nil {
 		return false
 	}
-	return rawStringEquals(permissions, "defaultMode", "bypassPermissions")
+	if !rawStringEquals(permissions, "defaultMode", "bypassPermissions") {
+		return false
+	}
+	env := map[string]json.RawMessage{}
+	if raw, ok := s.Extra["env"]; !ok || json.Unmarshal(raw, &env) != nil {
+		return false
+	}
+	return rawStringEquals(env, "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", "1")
 }
 
 func addClaudePromptDefaults(out map[string]json.RawMessage) {
@@ -170,6 +177,21 @@ func addClaudePromptDefaults(out map[string]json.RawMessage) {
 	permissions["defaultMode"] = json.RawMessage(`"bypassPermissions"`)
 	if raw, err := json.Marshal(permissions); err == nil {
 		out["permissions"] = raw
+	}
+
+	// Suppress Claude Code's interactive feedback/rating dialogs. These menus
+	// are not covered by bypassPermissions and freeze non-interactive agent
+	// sessions (deacon menu-freeze pattern). CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY
+	// is load-bearing and forced; the others default so a user override wins.
+	env := map[string]json.RawMessage{}
+	if raw, ok := out["env"]; ok {
+		_ = json.Unmarshal(raw, &env)
+	}
+	setRawDefault(env, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", []byte(`"1"`))
+	setRaw(env, "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY", []byte(`"1"`))
+	setRawDefault(env, "DO_NOT_TRACK", []byte(`"1"`))
+	if raw, err := json.Marshal(env); err == nil {
+		out["env"] = raw
 	}
 }
 
