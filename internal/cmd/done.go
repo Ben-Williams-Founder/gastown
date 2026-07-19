@@ -90,6 +90,15 @@ func shouldSyncIdlePolecatWorktree(exitType, mergeStrategy string, pushFailed, m
 	if exitType != ExitCompleted || pushFailed || mrFailed || !syncSafe {
 		return false
 	}
+	// wkb-9688: for "pr" MQ-strategy work, defer destructive worktree checkout
+	// + old-branch deletion until the refinery confirms merge. Deleting the branch
+	// at submit destroys the artifact needed to fix a CI failure — MERGE_FAILED
+	// nudges become dead letters (see RPT-polecat-ci-fail-death-mechanism 2026-07-19).
+	// The branch will be cleaned up when the MR is definitively resolved (merged →
+	// PostMerge closes the source; rejected non-CI → operator handles).
+	if mergeStrategy == "pr" {
+		return false
+	}
 	return mergeStrategy != "local"
 }
 
