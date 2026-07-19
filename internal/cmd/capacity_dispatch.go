@@ -115,8 +115,13 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 		schedulerCfg = capacity.DefaultSchedulerConfig()
 	}
 
-	// Nothing to dispatch when scheduler is in direct dispatch or disabled mode.
+	// DEC-OPS-cap-semantics: -1 means "no ceiling but still governor-gated" — treat
+	// as effectively unlimited so the dispatch cycle runs; the governor gate fires per
+	// spawn attempt. 0 = truly disabled (early-return).
 	maxPolecats := schedulerCfg.GetMaxPolecats()
+	if maxPolecats == -1 {
+		maxPolecats = 1 << 30 // effectively unlimited; governor.admit gates per-spawn
+	}
 	if maxPolecats <= 0 {
 		if !dryRun && !isDaemonDispatch() {
 			staleBeads, _ := getReadySlingContexts(townRoot)

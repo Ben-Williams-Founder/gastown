@@ -38,10 +38,14 @@ func shouldDeferDispatch() (bool, error) {
 	}
 
 	maxPol := schedulerCfg.GetMaxPolecats()
-	if maxPol > 0 {
+	// DEC-OPS-cap-semantics ratified 2026-07-15: decouple "no cap" from "no gate".
+	// -1 means "no scheduler-imposed ceiling" but the governor gate is STILL consulted
+	// on every spawn — route through the deferred path where governor.admit fires.
+	// 0 = truly disabled (bypass everything including gate); operator escape hatch.
+	if maxPol > 0 || maxPol == -1 {
 		return true, nil
 	}
-	return false, nil // -1 or 0 = direct dispatch
+	return false, nil // 0 = direct dispatch (gate bypassed by operator choice)
 }
 
 // ScheduleOptions holds options for scheduling a bead.

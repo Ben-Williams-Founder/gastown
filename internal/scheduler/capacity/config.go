@@ -67,9 +67,11 @@ func (c *SchedulerConfig) GetSpawnDelay() time.Duration {
 }
 
 // IsDeferred returns true when the scheduler is configured for deferred dispatch
-// (max_polecats > 0). Returns false for direct dispatch (-1) and disabled (0).
+// (max_polecats > 0, or -1 = unbounded-but-governed per DEC-OPS-cap-semantics
+// ratified 2026-07-15). Returns false only for 0 (truly disabled / operator bypass).
 func (c *SchedulerConfig) IsDeferred() bool {
-	return c.GetMaxPolecats() > 0
+	m := c.GetMaxPolecats()
+	return m > 0 || m == -1
 }
 
 // ParseDurationOrDefault parses a Go duration string, returning fallback on error or empty input.
