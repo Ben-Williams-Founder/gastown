@@ -3,6 +3,11 @@
   "hasCompletedOnboarding": true,
   "theme": "dark",
   "editorMode": "normal",
+  "env": {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+    "DO_NOT_TRACK": "1"
+  },
   "permissions": {
     "defaultMode": "bypassPermissions"
   },

@@ -2,6 +2,7 @@ package hooks
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -1329,5 +1330,35 @@ func TestMarshalConfig(t *testing.T) {
 
 	if len(loaded.SessionStart) != 1 {
 		t.Errorf("round-trip lost SessionStart hooks")
+	}
+}
+
+func TestHasClaudePromptDefaults_RequiresFeedbackSurveyEnv(t *testing.T) {
+	const base = `{
+		"skipDangerousModePermissionPrompt": true,
+		"hasCompletedOnboarding": true,
+		"theme": "dark",
+		"permissions": {"defaultMode": "bypassPermissions"}%s
+	}`
+	tests := []struct {
+		name    string
+		envJSON string
+		want    bool
+	}{
+		{"all defaults present", `, "env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"}`, true},
+		{"env missing entirely", ``, false},
+		{"env present but key missing", `, "env": {"DO_NOT_TRACK": "1"}`, false},
+		{"env key wrong value", `, "env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "0"}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s, err := UnmarshalSettings([]byte(fmt.Sprintf(base, tt.envJSON)))
+			if err != nil {
+				t.Fatalf("UnmarshalSettings: %v", err)
+			}
+			if got := HasClaudePromptDefaults(s); got != tt.want {
+				t.Fatalf("HasClaudePromptDefaults = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

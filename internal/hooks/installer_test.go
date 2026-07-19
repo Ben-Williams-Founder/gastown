@@ -95,6 +95,13 @@ func TestInstallForRole_ClaudeSettingsSuppressStartupPrompts(t *testing.T) {
 			if got := permissions["defaultMode"]; got != "bypassPermissions" {
 				t.Fatalf("permissions.defaultMode = %v, want bypassPermissions", got)
 			}
+			env, ok := settings["env"].(map[string]any)
+			if !ok {
+				t.Fatalf("env = %T, want object", settings["env"])
+			}
+			if got := env["CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"]; got != "1" {
+				t.Fatalf("env.CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY = %v, want \"1\"", got)
+			}
 		})
 	}
 }
