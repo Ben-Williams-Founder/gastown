@@ -14,6 +14,7 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/events"
+	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/mayor"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/session"
@@ -105,7 +106,7 @@ Role shortcuts (expand to session names):
 
 Channel syntax:
   channel:<name>  Nudges all members of a named channel defined in
-                  ~/gt/config/messaging.json under "nudge_channels".
+                  <town-root>/config/messaging.json under "nudge_channels".
                   Patterns like "gastown/polecats/*" are expanded.
 
 DND (Do Not Disturb):
@@ -244,7 +245,19 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 				Message:  message,
 				Priority: nudgePriorityFlag,
 			}})
-			return t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
+			deliverErr := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot})
+			if !errors.Is(deliverErr, tmux.ErrSubmitNotVerified) {
+				return deliverErr
+			}
+			fmt.Fprintf(os.Stderr, "wait-idle: %v; queueing for %s\n", deliverErr, sessionName)
+			if qErr := nudge.Enqueue(townRoot, sessionName, nudge.QueuedNudge{
+				Sender:   sender,
+				Message:  message,
+				Priority: nudgePriorityFlag,
+			}); qErr != nil {
+				return fmt.Errorf("queue fallback after unverified submit failed: %v (original: %w)", qErr, deliverErr)
+			}
+			return nil
 		}
 		// Terminal errors (session gone, no server) — propagate, don't queue.
 		// Queueing a nudge for a dead session means it will never be delivered.
@@ -338,11 +351,18 @@ func watchAndDeliver(t *tmux.Tmux, townRoot, sessionName string) {
 			formatted := nudge.FormatForInjection(drained)
 			if err := t.NudgeSessionWithOpts(sessionName, formatted, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
 				fmt.Fprintf(os.Stderr, "idle-watcher: delivery for %s failed: %v\n", sessionName, err)
+				requeueDrainedNudges(townRoot, sessionName, "idle-watcher", drained)
 			}
 			return
 		}
 	}
 	// Timeout — nudge stays in queue for next watcher or manual drain.
+}
+
+func requeueDrainedNudges(townRoot, sessionName, source string, drained []nudge.QueuedNudge) {
+	if err := nudge.Requeue(townRoot, sessionName, drained); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: requeue for %s failed: %v\n", source, sessionName, err)
+	}
 }
 
 // validNudgeModes is the set of allowed --mode values.
@@ -518,6 +538,32 @@ func runNudge(cmd *cobra.Command, args []string) (retErr error) {
 		}
 		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", constants.RoleDeacon, message))
 		return nil
+	}
+	if dogName, ok := mail.DogAddressName(target); ok {
+		sessionName := session.DogSessionName(dogName)
+		if nudgeModeFlag != NudgeModeImmediate && !hasACPSessionByName(townRoot, sessionName) {
+			exists, err := t.HasSession(sessionName)
+			if err != nil {
+				return fmt.Errorf("checking dog session: %w", err)
+			}
+			if !exists {
+				return fmt.Errorf("session %q not found (cannot queue nudge for nonexistent session)", sessionName)
+			}
+		}
+
+		if err := deliverNudge(t, sessionName, message, sender); err != nil {
+			return fmt.Errorf("nudging dog: %w", err)
+		}
+
+		fmt.Printf("%s Nudged %s (%s)\n", style.Bold.Render("✓"), target, nudgeModeFlag)
+		if townRoot, err := workspace.FindFromCwd(); err == nil && townRoot != "" {
+			_ = LogNudge(townRoot, target, message)
+		}
+		_ = events.LogFeed(events.TypeNudge, sender, events.NudgePayload("", target, message))
+		return nil
+	}
+	if strings.HasPrefix(target, constants.RoleMayor+"/") || strings.HasPrefix(target, constants.RoleDeacon+"/") {
+		return fmt.Errorf("invalid town target %q", target)
 	}
 
 	// Check if target is rig/polecat format or raw session name
@@ -849,6 +895,8 @@ func sessionNameToAddress(sessionName string) string {
 		return constants.RoleMayor
 	case session.RoleDeacon:
 		return constants.RoleDeacon
+	case session.RoleDog:
+		return mail.DogAddress(identity.Name)
 	case session.RoleWitness:
 		return fmt.Sprintf("%s/witness", identity.Rig)
 	case session.RoleRefinery:
@@ -871,12 +919,18 @@ func sessionNameToAddress(sessionName string) string {
 //
 // Returns empty string if the address cannot be converted.
 func addressToAgentBeadID(address string) string {
+	if dogName, ok := mail.DogAddressName(address); ok {
+		return session.DogSessionName(dogName)
+	}
 	// Handle special cases
 	switch address {
-	case constants.RoleMayor:
+	case constants.RoleMayor, constants.RoleMayor + "/":
 		return session.MayorSessionName()
-	case constants.RoleDeacon:
+	case constants.RoleDeacon, constants.RoleDeacon + "/":
 		return session.DeaconSessionName()
+	}
+	if strings.HasPrefix(address, constants.RoleMayor+"/") || strings.HasPrefix(address, constants.RoleDeacon+"/") {
+		return ""
 	}
 
 	// Parse rig/role format

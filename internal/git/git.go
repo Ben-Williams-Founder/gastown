@@ -975,9 +975,114 @@ func (g *Git) GetPushURL(remote string) (string, error) {
 	return strings.TrimSpace(out), nil
 }
 
+// ForkBackedRemote reports whether pushes to remote land somewhere other than
+// the canonical fetch base. This covers both split push URLs and fork remotes
+// with a distinct upstream remote.
+func (g *Git) ForkBackedRemote(remote string) bool {
+	fetchURL, fetchErr := g.RemoteURL(remote)
+	if fetchErr != nil {
+		return false
+	}
+	pushURL, pushErr := g.GetPushURL(remote)
+	if pushErr == nil && pushURL != "" && !sameGitRemoteURL(fetchURL, pushURL) {
+		return true
+	}
+	upstreamURL, upstreamErr := g.GetUpstreamURL()
+	return upstreamErr == nil && upstreamURL != "" && !sameGitRemoteURL(fetchURL, upstreamURL)
+}
+
+// CleanDefaultBranchBaseRef returns the ref that should be used as a clean base
+// for default-branch work. In split push-url setups origin still fetches from
+// upstream, so origin/<default> is clean. When origin itself is a fork and a
+// distinct upstream remote is present, upstream/<default> is the clean base.
+func (g *Git) CleanDefaultBranchBaseRef(remote, defaultBranch string) string {
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	fetchURL, fetchErr := g.RemoteURL(remote)
+	upstreamURL, upstreamErr := g.GetUpstreamURL()
+	if fetchErr == nil && upstreamErr == nil && upstreamURL != "" && !sameGitRemoteURL(fetchURL, upstreamURL) {
+		return "upstream/" + defaultBranch
+	}
+	return remote + "/" + defaultBranch
+}
+
+// CleanBaseRef returns a fully qualified base ref for a target branch. Explicit
+// origin/ or upstream/ refs are preserved; default-branch targets use the clean
+// fork-aware base.
+func (g *Git) CleanBaseRef(remote, defaultBranch, target string) string {
+	target = strings.TrimSpace(target)
+	if target == "" || target == defaultBranch {
+		return g.CleanDefaultBranchBaseRef(remote, defaultBranch)
+	}
+	if strings.HasPrefix(target, "origin/") || strings.HasPrefix(target, "upstream/") {
+		return target
+	}
+	return remote + "/" + target
+}
+
+// RemoteForRef returns the remote prefix from refs like origin/main or
+// upstream/main. It returns an empty string for local branch names.
+func RemoteForRef(ref string) string {
+	remote, _, ok := strings.Cut(strings.TrimSpace(ref), "/")
+	if !ok || (remote != "origin" && remote != "upstream") {
+		return ""
+	}
+	return remote
+}
+
+// RefuseForkBackedDefaultPush fails closed before default-branch pushes in a
+// fork/upstream topology. Feature branch pushes to the fork remain allowed.
+func (g *Git) RefuseForkBackedDefaultPush(remote, refspec, defaultBranch string) error {
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
+	destination := pushDestinationBranch(refspec)
+	if destination != defaultBranch || !g.ForkBackedRemote(remote) {
+		return nil
+	}
+	return fmt.Errorf("refusing direct push to %s/%s: fork/upstream rig detected; push a feature branch and use the Mayor-managed fork PR flow to upstream %s (no refs were pushed)", remote, destination, defaultBranch)
+}
+
+func pushDestinationBranch(refspec string) string {
+	refspec = strings.TrimSpace(refspec)
+	for strings.HasPrefix(refspec, "+") {
+		refspec = strings.TrimPrefix(refspec, "+")
+	}
+	if _, dst, ok := strings.Cut(refspec, ":"); ok {
+		refspec = dst
+	}
+	refspec = strings.TrimPrefix(refspec, "refs/heads/")
+	return strings.TrimSpace(refspec)
+}
+
+func sameGitRemoteURL(a, b string) bool {
+	return normalizeGitRemoteURL(a) == normalizeGitRemoteURL(b)
+}
+
+func normalizeGitRemoteURL(raw string) string {
+	s := strings.TrimSpace(raw)
+	s = strings.TrimSuffix(s, "/")
+	s = strings.TrimSuffix(s, ".git")
+	s = strings.TrimPrefix(s, "https://")
+	s = strings.TrimPrefix(s, "http://")
+	s = strings.TrimPrefix(s, "ssh://")
+	s = strings.TrimPrefix(s, "git://")
+	if strings.HasPrefix(s, "git@") {
+		s = strings.TrimPrefix(s, "git@")
+		s = strings.Replace(s, ":", "/", 1)
+	} else if at := strings.LastIndex(s, "@"); at >= 0 {
+		s = s[at+1:]
+	}
+	return strings.ToLower(strings.TrimSuffix(s, "/"))
+}
+
 // Push pushes to the remote branch with a timeout to prevent indefinite hangs
 // when the remote is unreachable.
 func (g *Git) Push(remote, branch string, force bool) error {
+	if err := g.RefuseForkBackedDefaultPush(remote, branch, g.RemoteDefaultBranch()); err != nil {
+		return err
+	}
 	args := []string{"push", remote, branch}
 	if force {
 		args = append(args, "--force")
@@ -990,6 +1095,9 @@ func (g *Git) Push(remote, branch string, force bool) error {
 // Used by gt mq integration land to set GT_INTEGRATION_LAND=1, which the
 // pre-push hook checks to allow integration branch content landing on main.
 func (g *Git) PushWithEnv(remote, branch string, force bool, env []string) error {
+	if err := g.RefuseForkBackedDefaultPush(remote, branch, g.RemoteDefaultBranch()); err != nil {
+		return err
+	}
 	args := []string{"push", remote, branch}
 	if force {
 		args = append(args, "--force")
@@ -1424,50 +1532,49 @@ func (g *Git) DeleteRemoteBranchIfAt(remote, branch, expectedHash string) error 
 }
 
 // HasOpenPR checks whether the given branch has an open pull request on GitHub.
-// Uses the gh CLI to query for open PRs with the branch as head ref.
-// Returns false on any error (fail-open: branch deletion proceeds if gh is unavailable).
+// Errors and ambiguous branch lookups protect the branch from deletion.
 func (g *Git) HasOpenPR(branch string) bool {
-	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
-	if err != nil {
-		return false // fail-open: can't determine PR state, allow deletion
-	}
-	out = bytes.TrimSpace(out)
-	// Empty array "[]" means no open PRs
-	return len(out) > 2
+	return g.HasOpenPullRequest(PullRequestRef{Branch: branch})
 }
 
 // FindPRNumber returns the GitHub PR number for the given branch, or 0 if none exists.
-// Uses the gh CLI to query for open PRs with the branch as head ref.
 func (g *Git) FindPRNumber(branch string) (int, error) {
-	cmd := exec.Command("gh", "pr", "list", "--head", branch, "--state", "open", "--json", "number", "--limit", "1")
-	cmd.Dir = g.workDir
-	out, err := cmd.Output()
+	return g.FindPRNumberForRef(PullRequestRef{Branch: branch})
+}
+
+// FindPRNumberForRef returns an open GitHub PR number using recorded PR identity
+// before falling back to an unambiguous target-repo branch lookup.
+func (g *Git) FindPRNumberForRef(ref PullRequestRef) (int, error) {
+	pr, err := g.LookupPullRequest(ref)
 	if err != nil {
-		return 0, fmt.Errorf("gh pr list failed: %w", err)
+		if errors.Is(err, ErrPullRequestNotFound) {
+			return 0, nil
+		}
+		return 0, err
 	}
-	out = bytes.TrimSpace(out)
-	if len(out) <= 2 {
-		return 0, nil // No open PR
-	}
-	var prs []struct {
-		Number int `json:"number"`
-	}
-	if err := json.Unmarshal(out, &prs); err != nil {
-		return 0, fmt.Errorf("failed to parse gh pr list output: %w", err)
-	}
-	if len(prs) == 0 {
+	if !pr.Open() {
 		return 0, nil
 	}
-	return prs[0].Number, nil
+	return pr.Number, nil
 }
 
 // IsPRApproved checks whether a GitHub PR has at least one approving review.
 // Returns true if approved, false if not (or on error).
 func (g *Git) IsPRApproved(prNumber int) (bool, error) {
+	return g.IsPullRequestApproved(&PullRequestInfo{Number: prNumber})
+}
+
+// IsPullRequestApproved checks whether a resolved GitHub PR has at least one approving review.
+func (g *Git) IsPullRequestApproved(pr *PullRequestInfo) (bool, error) {
+	if pr == nil || (pr.Number == 0 && pr.URL == "") {
+		return false, fmt.Errorf("pull request identity is missing")
+	}
 	// Use gh pr view which includes review decision
-	cmd := exec.Command("gh", "pr", "view", fmt.Sprintf("%d", prNumber), "--json", "reviewDecision")
+	args := []string{"pr", "view", pullRequestSelector(pr), "--json", "reviewDecision"}
+	if pr.BaseRepo != "" {
+		args = append(args, "--repo", pr.BaseRepo)
+	}
+	cmd := exec.Command("gh", args...)
 	cmd.Dir = g.workDir
 	out, err := cmd.Output()
 	if err != nil {
@@ -1487,7 +1594,18 @@ func (g *Git) IsPRApproved(prNumber int) (bool, error) {
 // The method parameter should be "merge", "squash", or "rebase".
 // Returns the merge commit SHA on success.
 func (g *Git) GhPrMerge(prNumber int, method string) (string, error) {
-	args := []string{"pr", "merge", fmt.Sprintf("%d", prNumber), "--" + method, "--delete-branch"}
+	return g.GhPrMergePullRequest(&PullRequestInfo{Number: prNumber}, method)
+}
+
+// GhPrMergePullRequest merges a resolved GitHub PR using its URL when available.
+func (g *Git) GhPrMergePullRequest(pr *PullRequestInfo, method string) (string, error) {
+	if pr == nil || (pr.Number == 0 && pr.URL == "") {
+		return "", fmt.Errorf("pull request identity is missing")
+	}
+	args := []string{"pr", "merge", pullRequestSelector(pr), "--" + method, "--delete-branch"}
+	if pr.BaseRepo != "" {
+		args = append(args, "--repo", pr.BaseRepo)
+	}
 	cmd := exec.Command("gh", args...)
 	cmd.Dir = g.workDir
 	out, err := cmd.CombinedOutput()
@@ -1506,6 +1624,16 @@ func (g *Git) GhPrMerge(prNumber int, method string) (string, error) {
 		return "", nil // Merge succeeded, just can't determine SHA
 	}
 	return sha, nil
+}
+
+func pullRequestSelector(pr *PullRequestInfo) string {
+	if pr != nil && pr.URL != "" {
+		return pr.URL
+	}
+	if pr != nil {
+		return fmt.Sprintf("%d", pr.Number)
+	}
+	return ""
 }
 
 // FindBitbucketPRNumber returns the Bitbucket PR ID for the given branch, or 0 if none exists.
@@ -1692,13 +1820,7 @@ func (g *Git) ListPushRemoteRefs(remote, prefix string) ([]string, error) {
 
 // ListPushRemoteRefsWithHashes is ListPushRemoteRefs with commit hashes.
 func (g *Git) ListPushRemoteRefsWithHashes(remote, prefix string) ([]RemoteRef, error) {
-	fetchURL, fetchErr := g.RemoteURL(remote)
-	pushURL, pushErr := g.GetPushURL(remote)
-	if fetchErr != nil || pushErr != nil || pushURL == fetchURL {
-		return g.ListRemoteRefsWithHashes(remote, prefix)
-	}
-	// Query the push URL directly
-	return g.ListRemoteRefsWithHashes(pushURL, prefix)
+	return g.ListRemoteRefsWithHashes(g.pushTarget(remote), prefix)
 }
 
 // Rebase rebases the current branch onto the given ref.
@@ -1902,12 +2024,11 @@ func (g *Git) RemoteBranchTip(remote, branch string) (string, error) {
 // URL directly so verification matches where the branch was actually pushed.
 // Falls back to RemoteBranchExists when no custom push URL is configured.
 func (g *Git) PushRemoteBranchExists(remote, branch string) (bool, error) {
-	fetchURL, fetchErr := g.RemoteURL(remote)
-	pushURL, pushErr := g.GetPushURL(remote)
-	if fetchErr != nil || pushErr != nil || pushURL == fetchURL {
+	pushTarget := g.pushTarget(remote)
+	if pushTarget == remote {
 		return g.RemoteBranchExists(remote, branch)
 	}
-	out, err := g.run("ls-remote", "--heads", pushURL, branch)
+	out, err := g.run("ls-remote", "--heads", pushTarget, branch)
 	if err != nil {
 		return false, err
 	}
@@ -1919,12 +2040,20 @@ func (g *Git) PushRemoteBranchExists(remote, branch string) (bool, error) {
 // the fetch URL, verification must query the push URL because that is where the
 // preceding git push wrote.
 func (g *Git) PushRemoteBranchTip(remote, branch string) (string, error) {
+	pushTarget := g.pushTarget(remote)
+	if pushTarget == remote {
+		return g.RemoteBranchTip(remote, branch)
+	}
+	return g.RemoteBranchTip(pushTarget, branch)
+}
+
+func (g *Git) pushTarget(remote string) string {
 	fetchURL, fetchErr := g.RemoteURL(remote)
 	pushURL, pushErr := g.GetPushURL(remote)
 	if fetchErr != nil || pushErr != nil || pushURL == fetchURL {
-		return g.RemoteBranchTip(remote, branch)
+		return remote
 	}
-	return g.RemoteBranchTip(pushURL, branch)
+	return pushURL
 }
 
 // VerifyPushedCommit verifies that the push target branch tip is exactly commit.
@@ -1944,6 +2073,39 @@ func (g *Git) VerifyPushedCommit(remote, branch, commit string) error {
 		return fmt.Errorf("verified_push_failed: branch %s/%s missing after push (expected %s)", remote, branch, shortSHA(commit))
 	}
 	if tip != commit {
+		return fmt.Errorf("verified_push_failed: commit %s not on %s/%s (remote tip %s)", shortSHA(commit), remote, branch, shortSHA(tip))
+	}
+	return nil
+}
+
+// VerifyPushedCommitReachableFromPushTarget verifies that commit is reachable
+// from the push target branch. Use this only for shared target branches where a
+// later fast-forward push by another actor may legitimately advance the tip.
+func (g *Git) VerifyPushedCommitReachableFromPushTarget(remote, branch, commit string) error {
+	commit = strings.TrimSpace(commit)
+	if commit == "" {
+		return fmt.Errorf("verified_push_failed: empty commit for %s/%s", remote, branch)
+	}
+	tip, err := g.PushRemoteBranchTip(remote, branch)
+	if err != nil {
+		return fmt.Errorf("verified_push_failed: unable to read %s/%s: %w", remote, branch, err)
+	}
+	if tip == "" {
+		return fmt.Errorf("verified_push_failed: branch %s/%s missing after push (expected %s)", remote, branch, shortSHA(commit))
+	}
+	if tip == commit {
+		return nil
+	}
+
+	fetchTarget := g.pushTarget(remote)
+	if _, err := g.run("fetch", "--no-tags", fetchTarget, "refs/heads/"+branch); err != nil {
+		return fmt.Errorf("verified_push_failed: unable to fetch %s/%s for ancestry check: %w", remote, branch, err)
+	}
+	reachable, err := g.IsAncestor(commit, "FETCH_HEAD")
+	if err != nil {
+		return fmt.Errorf("verified_push_failed: unable to verify commit %s on %s/%s: %w", shortSHA(commit), remote, branch, err)
+	}
+	if !reachable {
 		return fmt.Errorf("verified_push_failed: commit %s not on %s/%s (remote tip %s)", shortSHA(commit), remote, branch, shortSHA(tip))
 	}
 	return nil
@@ -2643,7 +2805,9 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 			lastErr = err
 			continue
 		}
-		candidate.Evidence = "comparison_ref"
+		if candidate.Evidence == "" {
+			candidate.Evidence = "comparison_ref"
+		}
 		if candidate.Preserved {
 			return candidate, nil
 		}
@@ -2692,23 +2856,84 @@ func comparisonRefCandidates(ref, remote string) []string {
 	if strings.HasPrefix(ref, "refs/") || strings.HasPrefix(ref, remote+"/") {
 		return []string{ref}
 	}
-	branch := strings.TrimPrefix(ref, "origin/")
-	return []string{ref, remote + "/" + branch}
+	if strings.HasPrefix(ref, "upstream/") {
+		return []string{ref}
+	}
+	if !strings.Contains(ref, "/") && remote != "upstream" {
+		return []string{"upstream/" + ref, remote + "/" + ref, ref}
+	}
+	return []string{remote + "/" + ref, ref}
 }
 
 func (g *Git) preservationAgainstRef(ref string) (BranchPreservationStatus, error) {
+	return g.preservationOfRefAgainstRef("HEAD", ref)
+}
+
+func (g *Git) preservationOfRefAgainstRef(head, ref string) (BranchPreservationStatus, error) {
 	status := BranchPreservationStatus{ComparisonBase: ref}
-	if contains, err := g.refContainsHead(ref); err == nil && contains {
+	if contains, err := g.IsAncestor(head, ref); err == nil && contains {
 		status.Preserved = true
+		status.Evidence = "ancestor"
 		return status, nil
 	}
-	out, err := g.Cherry(ref, "HEAD")
+	if preserved, err := g.mergeTreeNoopBetweenRefs(head, ref); err == nil && preserved {
+		status.Preserved = true
+		status.Evidence = "merge_tree_noop"
+		return status, nil
+	}
+	out, err := g.Cherry(ref, head)
 	if err != nil {
 		return status, err
 	}
 	status.UnpreservedPatchCount = CountCherryUnmergedCommits(out)
 	status.Preserved = status.UnpreservedPatchCount == 0
+	if status.Preserved {
+		status.Evidence = "cherry"
+	}
 	return status, nil
+}
+
+func (g *Git) mergeTreeNoopAgainstRef(ref string) (bool, error) {
+	return g.mergeTreeNoopBetweenRefs("HEAD", ref)
+}
+
+func (g *Git) mergeTreeNoopBetweenRefs(head, ref string) (bool, error) {
+	refTree, err := g.run("rev-parse", ref+"^{tree}")
+	if err != nil {
+		return false, err
+	}
+	mergedTree, err := g.run("merge-tree", "--write-tree", ref, head)
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(mergedTree) == strings.TrimSpace(refTree), nil
+}
+
+// PushRemoteRefTargetStatus checks whether a push-remote ref is preserved on
+// target. It fetches the exact candidate ref first so remote-only tips and split
+// fetch/push remotes are classified against the listed hash, not stale tracking
+// refs.
+func (g *Git) PushRemoteRefTargetStatus(remote string, ref RemoteRef, target string) (BranchPreservationStatus, error) {
+	var status BranchPreservationStatus
+	refName := strings.TrimSpace(ref.Name)
+	expectedHash := strings.TrimSpace(ref.Hash)
+	if refName == "" || expectedHash == "" {
+		return status, fmt.Errorf("remote ref is missing name or hash")
+	}
+
+	if _, err := g.run("fetch", "--no-tags", g.pushTarget(remote), refName); err != nil {
+		return status, fmt.Errorf("fetching candidate %s: %w", refName, err)
+	}
+	fetchedHash, err := g.Rev("FETCH_HEAD")
+	if err != nil {
+		return status, fmt.Errorf("resolving fetched candidate %s: %w", refName, err)
+	}
+	fetchedHash = strings.TrimSpace(fetchedHash)
+	if fetchedHash != expectedHash {
+		return status, fmt.Errorf("candidate %s changed while pruning: expected %s, fetched %s", refName, shortSHA(expectedHash), shortSHA(fetchedHash))
+	}
+
+	return g.preservationOfRefAgainstRef("FETCH_HEAD", target)
 }
 
 // CountCherryUnmergedCommits counts `git cherry` lines whose patches are not
@@ -2819,21 +3044,29 @@ func isGasTownRuntimePath(path string) bool {
 	return ok
 }
 
-// RuntimeArtifactPaths returns deduplicated pathspecs for runtime artifacts in the
-// current uncommitted work. Callers can pass the result to git reset after git add
+// RuntimeArtifactPathspecs returns deduplicated git pathspecs for runtime
+// artifacts in paths. Callers can pass the result to git reset after git add
 // to keep generated state out of safety-net commits.
-func (s *UncommittedWorkStatus) RuntimeArtifactPaths() []string {
+func RuntimeArtifactPathspecs(paths []string) []string {
 	seen := make(map[string]bool)
-	var paths []string
-	for _, f := range append(append([]string{}, s.ModifiedFiles...), s.UntrackedFiles...) {
+	var pathspecs []string
+	for _, f := range paths {
 		root, ok := runtimeArtifactRoot(f)
 		if !ok || seen[root] {
 			continue
 		}
 		seen[root] = true
-		paths = append(paths, root)
+		pathspecs = append(pathspecs, root)
 	}
-	return paths
+	return pathspecs
+}
+
+// RuntimeArtifactPaths returns deduplicated pathspecs for runtime artifacts in the
+// current uncommitted work. Callers can pass the result to git reset after git add
+// to keep generated state out of safety-net commits.
+func (s *UncommittedWorkStatus) RuntimeArtifactPaths() []string {
+	paths := append(append([]string{}, s.ModifiedFiles...), s.UntrackedFiles...)
+	return RuntimeArtifactPathspecs(paths)
 }
 
 // NonRuntimePaths returns uncommitted paths that are not covered by the runtime

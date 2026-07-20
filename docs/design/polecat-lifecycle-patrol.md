@@ -448,7 +448,7 @@ safety net.
 
 ```
 AGENT-DRIVEN (preferred)              MECHANICAL (safety net)
-├── gt done (polecat goes idle)       ├── Daemon detects dead session
+├── gt done (polecat retires session) ├── Daemon detects dead session
 ├── gt handoff (polecat self-cycles)  ├── Daemon detects GUPP violation
 ├── gt escalate (polecat asks help)   ├── Witness zombie sweep
 └── HELP mail (polecat signals)       └── Deacon restart on stale heartbeat
@@ -583,7 +583,7 @@ The molecule stays in its current state (recoverable when the bug is fixed).
 Should not happen because the hook is exclusive (one `hook_bead` per agent bead,
 one agent bead per polecat name). But if it does:
 
-**Prevention:** Git branch naming includes a unique suffix (`@<timestamp>`).
+**Prevention:** Git branch naming includes a unique suffix (`+<timestamp>`).
 The TOCTOU guard in `DetectZombiePolecats()` (records `detectedAt`, re-verifies
 before destructive action) prevents racing between detection and action.
 
@@ -632,8 +632,8 @@ All core lifecycle operations are implemented and running in production:
 | Work execution | `gt prime --hook` | Session discovers hook via `bd mol current`, GUPP fires |
 | Session cycling | `gt handoff` | `handoff.go` — all roles, preserves sandbox and identity |
 | Step completion | `bd close` + `gt handoff` | Step cleanup: session dies, sandbox lives |
-| Work submission | `gt done` | `done.go` — push, MR, sandbox sync, set idle |
-| Idle polecat reuse | `gt sling` | `polecat/manager.go`: `FindIdlePolecat()` + `ReuseIdlePolecat()` — branch-only repair |
+| Work submission | `gt done` | `done.go` — push, MR/PR handoff, set done, retire session |
+| Polecat allocation | `gt sling` | `polecat/manager.go` + `polecat_spawn.go` — capacity allocation and branch setup |
 | Zombie detection | Witness patrol | `witness/handlers.go`: `DetectZombiePolecats()` — restart-first, no auto-nuke |
 | Stale detection | Witness patrol | `polecat/manager.go`: `DetectStalePolecats()` — tmux-based, protects paused states |
 | Orphan recovery | Witness patrol | `witness/handlers.go`: `DetectOrphanedBeads()` — reset and re-dispatch |

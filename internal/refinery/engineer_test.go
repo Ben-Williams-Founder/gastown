@@ -9,12 +9,14 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/rig"
+	"github.com/steveyegge/gastown/internal/testutil"
 )
 
 func TestDefaultMergeQueueConfig(t *testing.T) {
@@ -67,7 +69,57 @@ func TestIsConflictTaskForMR(t *testing.T) {
 	}
 }
 
-func TestEngineerClearAgentActiveMRUsesTownBeadsDir(t *testing.T) {
+func TestEngineerFirstOpenBlockerUsesDependencySemantics(t *testing.T) {
+	e := &Engineer{}
+	tests := []struct {
+		name  string
+		issue *beads.Issue
+		want  string
+	}{
+		{
+			name:  "open blocking dependency blocks",
+			issue: &beads.Issue{Dependencies: []beads.IssueDep{{ID: "gt-blocker", Status: "open", DependencyType: "blocks"}}},
+			want:  "gt-blocker",
+		},
+		{
+			name:  "external blocker ID is normalized",
+			issue: &beads.Issue{Dependencies: []beads.IssueDep{{ID: "external:gt:gt-blocker", Status: "open", DependencyType: "waits-for"}}},
+			want:  "gt-blocker",
+		},
+		{
+			name:  "closed blocking dependency is resolved",
+			issue: &beads.Issue{Dependencies: []beads.IssueDep{{ID: "gt-closed", Status: "closed", DependencyType: "blocks"}}},
+		},
+		{
+			name:  "tombstone blocking dependency is resolved",
+			issue: &beads.Issue{Dependencies: []beads.IssueDep{{ID: "gt-tombstone", Status: "tombstone", DependencyType: "blocks"}}},
+		},
+		{
+			name:  "closed merge-block without merge reason still blocks",
+			issue: &beads.Issue{Dependencies: []beads.IssueDep{{ID: "gt-closed-only", Status: "closed", DependencyType: "merge-blocks"}}},
+			want:  "gt-closed-only",
+		},
+		{
+			name:  "merged merge-block is resolved",
+			issue: &beads.Issue{Dependencies: []beads.IssueDep{{ID: "gt-merged", Status: "closed", DependencyType: "merge-blocks", CloseReason: "Merged in gt-wisp"}}},
+		},
+		{
+			name:  "raw blocked_by fallback uses shared normalization",
+			issue: &beads.Issue{BlockedBy: []string{"external:gt:gt-raw-blocker"}},
+			want:  "gt-raw-blocker",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := e.firstOpenBlocker(tt.issue); got != tt.want {
+				t.Fatalf("firstOpenBlocker() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEngineerTerminalCloseClearsAgentActiveMRUsesTownBeadsDir(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses Unix shell script mock for bd")
 	}
@@ -102,7 +154,6 @@ func TestEngineerClearAgentActiveMRUsesTownBeadsDir(t *testing.T) {
 	logPath := filepath.Join(binDir, "bd.log")
 	script := fmt.Sprintf(`#!/bin/sh
 LOG=%q
-EXPECTED=%q
 printf 'env=%%s args=%%s\n' "${BEADS_DIR:-<unset>}" "$*" >> "$LOG"
 cmd=""
 for arg in "$@"; do
@@ -111,23 +162,26 @@ for arg in "$@"; do
     *) cmd="$arg"; break ;;
   esac
 done
-if [ "$cmd" != "version" ] && [ "${BEADS_DIR:-}" != "$EXPECTED" ]; then
-  echo "wrong BEADS_DIR ${BEADS_DIR:-<unset>}" >&2
-  exit 9
-fi
 case "$cmd" in
-  version|update)
-    exit 0
-    ;;
-  show)
-    printf '%%s\n' '[{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","issue_type":"task","labels":["gt:agent"],"status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: idle\nactive_mr: gt-mr"}]'
-    exit 0
-    ;;
-  *)
+	version|update|close)
+		exit 0
+		;;
+	show)
+		case "$*" in
+			*gt-wisp-mr*)
+				printf '%%s\n' '[{"id":"gt-wisp-mr","title":"MR","issue_type":"task","labels":["gt:merge-request"],"status":"open","description":"branch: polecat/rust/gt-test\nsource_issue: gt-test\nagent_bead: gt-gastown-polecat-rust"}]'
+				;;
+			*)
+				printf '%%s\n' '[{"id":"gt-gastown-polecat-rust","title":"gt-gastown-polecat-rust","issue_type":"task","labels":["gt:agent"],"status":"open","description":"role_type: polecat\nrig: gastown\nagent_state: idle\nactive_mr: gt-wisp-mr"}]'
+				;;
+		esac
+		exit 0
+		;;
+	*)
     exit 0
     ;;
 esac
-`, logPath, townBeadsDir)
+`, logPath)
 	if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0755); err != nil {
 		t.Fatalf("write mock bd: %v", err)
 	}
@@ -138,8 +192,8 @@ esac
 		beads:  beads.NewWithBeadsDir(mayorRig, rigBeadsDir),
 		output: io.Discard,
 	}
-	if err := e.clearAgentActiveMR("gt-gastown-polecat-rust"); err != nil {
-		t.Fatalf("clearAgentActiveMR: %v", err)
+	if err := e.closeMRWithReason(&MRInfo{ID: "gt-wisp-mr", AgentBead: "gt-gastown-polecat-rust"}, "rejected: test"); err != nil {
+		t.Fatalf("closeMRWithReason: %v", err)
 	}
 
 	logBytes, err := os.ReadFile(logPath)
@@ -147,12 +201,135 @@ esac
 		t.Fatalf("read mock log: %v", err)
 	}
 	logOutput := string(logBytes)
-	if strings.Contains(logOutput, "env="+rigBeadsDir) {
-		t.Fatalf("refinery active_mr cleanup used rig BEADS_DIR; log:\n%s", logOutput)
+	for _, line := range strings.Split(strings.TrimSpace(logOutput), "\n") {
+		if strings.Contains(line, "gt-gastown-polecat-rust") && strings.Contains(line, "env="+rigBeadsDir) {
+			t.Fatalf("refinery active_mr cleanup used rig BEADS_DIR; log:\n%s", logOutput)
+		}
 	}
-	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=") || !strings.Contains(logOutput, "args=show") || !strings.Contains(logOutput, "args=update") {
+	if !strings.Contains(logOutput, "env="+townBeadsDir+" args=show gt-gastown-polecat-rust") || !strings.Contains(logOutput, "env="+townBeadsDir+" args=update gt-gastown-polecat-rust") {
 		t.Fatalf("refinery active_mr cleanup did not use town BEADS_DIR; log:\n%s", logOutput)
 	}
+}
+
+func TestEngineerCloseMRWithReasonRecordsMergeCommitAndClearsActiveMR(t *testing.T) {
+	e, b, mrIssue, agentIssue, _ := setupEngineerTerminalCloseTest(t, "gt-wisp-old")
+
+	if err := e.closeMRWithReason(&MRInfo{ID: mrIssue.ID, AgentBead: agentIssue.ID}, string(CloseReasonMerged), "abc123"); err != nil {
+		t.Fatalf("closeMRWithReason: %v", err)
+	}
+
+	assertIssueStatus(t, b, mrIssue.ID, string(beads.StatusClosed))
+	assertAgentActiveMR(t, b, agentIssue.ID, "")
+	assertMRCloseReason(t, b, mrIssue.ID, string(CloseReasonMerged))
+	issue, err := b.Show(mrIssue.ID)
+	if err != nil {
+		t.Fatalf("show MR %s: %v", mrIssue.ID, err)
+	}
+	fields := beads.ParseMRFields(issue)
+	if fields.MergeCommit != "abc123" {
+		t.Fatalf("MR merge_commit = %q, want abc123", fields.MergeCommit)
+	}
+}
+
+func TestEngineerCloseMRWithReasonRejectsAndClearsMatchingActiveMR(t *testing.T) {
+	e, b, mrIssue, agentIssue, srcIssue := setupEngineerTerminalCloseTest(t, "gt-wisp-old")
+
+	if err := e.closeMRWithReason(&MRInfo{ID: mrIssue.ID, AgentBead: agentIssue.ID}, "rejected: policy failed"); err != nil {
+		t.Fatalf("closeMRWithReason: %v", err)
+	}
+
+	assertIssueStatus(t, b, mrIssue.ID, string(beads.StatusClosed))
+	assertIssueStatus(t, b, srcIssue.ID, string(beads.StatusOpen))
+	assertAgentActiveMR(t, b, agentIssue.ID, "")
+	assertMRCloseReason(t, b, mrIssue.ID, string(CloseReasonRejected))
+}
+
+func TestEngineerCloseMRWithReasonAlreadyTerminalRetriesActiveMRCleanup(t *testing.T) {
+	e, b, mrIssue, agentIssue, _ := setupEngineerTerminalCloseTest(t, "gt-wisp-old")
+	issue, err := b.Show(mrIssue.ID)
+	if err != nil {
+		t.Fatalf("show MR %s: %v", mrIssue.ID, err)
+	}
+	fields := beads.ParseMRFields(issue)
+	fields.CloseReason = string(CloseReasonRejected)
+	desc := beads.SetMRFields(issue, fields)
+	if err := b.Update(mrIssue.ID, beads.UpdateOptions{Description: &desc}); err != nil {
+		t.Fatalf("record close_reason: %v", err)
+	}
+	if err := b.CloseWithReason("rejected: policy failed", mrIssue.ID); err != nil {
+		t.Fatalf("close MR issue: %v", err)
+	}
+
+	if err := e.closeMRWithReason(&MRInfo{ID: mrIssue.ID, AgentBead: agentIssue.ID}, "rejected: policy failed"); err != nil {
+		t.Fatalf("closeMRWithReason retry: %v", err)
+	}
+
+	assertAgentActiveMR(t, b, agentIssue.ID, "")
+}
+
+func TestEngineerCloseMRWithReasonDoesNotClearNewerActiveMR(t *testing.T) {
+	e, b, mrIssue, agentIssue, _ := setupEngineerTerminalCloseTest(t, "gt-wisp-newer")
+
+	if err := e.closeMRWithReason(&MRInfo{ID: mrIssue.ID, AgentBead: agentIssue.ID}, "rejected: policy failed"); err != nil {
+		t.Fatalf("closeMRWithReason: %v", err)
+	}
+
+	assertAgentActiveMR(t, b, agentIssue.ID, "gt-wisp-newer")
+}
+
+func TestEngineerCloseMRWithReasonNormalizesSuperseded(t *testing.T) {
+	e, b, mrIssue, agentIssue, _ := setupEngineerTerminalCloseTest(t, "gt-wisp-old")
+
+	if err := e.closeMRWithReason(&MRInfo{ID: mrIssue.ID, AgentBead: agentIssue.ID}, "superseded by gt-wisp-new"); err != nil {
+		t.Fatalf("closeMRWithReason: %v", err)
+	}
+
+	assertAgentActiveMR(t, b, agentIssue.ID, "")
+	assertMRCloseReason(t, b, mrIssue.ID, string(CloseReasonSuperseded))
+}
+
+func setupEngineerTerminalCloseTest(t *testing.T, activeMR string) (*Engineer, *beads.Beads, *beads.Issue, *beads.Issue, *beads.Issue) {
+	t.Helper()
+	testutil.RequireDoltContainer(t)
+	port, _ := strconv.Atoi(testutil.DoltContainerPort())
+	rigPath := t.TempDir()
+	b := beads.NewIsolatedWithPort(rigPath, port)
+	if err := b.Init("gt"); err != nil {
+		t.Skipf("bd init unavailable: %v", err)
+	}
+
+	srcIssue, err := b.Create(beads.CreateOptions{Title: "Implement feature X", Labels: []string{"gt:task"}})
+	if err != nil {
+		t.Fatalf("create source issue: %v", err)
+	}
+	agentIssue, err := b.Create(beads.CreateOptions{
+		Title:       "Polecat nux",
+		Labels:      []string{"gt:agent"},
+		Description: "role_type: polecat\nrig: testrig\nagent_state: working\nactive_mr: " + activeMR,
+	})
+	if err != nil {
+		t.Fatalf("create agent issue: %v", err)
+	}
+	mrIssue, err := b.Create(beads.CreateOptions{
+		Title:       "MR for feature X",
+		Labels:      []string{"gt:merge-request"},
+		Description: "branch: polecat/test/gt-xyz\nsource_issue: " + srcIssue.ID + "\nworker: test\ntarget: main\nagent_bead: " + agentIssue.ID,
+	})
+	if err != nil {
+		t.Fatalf("create MR issue: %v", err)
+	}
+	if activeMR == "gt-wisp-old" {
+		if err := b.UpdateAgentActiveMR(agentIssue.ID, mrIssue.ID); err != nil {
+			t.Fatalf("set active_mr: %v", err)
+		}
+	}
+
+	e := &Engineer{
+		rig:    &rig.Rig{Name: "testrig", Path: rigPath},
+		beads:  b,
+		output: io.Discard,
+	}
+	return e, b, mrIssue, agentIssue, srcIssue
 }
 
 func TestEngineer_LoadConfig_NoFile(t *testing.T) {
@@ -1209,6 +1386,13 @@ exit 0
 	}
 	if got := strings.Count(string(data), "mail send"); got != 1 {
 		t.Fatalf("mail sends = %d, want 1; log:\n%s", got, string(data))
+	}
+	log := string(data)
+	if !strings.Contains(log, "--from convoy/hq-cv-ref") {
+		t.Fatalf("mail send missing convoy sender; log:\n%s", log)
+	}
+	if !strings.Contains(log, "--no-notify") {
+		t.Fatalf("mail send missing --no-notify; log:\n%s", log)
 	}
 	if _, err := os.Stat(statePath); err != nil {
 		t.Fatalf("completion notification state was not recorded: %v", err)

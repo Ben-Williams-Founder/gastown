@@ -399,6 +399,7 @@ type PolecatListItem struct {
 	MQStatus             string        `json:"mq_status,omitempty"`
 	CountsTowardCapacity bool          `json:"counts_toward_capacity"`
 	ReuseStatus          string        `json:"reuse_status,omitempty"`
+	Blockers             []string      `json:"blockers,omitempty"`
 	SessionRunning       bool          `json:"session_running"`
 	Zombie               bool          `json:"zombie,omitempty"`
 	SessionName          string        `json:"session_name,omitempty"`
@@ -412,7 +413,7 @@ func effectivePolecatState(item PolecatListItem) polecat.State {
 	state := item.State
 	// A running session only implies working when there is active work attached.
 	// Without an issue, rewriting idle/done to working recreates "Issue: (none)".
-	if item.SessionRunning && item.Issue != "" && (state == polecat.StateDone || state == polecat.StateIdle) {
+	if item.SessionRunning && item.Issue != "" && item.CountsTowardCapacity && (state == polecat.StateDone || state == polecat.StateIdle) {
 		return polecat.StateWorking
 	}
 	// When session is dead but beads still says "working", mark as stalled
@@ -482,45 +483,56 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 
 	// Collect polecats from all rigs
 	t := tmux.NewTmux()
+	sessionNames, err := t.ListSessions()
+	if err != nil {
+		return fmt.Errorf("listing tmux sessions: %w", err)
+	}
+	sessions := newPolecatSessionSet(sessionNames)
 	allPolecats := make([]PolecatListItem, 0)
 
 	for _, r := range rigs {
-		polecatGit := git.NewGit(r.Path)
-		mgr := polecat.NewManager(r, polecatGit, t)
-		polecatMgr := polecat.NewSessionManager(t, r)
 		bd := beads.New(r.Path)
 
-		polecats, err := mgr.List()
+		polecatNames, err := listPolecatDirectoryNames(r.Path)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to list polecats in %s: %v\n", r.Name, err)
 			continue
 		}
+		agents, agentErr := bd.ListAgentBeads()
+		if agentErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to list agent beads in %s: %v\n", r.Name, agentErr)
+			agents = nil
+		}
+		activeWork, activeWorkErr := listActivePolecatWorkByName(bd, r.Name)
+		if activeWorkErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to list active polecat work in %s: %v\n", r.Name, activeWorkErr)
+			activeWork = nil
+		}
 
 		// Track known polecat names from filesystem for zombie detection
 		knownNames := make(map[string]bool)
-		for _, p := range polecats {
-			running, _ := polecatMgr.IsRunning(p.Name)
-			cleanupStatus := ""
-			activeMR := ""
-			agentBeadID := polecatBeadIDForRig(r, r.Name, p.Name)
-			if _, fields, err := bd.GetAgentBead(agentBeadID); err == nil && fields != nil {
-				cleanupStatus = fields.CleanupStatus
-				activeMR = fields.ActiveMR
+		for _, name := range polecatNames {
+			agentBeadID := polecatBeadIDForRig(r, r.Name, name)
+			fields := parsePolecatAgentFields(agents[agentBeadID])
+			item := buildPolecatInventoryItem(r.Name, name, fields, activeWork[name], sessions)
+			if activeWorkErr != nil {
+				item = buildPolecatInventoryItemFromEvidence(r.Name, name, fields, polecatActiveWorkLookupError(activeWorkErr), sessions)
 			}
+			disposition := item.Disposition
 			state := effectivePolecatState(PolecatListItem{
-				State:          p.State,
-				Issue:          p.Issue,
-				SessionRunning: running,
+				State:                item.State,
+				Issue:                item.Issue,
+				SessionRunning:       item.SessionRunning,
+				CountsTowardCapacity: disposition.CountsTowardCapacity,
 			})
-			disposition := mgr.WorkstateDispositionForPolecat(p.Name, state, p.Issue)
 			allPolecats = append(allPolecats, PolecatListItem{
 				Rig:                  r.Name,
-				Name:                 p.Name,
+				Name:                 name,
 				State:                state,
-				Issue:                p.Issue,
-				CleanupStatus:        cleanupStatus,
-				ActiveMR:             activeMR,
-				Branch:               p.Branch,
+				Issue:                item.Issue,
+				CleanupStatus:        item.CleanupStatus,
+				ActiveMR:             item.ActiveMR,
+				Branch:               item.Branch,
 				Verdict:              disposition.Verdict,
 				Reason:               disposition.Reason,
 				Reusable:             disposition.Reusable,
@@ -530,15 +542,17 @@ func runPolecatList(cmd *cobra.Command, args []string) error {
 				MQStatus:             disposition.MQStatus,
 				CountsTowardCapacity: disposition.CountsTowardCapacity,
 				ReuseStatus:          disposition.ReuseStatus,
-				SessionRunning:       running,
+				Blockers:             disposition.Blockers,
+				SessionRunning:       item.SessionRunning,
+				SessionName:          item.SessionName,
 			})
-			knownNames[p.Name] = true
+			knownNames[name] = true
 		}
 
 		// Discover zombie tmux sessions: sessions without matching worktree directories.
 		// These occur when a worktree is deleted but the tmux session persists
 		// (incomplete nuke or session naming mismatch).
-		zombieSessions, _ := findRigPolecatSessions(r.Name)
+		zombieSessions := sessions.namesForRig(r.Name)
 		for _, sessionName := range zombieSessions {
 			_, polecatName, ok := parsePolecatSessionName(sessionName)
 			if !ok {
@@ -1048,7 +1062,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 	beadTerminal := isAssignedBeadTerminal(bd, status.Issue)
 	workTerminal := beadTerminal
-	targetRefs := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
+	targetRefs, targetRefLookupFailed := recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
 	input := polecat.WorkstateInput{State: p.State, CleanupStatus: polecat.CleanupUnknown, Branch: p.Branch}
 	var gitState *GitState
 	var gitErr error
@@ -1085,12 +1099,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		// Use cleanup_status from agent bead, then overlay direct git and MQ facts.
 		input.CleanupStatus = polecat.CleanupStatus(fields.CleanupStatus)
 		status.ActiveMR = fields.ActiveMR
-		targetRefs = recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch)
 		input.ActiveMR = fields.ActiveMR
 		hookBead := agentHookBead(agentIssue, fields)
 		hookSafe, hookTerminal, hookBlocker := hookBeadSafeForCleanup(bd, hookBead)
 		workTerminal = beadTerminal || hookTerminal
 		sourceHint := agentSourceIssueHint(status.Issue, fields)
+		targetRefs, targetRefLookupFailed = recoveryTargetRefs(bd, status.Issue, status.ActiveMR, status.Branch, sourceHint)
 		if status.Issue == "" && sourceHint != "" {
 			status.Issue = sourceHint
 		}
@@ -1146,7 +1160,7 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 	}
 
 	status.CleanupStatus = input.CleanupStatus
-	applyMQFactsToWorkstateInput(&input, &status, bd, workTerminal, p.ClonePath, targetRefs, gitState, gitErr)
+	applyMQFactsToWorkstateInput(&input, &status, bd, workTerminal, p.ClonePath, targetRefs, targetRefLookupFailed, gitState, gitErr)
 	disposition := polecat.DecideWorkstate(input)
 	applyWorkstateDispositionToRecoveryStatus(&status, disposition)
 
@@ -1241,7 +1255,7 @@ func applyGitStateToWorkstateInput(input *polecat.WorkstateInput, worktreePath s
 	}
 }
 
-func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *RecoveryStatus, bd *beads.Beads, beadTerminal bool, worktreePath string, targetRefs []string, gitState *GitState, gitErr error) {
+func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *RecoveryStatus, bd *beads.Beads, beadTerminal bool, worktreePath string, targetRefs []string, targetRefLookupFailed bool, gitState *GitState, gitErr error) {
 	if status.Branch == "" {
 		return
 	}
@@ -1249,6 +1263,9 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 	input.AssignedBeadTerminal = beadTerminal
 	input.HasSubmittableWork = hasSubmittableWorkForRecovery(worktreePath, targetRefs, gitState, gitErr)
 	input.MQNotRequired = isMQNotRequiredSource(bd, status.Issue)
+	if targetRefLookupFailed {
+		input.MQLookupFailed = true
+	}
 	if !input.HasSubmittableWork || input.MQNotRequired || input.AssignedBeadTerminal {
 		return
 	}
@@ -1474,8 +1491,9 @@ func isRecoveryBaseBranch(branch string) bool {
 	return branch == "main" || branch == "master" || strings.HasPrefix(branch, "integration/")
 }
 
-func recoveryTargetRefs(bd *beads.Beads, issueID, activeMR, branch string) []string {
+func recoveryTargetRefs(bd *beads.Beads, issueID, activeMR, branch string, extraIssueIDs ...string) ([]string, bool) {
 	var refs []string
+	lookupFailed := false
 	appendMRTarget := func(issue *beads.Issue) {
 		if fields := beads.ParseMRFields(issue); fields != nil && fields.Target != "" {
 			refs = append(refs, fields.Target)
@@ -1485,20 +1503,29 @@ func recoveryTargetRefs(bd *beads.Beads, issueID, activeMR, branch string) []str
 		if activeMR != "" {
 			if issue, err := bd.Show(activeMR); err == nil {
 				appendMRTarget(issue)
+			} else if !errors.Is(err, beads.ErrNotFound) {
+				lookupFailed = true
 			}
 		}
 		if branch != "" {
 			if issue, err := bd.FindMRForBranchAny(branch); err == nil {
 				appendMRTarget(issue)
+			} else if !errors.Is(err, beads.ErrNotFound) {
+				lookupFailed = true
 			}
 		}
-		if issueID != "" {
-			if issue, err := bd.Show(issueID); err == nil {
+		for _, candidateIssueID := range append([]string{issueID}, extraIssueIDs...) {
+			if candidateIssueID == "" {
+				continue
+			}
+			if issue, err := bd.Show(candidateIssueID); err == nil {
 				appendAttachmentTargets(&refs, bd, issue)
+			} else {
+				lookupFailed = true
 			}
 		}
 	}
-	return uniqueStrings(refs)
+	return uniqueStrings(refs), lookupFailed
 }
 
 func appendAttachmentTargets(refs *[]string, bd *beads.Beads, issue *beads.Issue) {
@@ -1764,7 +1791,7 @@ func runPolecatNuke(cmd *cobra.Command, args []string) error {
 			fmt.Printf("Nuking %s/%s...\n", p.rigName, p.polecatName)
 		}
 
-		if err := nukePolecatFullWithOptions(p.polecatName, p.rigName, p.mgr, p.r, nukePolecatOptions{PurgeClosedEphemerals: !batchPurge}); err != nil {
+		if err := nukePolecatFullWithOptions(p.polecatName, p.rigName, p.mgr, p.r, nukePolecatOptions{Force: polecatNukeForce, PurgeClosedEphemerals: !batchPurge}); err != nil {
 			nukeErrors = append(nukeErrors, fmt.Sprintf("%s/%s: %v", p.rigName, p.polecatName, err))
 			continue
 		}
@@ -1832,10 +1859,15 @@ func nukePolecatFull(polecatName, rigName string, mgr *polecat.Manager, r *rig.R
 }
 
 type nukePolecatOptions struct {
+	Force                 bool
 	PurgeClosedEphemerals bool
 }
 
 func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manager, r *rig.Rig, opts nukePolecatOptions) error {
+	if err := checkNukeActiveMRSafety(mgr, polecatName, rigName, opts.Force); err != nil {
+		return err
+	}
+
 	t := tmux.NewTmux()
 
 	// Step 1: Kill tmux session unconditionally to prevent ghost sessions
@@ -1865,8 +1897,8 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	}
 
 	// Step 2.75: Best-effort push before nuke (gt-4vr guardrail).
-	// Try to preserve any unpushed commits on the branch. If push fails,
-	// proceed — --force already means "I accept data loss".
+	// Try to preserve any unpushed commits on the branch. Push failures are
+	// non-fatal because this cleanup path already passed its safety gates.
 	if branchToDelete != "" {
 		var pushGit *git.Git
 		// Try worktree first (may still exist), then bare repo fallback.
@@ -1894,7 +1926,7 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 	}
 
 	// Step 3: Delete worktree (nuclear=true to bypass safety checks for stale polecats)
-	if err := mgr.RemoveWithOptions(polecatName, true, true, false); err != nil {
+	if err := mgr.RemoveWithOptions(polecatName, opts.Force, true, false); err != nil {
 		if errors.Is(err, polecat.ErrPolecatNotFound) {
 			fmt.Printf("  %s worktree already gone\n", style.Dim.Render("○"))
 			resetPolecatAgentBeadForReuse(r, rigName, polecatName)
@@ -1928,6 +1960,20 @@ func nukePolecatFullWithOptions(polecatName, rigName string, mgr *polecat.Manage
 		purgeClosedEphemeralBeads(beads.New(r.Path))
 	}
 
+	return nil
+}
+
+type activeMRRemovalChecker interface {
+	ActiveMRRemovalBlocker(name string) (activeMR, blocker string)
+}
+
+func checkNukeActiveMRSafety(checker activeMRRemovalChecker, polecatName, rigName string, force bool) error {
+	if force || checker == nil {
+		return nil
+	}
+	if activeMR, blocker := checker.ActiveMRRemovalBlocker(polecatName); blocker != "" {
+		return fmt.Errorf("cannot nuke %s/%s: MR %s is still pending in merge queue (%s)\nRefinery will process the MR and clean up after merge\nUse --force to override (risks data loss)", rigName, polecatName, activeMR, blocker)
+	}
 	return nil
 }
 
@@ -1983,14 +2029,8 @@ func nukeCleanupMolecules(workBeadID string, r *rig.Rig) {
 		return
 	}
 
-	// Remove dependency bond so collectExistingMolecules won't find the
-	// closed molecule and block re-dispatch. Without this, the bond persists
-	// and every sling attempt fails with "bead has existing molecule(s)".
-	if err := bd.RemoveDependency(workBeadID, moleculeID); err != nil {
-		fmt.Printf("  %s molecule bond removal failed for %s → %s: %v\n",
-			style.Warning.Render("⚠"), workBeadID, moleculeID, err)
-		// Non-fatal: detach already cleared the description pointer.
-	}
+	// Remove dependency bonds so stale molecule discovery does not block re-dispatch.
+	removeMoleculeBonds(bd, workBeadID, moleculeID)
 
 	// Force-close the orphaned wisp root so it doesn't linger
 	if closeErr := bd.ForceCloseWithReason("burned: polecat nuked", moleculeID); closeErr != nil {
@@ -2175,6 +2215,9 @@ func runPolecatPrune(cmd *cobra.Command, args []string) error {
 
 	// First, prune stale remote-tracking refs so we detect deleted remote branches
 	if err := repoGit.FetchPrune("origin"); err != nil {
+		if polecatPruneRemote {
+			return fmt.Errorf("refreshing origin before remote prune: %w", err)
+		}
 		fmt.Printf("  %s fetch --prune: %v (continuing anyway)\n", style.Warning.Render("⚠"), err)
 	}
 
@@ -2202,38 +2245,9 @@ func runPolecatPrune(cmd *cobra.Command, args []string) error {
 		fmt.Println()
 		fmt.Println("Pruning remote polecat branches...")
 
-		defaultBranch := repoGit.RemoteDefaultBranch()
-		remoteRefs, lsErr := repoGit.ListPushRemoteRefsWithHashes("origin", "refs/heads/polecat/")
-		if lsErr != nil {
-			return fmt.Errorf("listing remote refs: %w", lsErr)
-		}
-
-		remotePruned := 0
-		for _, ref := range remoteRefs {
-			if !strings.HasPrefix(ref.Name, "refs/heads/") {
-				continue
-			}
-			branch := strings.TrimPrefix(ref.Name, "refs/heads/")
-			// Use the listed remote tip, not the short branch name, so remote-only
-			// branches can be classified without a local branch.
-			merged, mergeErr := repoGit.IsAncestor(ref.Hash, "origin/"+defaultBranch)
-			if mergeErr != nil {
-				continue
-			}
-			if !merged {
-				continue
-			}
-
-			if polecatPruneDryRun {
-				fmt.Printf("  Would delete remote: %s\n", style.Dim.Render(branch))
-			} else {
-				if delErr := repoGit.DeleteRemoteBranchIfAt("origin", branch, ref.Hash); delErr != nil {
-					fmt.Printf("  %s remote %s: %v\n", style.Warning.Render("⚠"), branch, delErr)
-				} else {
-					fmt.Printf("  %s deleted remote %s\n", style.Success.Render("✓"), branch)
-				}
-			}
-			remotePruned++
+		remotePruned, remoteErr := pruneRemotePolecatBranches(repoGit, polecatPruneDryRun)
+		if remoteErr != nil {
+			return remoteErr
 		}
 
 		if remotePruned == 0 {
@@ -2248,6 +2262,46 @@ func runPolecatPrune(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func pruneRemotePolecatBranches(repoGit *git.Git, dryRun bool) (int, error) {
+	defaultBranch := repoGit.RemoteDefaultBranch()
+	target := repoGit.CleanDefaultBranchBaseRef("origin", defaultBranch)
+	if targetRemote := git.RemoteForRef(target); targetRemote != "" && targetRemote != "origin" {
+		if err := repoGit.FetchPrune(targetRemote); err != nil {
+			return 0, fmt.Errorf("refreshing %s before remote prune: %w", targetRemote, err)
+		}
+	}
+	remoteRefs, lsErr := repoGit.ListPushRemoteRefsWithHashes("origin", "refs/heads/polecat/")
+	if lsErr != nil {
+		return 0, fmt.Errorf("listing remote refs: %w", lsErr)
+	}
+
+	remotePruned := 0
+	for _, ref := range remoteRefs {
+		if !strings.HasPrefix(ref.Name, "refs/heads/") {
+			continue
+		}
+		branch := strings.TrimPrefix(ref.Name, "refs/heads/")
+		status, statusErr := repoGit.PushRemoteRefTargetStatus("origin", ref, target)
+		if statusErr != nil || !status.Preserved {
+			continue
+		}
+
+		if dryRun {
+			fmt.Printf("  Would delete remote: %s\n", style.Dim.Render(branch))
+			remotePruned++
+			continue
+		}
+		if delErr := repoGit.DeleteRemoteBranchIfAt("origin", branch, ref.Hash); delErr != nil {
+			fmt.Printf("  %s remote %s: %v\n", style.Warning.Render("⚠"), branch, delErr)
+			continue
+		}
+		fmt.Printf("  %s deleted remote %s\n", style.Success.Render("✓"), branch)
+		remotePruned++
+	}
+
+	return remotePruned, nil
 }
 
 // runPolecatPoolInit creates a persistent polecat pool for a rig.

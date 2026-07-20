@@ -38,8 +38,8 @@ This is a convenience command for polecats that:
 1. Submits the current branch to the merge queue
 2. Auto-detects issue ID from branch name
 3. Notifies the Witness with the exit outcome
-4. Syncs worktree to main and transitions polecat to IDLE
-   (sandbox preserved, session stays alive for reuse)
+4. Exits the polecat session after durable handoff
+   (Witness/refinery cleanup owns the retired sandbox)
 
 Exit statuses:
   COMPLETED      - Work done, MR submitted (default)
@@ -47,7 +47,7 @@ Exit statuses:
   DEFERRED       - Work paused, issue still open
 
 Examples:
-  gt done                              # Submit branch, notify COMPLETED, transition to IDLE
+  gt done                              # Submit branch, notify COMPLETED, exit session
   gt done --pre-verified               # Submit with pre-verification fast-path
   gt done --target feat/my-branch      # Explicit MR target branch
   gt done --pre-verified --target feat/contract-review  # Pre-verified with explicit target
@@ -80,14 +80,21 @@ const (
 func doneContaminationBaseRef(defaultBranch, explicitTarget string) string {
 	targetBranch := defaultBranch
 	if explicitTarget != "" {
-		targetBranch = strings.TrimPrefix(explicitTarget, "origin/")
+		targetBranch = strings.TrimSpace(explicitTarget)
+		if strings.HasPrefix(targetBranch, "origin/") || strings.HasPrefix(targetBranch, "upstream/") {
+			return targetBranch
+		}
 	}
 
 	return "origin/" + targetBranch
 }
 
-func shouldSyncIdlePolecatWorktree(exitType, mergeStrategy string, pushFailed, mrFailed, syncSafe bool) bool {
-	if exitType != ExitCompleted || pushFailed || mrFailed || !syncSafe {
+func shouldUpdateAgentStateOnDone(pushFailed, mrFailed bool) bool {
+	return !pushFailed && !mrFailed
+}
+
+func shouldRetirePolecatSessionAfterDone(exitType, mergeStrategy string, pushFailed, mrFailed bool) bool {
+	if exitType != ExitCompleted || pushFailed || mrFailed {
 		return false
 	}
 	// wkb-9688: for "pr" MQ-strategy work, defer destructive worktree checkout
@@ -102,11 +109,301 @@ func shouldSyncIdlePolecatWorktree(exitType, mergeStrategy string, pushFailed, m
 	return mergeStrategy != "local"
 }
 
+type doneSessionKiller interface {
+	KillSessionWithProcessesExcluding(name string, excludePIDs []string) error
+}
+
+var newDoneSessionKiller = func() doneSessionKiller {
+	return tmux.NewTmux()
+}
+
+var updateAgentStateOnDoneFn = updateAgentStateOnDone
+
+func updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID string, pushFailed, mrFailed bool) error {
+	if !shouldUpdateAgentStateOnDone(pushFailed, mrFailed) {
+		style.PrintWarning("skipping agent cleanup because push or MR submission failed")
+		return nil
+	}
+	return updateAgentStateOnDoneFn(cwd, townRoot, exitType, issueID)
+}
+
+func polecatSessionRetirementTarget(rigName, polecatName string, pid int) (string, []string, bool) {
+	if rigName == "" || polecatName == "" || pid <= 0 {
+		return "", nil, false
+	}
+	return session.PolecatSessionName(session.PrefixFor(rigName), polecatName), []string{fmt.Sprintf("%d", pid)}, true
+}
+
+func retirePolecatSessionAfterDone(rigName, polecatName string, pid int) error {
+	sessionName, excludePIDs, ok := polecatSessionRetirementTarget(rigName, polecatName, pid)
+	if !ok {
+		return nil
+	}
+	return newDoneSessionKiller().KillSessionWithProcessesExcluding(sessionName, excludePIDs)
+}
+
 func cleanupStatusAfterSuccessfulPush(status string) string {
 	if status == "unpushed" || status == "has_unpushed" {
 		return "clean"
 	}
 	return status
+}
+
+func cleanupStatusFromWorkState(workStatus *git.UncommittedWorkStatus, branchPushed bool, unpushedCount int, branchPushedErr error) string {
+	if workStatus == nil {
+		return "unknown"
+	}
+	if workStatus.HasUncommittedChanges && !workStatus.CleanExcludingRuntime() {
+		return "uncommitted"
+	}
+	if workStatus.StashCount > 0 {
+		return "stash"
+	}
+	if branchPushedErr != nil || !branchPushed || unpushedCount > 0 {
+		return "unpushed"
+	}
+	return "clean"
+}
+
+var reviewEvidencePrefixes = []string{
+	"report:",
+	"findings:",
+	"review:",
+	"evidence:",
+	"verdict:",
+	"decision:",
+	"pr-sheriff-evidence",
+	"pr sheriff evidence",
+}
+
+var generatedCommentPrefixes = []string{
+	"verified_push_",
+	"mr created:",
+}
+
+func doneSourceCloseSkipReason(bd *beads.Beads, issueID string, issue *beads.Issue) (string, bool) {
+	currentHead, _ := currentReviewEvidenceHead()
+	return doneSourceCloseSkipReasonForHead(bd, issueID, issue, currentHead)
+}
+
+func doneDirectMergeSkipReason(bd *beads.Beads, issueID string, issue *beads.Issue, targetBranch string) string {
+	if strings.TrimSpace(issueID) == "" {
+		return "source issue is required for direct merge"
+	}
+	issue, skipReason, _ := loadDoneSourceIssue(bd, issueID, issue)
+	if skipReason != "" {
+		return skipReason
+	}
+	if err := validateConcreteSourceIssue(issueID, issue); err != nil {
+		return err.Error()
+	}
+	if attachment := beads.ParseAttachmentFields(issue); attachment != nil {
+		switch {
+		case attachment.NoMerge:
+			return fmt.Sprintf("source_issue %s has no_merge=true", issueID)
+		case attachment.ReviewOnly:
+			return fmt.Sprintf("review-only issue %s cannot be direct-merged to %s", issueID, targetBranch)
+		case strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local"):
+			return fmt.Sprintf("source_issue %s has merge_strategy=local", issueID)
+		}
+	}
+	if unchecked := beads.HasUncheckedCriteria(issue); unchecked > 0 {
+		return fmt.Sprintf("issue %s has %d unchecked acceptance criteria — skipping direct merge", issueID, unchecked)
+	}
+	return ""
+}
+
+func doneSourceCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue *beads.Issue, currentHead string) (string, bool) {
+	issue, skipReason, fatal := loadDoneSourceIssue(bd, issueID, issue)
+	if skipReason != "" {
+		return skipReason, fatal
+	}
+	if err := validateConcreteSourceIssue(issueID, issue); err != nil {
+		return err.Error(), true
+	}
+	if attachment := beads.ParseAttachmentFields(issue); attachment != nil && strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local") {
+		return fmt.Sprintf("issue %s has merge_strategy=local — skipping close", issueID), false
+	}
+	if skipReason, fatal := doneReviewOnlyCloseSkipReasonForHead(bd, issueID, issue, currentHead); skipReason != "" {
+		return skipReason, fatal
+	}
+	if unchecked := beads.HasUncheckedCriteria(issue); unchecked > 0 {
+		return fmt.Sprintf("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked), false
+	}
+	return "", false
+}
+
+func doneReviewOnlyCloseSkipReason(bd *beads.Beads, issueID string, issue *beads.Issue) (string, bool) {
+	issue, skipReason, fatal := loadDoneSourceIssue(bd, issueID, issue)
+	if skipReason != "" {
+		return skipReason, fatal
+	}
+	attachment := beads.ParseAttachmentFields(issue)
+	if attachment == nil || !attachment.ReviewOnly {
+		return "", false
+	}
+	currentHead, err := currentReviewEvidenceHead()
+	if err != nil {
+		return fmt.Sprintf("could not verify review evidence for %s: %v", issueID, err), true
+	}
+	return doneReviewOnlyCloseSkipReasonForHead(bd, issueID, issue, currentHead)
+}
+
+func doneReviewOnlyCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue *beads.Issue, currentHead string) (string, bool) {
+	issue, skipReason, fatal := loadDoneSourceIssue(bd, issueID, issue)
+	if skipReason != "" {
+		return skipReason, fatal
+	}
+	attachment := beads.ParseAttachmentFields(issue)
+	if attachment == nil || !attachment.ReviewOnly {
+		return "", false
+	}
+	assignmentAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(attachment.AttachedAt))
+	if err != nil {
+		return fmt.Sprintf("review-only issue %s has no fresh assignment timestamp — re-sling it or add evidence after a fresh assignment", issueID), true
+	}
+	if strings.TrimSpace(issue.Assignee) == "" {
+		return fmt.Sprintf("review-only issue %s has no assignee for evidence author validation", issueID), true
+	}
+	currentHead = strings.TrimSpace(currentHead)
+	if currentHead == "" {
+		return fmt.Sprintf("review-only issue %s has no current HEAD for evidence validation", issueID), true
+	}
+	hasEvidence, err := hasFreshReviewReportEvidence(bd, issueID, issue, assignmentAt, issue.Assignee, currentHead)
+	if err != nil {
+		return fmt.Sprintf("could not verify review evidence for %s: %v", issueID, err), true
+	}
+	if !hasEvidence {
+		return fmt.Sprintf("review-only issue %s has no fresh review evidence comment for assignee %s and head %s", issueID, strings.TrimSpace(issue.Assignee), currentHead), true
+	}
+	return "", false
+}
+
+func loadDoneSourceIssue(bd *beads.Beads, issueID string, issue *beads.Issue) (*beads.Issue, string, bool) {
+	if issueID == "" {
+		return nil, "", false
+	}
+	if issue != nil {
+		return issue, "", false
+	}
+	if bd == nil {
+		return nil, fmt.Sprintf("could not inspect issue %s close eligibility", issueID), true
+	}
+	loaded, err := bd.Show(issueID)
+	if err != nil {
+		return nil, fmt.Sprintf("could not inspect issue %s close eligibility: %v", issueID, err), true
+	}
+	return loaded, "", false
+}
+
+func currentReviewEvidenceHead() (string, error) {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("resolving current HEAD: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+func hasFreshReviewReportEvidence(bd *beads.Beads, issueID string, issue *beads.Issue, assignmentAt time.Time, assignee, currentHead string) (bool, error) {
+	if issue != nil {
+		if hasFreshReviewEvidenceComment(issue.Comments, assignmentAt, assignee, currentHead) {
+			return true, nil
+		}
+	}
+	if bd == nil || issueID == "" {
+		return false, nil
+	}
+	comments, err := bd.Comments(issueID)
+	if err != nil {
+		return false, err
+	}
+	if hasFreshReviewEvidenceComment(comments, assignmentAt, assignee, currentHead) {
+		return true, nil
+	}
+	return false, nil
+}
+
+func hasFreshReviewEvidenceComment(comments []beads.Comment, assignmentAt time.Time, assignee, currentHead string) bool {
+	assignee = strings.TrimSpace(assignee)
+	currentHead = strings.TrimSpace(currentHead)
+	if assignee == "" || currentHead == "" {
+		return false
+	}
+	for _, comment := range comments {
+		createdAt, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(comment.CreatedAt))
+		if err != nil || !createdAt.After(assignmentAt) {
+			continue
+		}
+		if strings.TrimSpace(comment.Author) != assignee {
+			continue
+		}
+		if isGeneratedReviewComment(comment.Text) || !isReviewEvidenceText(comment.Text) {
+			continue
+		}
+		if reviewEvidenceHeadSHA(comment.Text) != currentHead {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isGeneratedReviewComment(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		lower := strings.ToLower(strings.TrimSpace(line))
+		if lower == "" {
+			continue
+		}
+		for _, prefix := range generatedCommentPrefixes {
+			if strings.HasPrefix(lower, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func reviewEvidenceHeadSHA(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		lower := strings.ToLower(trimmed)
+		for _, key := range []string{"head_sha", "target_head_sha", "head"} {
+			for _, sep := range []string{":", "="} {
+				prefix := key + sep
+				if strings.HasPrefix(lower, prefix) {
+					return strings.TrimSpace(trimmed[len(prefix):])
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func isReviewEvidenceText(text string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		generated := false
+		for _, prefix := range generatedCommentPrefixes {
+			if strings.HasPrefix(lower, prefix) {
+				generated = true
+				break
+			}
+		}
+		if generated {
+			continue
+		}
+		for _, prefix := range reviewEvidencePrefixes {
+			if strings.HasPrefix(lower, prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func init() {
@@ -139,9 +436,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("invalid exit status '%s': must be COMPLETED, ESCALATED, or DEFERRED", doneStatus)
 	}
 
-	// Persistent polecat model (gt-hdf8): sessions stay alive after gt done.
-	// No deferred session kill — the polecat transitions to IDLE with sandbox
-	// preserved. The Witness handles any cleanup if the polecat gets stuck.
+	// Clean completions retire the live polecat session after durable handoff.
+	// Failed, deferred, escalated, and local-review paths preserve the session for recovery.
 
 	// Find workspace with fallback for deleted worktrees (hq-3xaxy)
 	// If the polecat's worktree was deleted by Witness before gt done finishes,
@@ -282,25 +578,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			if err != nil {
 				style.PrintWarning("could not auto-detect cleanup status: %v", err)
 			} else {
-				switch {
-				case workStatus.HasUncommittedChanges:
-					doneCleanupStatus = "uncommitted"
-				case workStatus.StashCount > 0:
-					doneCleanupStatus = "stash"
-				default:
-					// CheckUncommittedWork.UnpushedCommits doesn't work for branches
-					// without upstream tracking (common for polecats). Use the more
-					// robust BranchPushedToRemote which compares against origin/main.
-					pushed, unpushedCount, err := g.BranchPushedToRemote(branch, "origin")
-					if err != nil {
-						style.PrintWarning("could not check if branch is pushed: %v", err)
-						doneCleanupStatus = "unpushed" // err on side of caution
-					} else if !pushed || unpushedCount > 0 {
-						doneCleanupStatus = "unpushed"
-					} else {
-						doneCleanupStatus = "clean"
-					}
+				// CheckUncommittedWork.UnpushedCommits doesn't work for branches
+				// without upstream tracking (common for polecats). Use the more
+				// robust BranchPushedToRemote which compares against origin/main.
+				pushed, unpushedCount, pushErr := g.BranchPushedToRemote(branch, "origin")
+				if pushErr != nil {
+					style.PrintWarning("could not check if branch is pushed: %v", pushErr)
 				}
+				doneCleanupStatus = cleanupStatusFromWorkState(workStatus, pushed, unpushedCount, pushErr)
 			}
 		}
 	}
@@ -460,8 +745,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// leaves the existing warnings.
 		ensureAgentBeadExists(beads.New(cwd).ForAgentBead(), agentBeadID, ctx)
 
-		// Persistent polecat model (gt-hdf8): no deferred session kill.
-		// Sessions stay alive after gt done — polecat transitions to IDLE.
+		// Completion now exits the live polecat session after durable handoff.
+		// The agent bead keeps lifecycle metadata for witness/refinery cleanup.
 	}
 	polecatName := ""
 	if parts := strings.Split(sender, "/"); len(parts) >= 2 {
@@ -497,7 +782,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if doneIssue == "" && info.Issue != "" && sender != "" {
 		if hookIssue, ambiguous := selectAssignedIssue(info.Issue, loadAssignedIssueIDs()); isStaleBranchIssue(info.Issue, hookIssue) {
 			style.PrintWarning("branch %q embeds issue %s but your hooked bead is %s — submitting for %s (stale branch reuse?)", branch, info.Issue, hookIssue, hookIssue)
-			fmt.Printf("  Fresh branches must be named polecat/<name>/<bead-id>@<suffix> for the bead you are working.\n")
+			fmt.Printf("  Fresh branches must be named polecat/<name>/<bead-id>+<suffix> for the bead you are working.\n")
 			fmt.Printf("  Use --issue to override if the branch-derived id is actually correct.\n\n")
 			issueID = hookIssue
 		} else if ambiguous {
@@ -537,6 +822,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 	if rigCfg, err := rig.LoadRigConfig(filepath.Join(townRoot, rigName)); err == nil && rigCfg.DefaultBranch != "" {
 		defaultBranch = rigCfg.DefaultBranch
 	}
+	baseRef := g.CleanBaseRef("origin", defaultBranch, doneTarget)
 
 	// For COMPLETED, we need an issue ID and branch must not be the default branch
 	var mrID string
@@ -574,10 +860,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			return fmt.Errorf("cannot complete: uncommitted changes would be lost\nCommit your changes first, or use --status DEFERRED to exit without completing\nUncommitted: %s", workStatus.String())
 		}
 
-		// Check if branch has commits ahead of origin/default
-		// If not, work may have been pushed directly to main - that's fine, just skip MR
-		originDefault := "origin/" + defaultBranch
-		aheadCount, err := g.CommitsAhead(originDefault, "HEAD")
+		// Check if branch has commits ahead of the clean target base. In fork-backed
+		// rigs this is upstream/main, not the fork's origin/main.
+		aheadCount, err := g.CommitsAhead(baseRef, "HEAD")
 		if err != nil {
 			// Fallback to local branch comparison if origin not available
 			aheadCount, err = g.CommitsAhead(defaultBranch, branch)
@@ -593,16 +878,23 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// where zero commits is expected.
 		// Must be checked before the zero-commit guard below (GH#2496, gt-kvf).
 		isNoMergeTask := false
+		reviewOnlySource := false
 		if issueID != "" {
 			noMergeBd := beads.New(cwd)
-			if noMergeIssue, showErr := noMergeBd.Show(issueID); showErr == nil {
-				if af := beads.ParseAttachmentFields(noMergeIssue); af != nil && (af.NoMerge || af.ReviewOnly) {
+			noMergeIssue, showErr := noMergeBd.Show(issueID)
+			if showErr != nil {
+				return fmt.Errorf("cannot inspect source issue %s before completion: %w", issueID, showErr)
+			}
+			if af := beads.ParseAttachmentFields(noMergeIssue); af != nil {
+				if af.NoMerge || af.ReviewOnly {
 					isNoMergeTask = true
 				}
+				reviewOnlySource = af.ReviewOnly
 			}
 		}
 
-		// If no commits ahead, work was likely pushed directly to main (or already merged)
+		// If no commits ahead, work was likely already merged or is a legitimate
+		// report-only completion. Fork-backed rigs must not infer success from fork main.
 		// For polecats, zero commits usually means the polecat sleepwalked through
 		// implementation without writing code (gastown#1484, beads#emma).
 		// The --cleanup-status=clean escape is preserved for legitimate report-only
@@ -627,7 +919,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						"Polecats must have at least 1 commit to submit.\n"+
 						"If the bug was already fixed upstream: gt done --status DEFERRED\n"+
 						"If you're blocked: gt done --status ESCALATED",
-						originDefault)
+						baseRef)
 				}
 			}
 
@@ -635,8 +927,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// (report-only tasks like audits/reviews), or no_merge polecat
 			// (non-code tasks like email/research per GH#2496):
 			// zero commits is valid.
-			fmt.Printf("%s Branch has no commits ahead of %s\n", style.Bold.Render("→"), originDefault)
-			fmt.Printf("  Work was likely pushed directly to main or already merged.\n")
+			fmt.Printf("%s Branch has no commits ahead of %s\n", style.Bold.Render("→"), baseRef)
+			fmt.Printf("  Work was likely already merged or report-only.\n")
 			fmt.Printf("  Skipping MR creation - completing without merge request.\n\n")
 
 			// G15 fix: Close the base issue when completing with no MR.
@@ -647,22 +939,19 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			if issueID != "" {
 				bd := beads.New(cwd)
 
-				// Acceptance criteria gate: check for unchecked criteria before closing.
-				// If criteria exist and are unchecked, warn and skip close — the bead stays
-				// open for witness/mayor to handle.
 				skipClose := false
-				if issue, err := bd.Show(issueID); err == nil {
-					if unchecked := beads.HasUncheckedCriteria(issue); unchecked > 0 {
-						skipReason := fmt.Sprintf("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked)
-						style.PrintWarning("%s", skipReason)
-						fmt.Printf("  The bead will remain open for witness/mayor review.\n")
-						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
-						skipClose = true
+				if skipReason, fatal := doneSourceCloseSkipReason(bd, issueID, nil); skipReason != "" {
+					style.PrintWarning("%s", skipReason)
+					fmt.Printf("  The bead will remain open for witness/mayor review.\n")
+					notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+					if fatal {
+						return fmt.Errorf("cannot complete review-only/no-MR work: %s", skipReason)
 					}
+					skipClose = true
 				}
 
 				if !skipClose {
-					closeReason := "Completed with no code changes (already fixed or pushed directly to main)"
+					closeReason := "Completed with no code changes (already fixed or already merged)"
 					noMRCommitSHA, _ := g.Rev("HEAD")
 					if doneSkipVerify {
 						noteVerifiedPushSkipped(cwd, issueID, defaultBranch, noMRCommitSHA, "--skip-verify on no-MR close")
@@ -670,7 +959,10 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 							closeReason = fmt.Sprintf("%s\nskip_verify: true\ntarget_branch: %s\ncommit_sha: %s", closeReason, defaultBranch, noMRCommitSHA)
 						}
 					} else if !isNoMergeTask {
-						if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
+						if g.ForkBackedRemote("origin") {
+							return fmt.Errorf("cannot close no-MR code bead in fork/upstream mode: %s has no commits ahead of %s; use the fork PR flow instead", branch, baseRef)
+						}
+						if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, noMRCommitSHA); verifyErr != nil {
 							noteVerifiedPushFailure(cwd, issueID, defaultBranch, noMRCommitSHA, verifyErr)
 							return fmt.Errorf("cannot close no-MR code bead: %w", verifyErr)
 						}
@@ -703,17 +995,27 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			goto notifyWitness
 		}
 
+		if reviewOnlySource {
+			return fmt.Errorf("cannot complete review-only issue %s with commits ahead of %s; add a fresh review evidence comment and complete without code changes", issueID, baseRef)
+		}
+
 		// Branch contamination preflight: check if branch is significantly behind
 		// the effective target branch, which indicates the branch may contain stale merge-base
 		// artifacts that will pollute the PR diff. (GH#2220)
 		//
 		// gh#3400: Refresh remote tracking refs first so contamination check (and
-		// the auto-rebase below) sees the current state of origin. Without this,
-		// the local view of origin/<base> may be stale and we'd skip a rebase that
-		// is actually needed.
-		contaminationBase := doneContaminationBaseRef(defaultBranch, doneTarget)
-		if fetchErr := g.Fetch("origin"); fetchErr != nil {
-			style.PrintWarning("could not fetch origin before contamination check: %v (proceeding with local refs)", fetchErr)
+		// the auto-rebase below) sees the current clean base. In fork-backed rigs,
+		// that base is upstream/main, not the fork's origin/main.
+		contaminationBase := baseRef
+		if doneTarget != "" && doneTarget != defaultBranch {
+			contaminationBase = doneContaminationBaseRef(defaultBranch, doneTarget)
+		}
+		fetchRemote := git.RemoteForRef(contaminationBase)
+		if fetchRemote == "" {
+			fetchRemote = "origin"
+		}
+		if fetchErr := g.Fetch(fetchRemote); fetchErr != nil {
+			style.PrintWarning("could not fetch %s before contamination check: %v (proceeding with local refs)", fetchRemote, fetchErr)
 		}
 		contam, err := g.CheckBranchContamination(contaminationBase)
 		if err == nil && contam.Behind > 0 {
@@ -722,8 +1024,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			if contam.Behind >= blockThreshold {
 				return fmt.Errorf("branch contamination: %d commits behind %s (threshold: %d)\n"+
 					"The branch is severely stale and will include unrelated changes in the PR.\n"+
-					"Fix: git fetch origin && git rebase %s",
-					contam.Behind, contaminationBase, blockThreshold, contaminationBase)
+					"Fix: git fetch %s && git rebase %s",
+					contam.Behind, contaminationBase, blockThreshold, fetchRemote, contaminationBase)
 			} else if contam.Behind >= warnThreshold {
 				style.PrintWarning("branch is %d commits behind %s — consider rebasing to avoid PR contamination", contam.Behind, contaminationBase)
 			}
@@ -738,7 +1040,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			if rebased {
 				fmt.Printf("%s Branch rebased onto %s\n", style.Bold.Render("✓"), contaminationBase)
 				// Recompute commits ahead since rebase rewrote history.
-				aheadCount, _ = g.CommitsAhead("origin/"+defaultBranch, "HEAD")
+				aheadCount, _ = g.CommitsAhead(baseRef, "HEAD")
 			} else if skipReason != "" {
 				style.PrintWarning("branch is %d commits behind %s but %s; skipping auto-rebase", contam.Behind, contaminationBase, skipReason)
 			}
@@ -747,9 +1049,9 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Strip Gas Town overlay from CLAUDE.md / CLAUDE.local.md (gt-p35).
 		// Polecats commit the overlay (polecat lifecycle boilerplate) into repos,
 		// overwriting project-specific CLAUDE.md content. Detect and revert before push.
-		if stripped := stripOverlayCLAUDEmd(g, defaultBranch); stripped {
+		if stripped := stripOverlayCLAUDEmd(g, defaultBranch, baseRef); stripped {
 			// Recalculate commits ahead since we added a cleanup commit
-			aheadCount, _ = g.CommitsAhead("origin/"+defaultBranch, "HEAD")
+			aheadCount, _ = g.CommitsAhead(baseRef, "HEAD")
 		}
 
 		// Determine merge strategy from convoy (gt-myofa.3)
@@ -783,8 +1085,14 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// Handle "direct" strategy: push to target branch, skip MR
 		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
 			fmt.Printf("%s Direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
+			directBd := beads.New(cwd)
+			if skipReason := doneDirectMergeSkipReason(directBd, issueID, nil, defaultBranch); skipReason != "" {
+				style.PrintWarning("%s", skipReason)
+				notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+				return fmt.Errorf("cannot complete direct-merge work: %s", skipReason)
+			}
 			// Push submodule changes before direct push (gt-dzs)
-			pushSubmoduleChanges(g, defaultBranch)
+			pushSubmoduleChanges(g, baseRef)
 			directRefspec := branch + ":" + defaultBranch
 			directPushErr := g.Push("origin", directRefspec, false)
 			if directPushErr != nil {
@@ -797,7 +1105,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			directCommitSHA, _ := g.Rev("HEAD")
 			if doneSkipVerify {
 				noteVerifiedPushSkipped(cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on direct merge")
-			} else if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, directCommitSHA); verifyErr != nil {
+			} else if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, directCommitSHA); verifyErr != nil {
 				pushFailed = true
 				errMsg := verifyErr.Error()
 				doneErrors = append(doneErrors, errMsg)
@@ -810,11 +1118,127 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 			// Close the base issue — no MR/refinery will close it
 			if issueID != "" {
-				directBd := beads.New(cwd)
-				closeReason := fmt.Sprintf("Direct merge to %s (convoy strategy)", defaultBranch)
+				if skipReason, fatal := doneSourceCloseSkipReason(directBd, issueID, nil); skipReason != "" {
+					style.PrintWarning("%s", skipReason)
+					notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+					if fatal {
+						return fmt.Errorf("cannot complete direct-merge work: %s", skipReason)
+					}
+				} else {
+					closeReason := fmt.Sprintf("Direct merge to %s (convoy strategy)", defaultBranch)
+					var closeErr error
+					for attempt := 1; attempt <= 3; attempt++ {
+						closeErr = directBd.ForceCloseWithReason(closeReason, issueID)
+						if closeErr == nil {
+							fmt.Printf("%s Issue %s closed (direct merge)\n", style.Bold.Render("✓"), issueID)
+							break
+						}
+						if attempt < 3 {
+							style.PrintWarning("close attempt %d/3 failed: %v (retrying in %ds)", attempt, closeErr, attempt*2)
+							time.Sleep(time.Duration(attempt*2) * time.Second)
+						}
+					}
+					if closeErr != nil {
+						style.PrintWarning("could not close issue %s after 3 attempts: %v", issueID, closeErr)
+					}
+				}
+			}
+
+			goto notifyWitness
+		}
+
+		// Default: "mr" strategy (or no convoy) — push branch, create MR bead
+
+		if issueID == "" {
+			return fmt.Errorf("cannot determine source issue from branch '%s'; use --issue to specify", branch)
+		}
+
+		// Initialize beads and validate the source before any remote mutation.
+		// Without a redirect, MR beads are invisible to the Refinery.
+		resolvedBeads := beads.ResolveBeadsDir(cwd)
+		if beads.IsLocalBeadsDir(cwd, resolvedBeads) {
+			fmt.Fprintf(os.Stderr, "WARNING: beads resolved to local dir %s (no shared-beads redirect)\n", resolvedBeads)
+			fmt.Fprintf(os.Stderr, "  MR beads written here will be invisible to the Refinery — run 'gt polecat repair' to fix\n")
+		}
+		bd := beads.NewWithBeadsDir(cwd, resolvedBeads)
+
+		sourceIssueForNoMerge, err := bd.Show(issueID)
+		if err != nil {
+			mrFailed = true
+			errMsg := fmt.Sprintf("source issue validation failed: source_issue %s could not be resolved: %v", issueID, err)
+			doneErrors = append(doneErrors, errMsg)
+			style.PrintWarning("%s\nBranch is not pushed and MR bead not created. Witness will be notified.", errMsg)
+			goto notifyWitness
+		}
+		if err := validateConcreteSourceIssue(issueID, sourceIssueForNoMerge); err != nil {
+			mrFailed = true
+			errMsg := fmt.Sprintf("source issue validation failed: %v", err)
+			doneErrors = append(doneErrors, errMsg)
+			style.PrintWarning("%s\nBranch is not pushed and MR bead not created. Witness will be notified.", errMsg)
+			goto notifyWitness
+		}
+		if attachmentFields := beads.ParseAttachmentFields(sourceIssueForNoMerge); attachmentFields != nil && strings.EqualFold(strings.TrimSpace(attachmentFields.MergeStrategy), "local") {
+			fmt.Printf("%s Local merge strategy: skipping push and merge queue\n", style.Bold.Render("→"))
+			fmt.Printf("  Branch: %s\n", branch)
+			fmt.Printf("  Issue: %s\n", issueID)
+			fmt.Println()
+			fmt.Printf("%s\n", style.Dim.Render("Work stays on local feature branch."))
+			goto notifyWitness
+		}
+
+		// Fallback: check if issue belongs to a direct-merge convoy that the
+		// primary check missed — e.g., issues dispatched before the attachment-field
+		// fix, or where dep-based lookup failed at that point. This must happen
+		// before the generic branch/submodule push because direct mode has no MR or
+		// refinery recheck.
+		convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
+		if convoyInfo == nil {
+			convoyInfo = getConvoyInfoForIssue(issueID)
+		}
+		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
+			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
+			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
+			if skipReason := doneDirectMergeSkipReason(bd, issueID, sourceIssueForNoMerge, defaultBranch); skipReason != "" {
+				style.PrintWarning("%s", skipReason)
+				notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+				return fmt.Errorf("cannot complete direct-merge work: %s", skipReason)
+			}
+
+			pushSubmoduleChanges(g, baseRef)
+			directRefspec := branch + ":" + defaultBranch
+			directPushErr := g.Push("origin", directRefspec, false)
+			if directPushErr != nil {
+				pushFailed = true
+				errMsg := fmt.Sprintf("direct push to %s failed: %v", defaultBranch, directPushErr)
+				doneErrors = append(doneErrors, errMsg)
+				style.PrintWarning("%s", errMsg)
+				goto notifyWitness
+			}
+			directCommitSHA, _ := g.Rev("HEAD")
+			if doneSkipVerify {
+				noteVerifiedPushSkipped(cwd, issueID, defaultBranch, directCommitSHA, "--skip-verify on late direct merge")
+			} else if verifyErr := g.VerifyPushedCommitReachableFromPushTarget("origin", defaultBranch, directCommitSHA); verifyErr != nil {
+				pushFailed = true
+				errMsg := verifyErr.Error()
+				doneErrors = append(doneErrors, errMsg)
+				noteVerifiedPushFailure(cwd, issueID, defaultBranch, directCommitSHA, verifyErr)
+				style.PrintWarning("%s\nLate direct merge pushed but remote verification failed. Source bead will remain in progress.", errMsg)
+				goto notifyWitness
+			}
+			fmt.Printf("%s Branch pushed directly to %s\n", style.Bold.Render("✓"), defaultBranch)
+			doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
+
+			if skipReason, fatal := doneSourceCloseSkipReason(bd, issueID, sourceIssueForNoMerge); skipReason != "" {
+				style.PrintWarning("%s", skipReason)
+				notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+				if fatal {
+					return fmt.Errorf("cannot complete direct-merge work: %s", skipReason)
+				}
+			} else {
 				var closeErr error
 				for attempt := 1; attempt <= 3; attempt++ {
-					closeErr = directBd.ForceCloseWithReason(closeReason, issueID)
+					closeErr = bd.ForceCloseWithReason(
+						fmt.Sprintf("Direct merge to %s (convoy strategy, late detection)", defaultBranch), issueID)
 					if closeErr == nil {
 						fmt.Printf("%s Issue %s closed (direct merge)\n", style.Bold.Render("✓"), issueID)
 						break
@@ -831,8 +1255,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 			goto notifyWitness
 		}
-
-		// Default: "mr" strategy (or no convoy) — push branch, create MR bead
 
 		// Pre-declare push variables for checkpoint goto (gt-aufru)
 		var refspec string
@@ -861,7 +1283,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		// If the parent repo's submodule pointer references commits that don't
 		// exist on the submodule's remote, the Refinery MR will be broken.
 		// Detect modified submodules and push each one first.
-		pushSubmoduleChanges(g, defaultBranch)
+		pushSubmoduleChanges(g, baseRef)
 
 		// Use explicit refspec (branch:branch) to create the remote branch.
 		// Without refspec, git push follows the tracking config — polecat branches
@@ -942,22 +1364,8 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 	afterPush:
 
-		if issueID == "" {
-			return fmt.Errorf("cannot determine source issue from branch '%s'; use --issue to specify", branch)
-		}
-
-		// Initialize beads — warn if resolved to a local .beads/ (no redirect).
-		// Without a redirect, MR beads are invisible to the Refinery.
-		resolvedBeads := beads.ResolveBeadsDir(cwd)
-		if beads.IsLocalBeadsDir(cwd, resolvedBeads) {
-			fmt.Fprintf(os.Stderr, "WARNING: beads resolved to local dir %s (no shared-beads redirect)\n", resolvedBeads)
-			fmt.Fprintf(os.Stderr, "  MR beads written here will be invisible to the Refinery — run 'gt polecat repair' to fix\n")
-		}
-		bd := beads.NewWithBeadsDir(cwd, resolvedBeads)
-
 		// Check for no_merge flag - if set, skip merge queue and notify for review
-		sourceIssueForNoMerge, err := bd.Show(issueID)
-		if err == nil {
+		{
 			attachmentFields := beads.ParseAttachmentFields(sourceIssueForNoMerge)
 			if attachmentFields != nil && attachmentFields.NoMerge {
 				fmt.Printf("%s No-merge mode: skipping merge queue\n", style.Bold.Render("→"))
@@ -997,7 +1405,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 						}
 					}
 					// Add diff stat for quick review context
-					if diffStat, diffErr := g.DiffStat(defaultBranch + "..." + branch); diffErr == nil && diffStat != "" {
+					if diffStat, diffErr := g.DiffStat(baseRef + "..." + branch); diffErr == nil && diffStat != "" {
 						prBodyBuilder.WriteString("## Changes\n\n```\n")
 						prBodyBuilder.WriteString(diffStat)
 						prBodyBuilder.WriteString("```\n\n")
@@ -1048,7 +1456,15 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 				// here after notifying the dispatcher. Otherwise hooked work remains open.
 				if issueID != "" {
 					canCloseIssue := true
-					if attachmentFields.AttachedMolecule != "" {
+					if skipReason, fatal := doneSourceCloseSkipReason(bd, issueID, sourceIssueForNoMerge); skipReason != "" {
+						style.PrintWarning("%s", skipReason)
+						notifyDoneCloseSkipped(townRoot, rigName, sender, issueID, skipReason)
+						if fatal {
+							return fmt.Errorf("cannot complete review-only/no-merge work: %s", skipReason)
+						}
+						canCloseIssue = false
+					}
+					if canCloseIssue && attachmentFields.AttachedMolecule != "" {
 						if n := closeDescendants(bd, attachmentFields.AttachedMolecule); n > 0 {
 							fmt.Fprintf(os.Stderr, "Closed %d molecule step(s) for %s\n", n, attachmentFields.AttachedMolecule)
 						}
@@ -1084,64 +1500,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			}
 		}
 
-		// Fallback: check if issue belongs to a direct-merge convoy that the
-		// primary check (line ~483) missed — e.g., issues dispatched before the
-		// attachment-field fix, or where dep-based lookup failed at that point.
-		// At this stage the branch was pushed to origin/<branch> (feature branch),
-		// NOT to main. So we must push to main now before skipping MR creation.
-		convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
-		if convoyInfo == nil {
-			convoyInfo = getConvoyInfoForIssue(issueID)
-		}
-		if convoyInfo != nil && convoyInfo.MergeStrategy == "direct" {
-			fmt.Printf("%s Late-detected direct merge strategy: pushing to %s\n", style.Bold.Render("→"), defaultBranch)
-			fmt.Printf("  Convoy: %s\n", convoyInfo.ID)
-
-			// Push branch directly to main (the earlier push went to origin/<branch>)
-			directRefspec := branch + ":" + defaultBranch
-			directPushErr := g.Push("origin", directRefspec, false)
-			if directPushErr != nil {
-				// Direct push failed — fall through to normal MR creation
-				style.PrintWarning("late direct push to %s failed: %v — falling through to MR", defaultBranch, directPushErr)
-			} else {
-				lateDirectCommitSHA, _ := g.Rev("HEAD")
-				if doneSkipVerify {
-					noteVerifiedPushSkipped(cwd, issueID, defaultBranch, lateDirectCommitSHA, "--skip-verify on late direct merge")
-				} else if verifyErr := g.VerifyPushedCommit("origin", defaultBranch, lateDirectCommitSHA); verifyErr != nil {
-					pushFailed = true
-					errMsg := verifyErr.Error()
-					doneErrors = append(doneErrors, errMsg)
-					noteVerifiedPushFailure(cwd, issueID, defaultBranch, lateDirectCommitSHA, verifyErr)
-					style.PrintWarning("%s\nLate direct merge pushed but remote verification failed. Source bead will remain in progress.", errMsg)
-					goto notifyWitness
-				}
-				fmt.Printf("%s Branch pushed directly to %s\n", style.Bold.Render("✓"), defaultBranch)
-				doneCleanupStatus = cleanupStatusAfterSuccessfulPush(doneCleanupStatus)
-
-				// Close the issue directly — refinery won't process it.
-				if issueID != "" {
-					var closeErr error
-					for attempt := 1; attempt <= 3; attempt++ {
-						closeErr = bd.ForceCloseWithReason(
-							fmt.Sprintf("Direct merge to %s (convoy strategy, late detection)", defaultBranch), issueID)
-						if closeErr == nil {
-							fmt.Printf("%s Issue %s closed (direct merge)\n", style.Bold.Render("✓"), issueID)
-							break
-						}
-						if attempt < 3 {
-							style.PrintWarning("close attempt %d/3 failed: %v (retrying in %ds)", attempt, closeErr, attempt*2)
-							time.Sleep(time.Duration(attempt*2) * time.Second)
-						}
-					}
-					if closeErr != nil {
-						style.PrintWarning("could not close issue %s after 3 attempts: %v", issueID, closeErr)
-					}
-				}
-
-				goto notifyWitness
-			}
-		}
-
 		// Determine target branch for the MR.
 		// Priority: explicit --target flag > formula_vars base_branch > integration branch auto-detect > rig default.
 		target := defaultBranch
@@ -1166,11 +1524,6 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 					fmt.Printf("  Target branch override: %s (from formula_vars)\n", target)
 				}
 			}
-		} else if !explicitTarget && target == defaultBranch && sourceIssueForNoMerge == nil && issueID != "" {
-			// sourceIssueForNoMerge is nil — bd.Show(issueID) failed earlier.
-			// This is the silent failure path that caused 150+ procedure beads to
-			// target main instead of feat/contract-review-procedure.
-			style.PrintWarning("could not load source issue %s for target branch detection (Dolt/beads lookup failed) — using default branch %s", issueID, defaultBranch)
 		}
 
 		// 3. Auto-detect integration branch from epic hierarchy (if enabled).
@@ -1194,12 +1547,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 		if donePriority >= 0 {
 			priority = donePriority
 		} else {
-			sourceIssue, err := bd.Show(issueID)
-			if err != nil {
-				priority = 2 // Default
-			} else {
-				priority = sourceIssue.Priority
-			}
+			priority = sourceIssueForNoMerge.Priority
 		}
 
 		// Pre-declare for checkpoint goto (gt-aufru)
@@ -1222,6 +1570,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			if cpMR, cpErr := bd.Show(cpMRID); cpErr == nil && cpMR != nil {
 				branchPrefix := "branch: " + branch + "\n"
 				if strings.HasPrefix(cpMR.Description, branchPrefix) {
+					if err := validateMergeRequestSource(bd, cpMR, issueID); err != nil {
+						mrFailed = true
+						errMsg := fmt.Sprintf("checkpoint MR validation failed: %v", err)
+						doneErrors = append(doneErrors, errMsg)
+						style.PrintWarning("%s\nBranch is pushed but MR bead not trusted. Witness will be notified.", errMsg)
+						goto notifyWitness
+					}
 					mrID = cpMRID
 					fmt.Printf("%s MR already created (resumed from checkpoint: %s)\n", style.Bold.Render("✓"), mrID)
 					goto afterMR
@@ -1245,6 +1600,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 
 		if existingMR != nil {
 			// MR already exists with same branch AND commit — true idempotent retry
+			if err := validateMergeRequestSource(bd, existingMR, issueID); err != nil {
+				mrFailed = true
+				errMsg := fmt.Sprintf("existing MR validation failed: %v", err)
+				doneErrors = append(doneErrors, errMsg)
+				style.PrintWarning("%s\nBranch is pushed but existing MR bead not trusted. Witness will be notified.", errMsg)
+				goto notifyWitness
+			}
 			mrID = existingMR.ID
 			fmt.Printf("%s MR already exists (idempotent)\n", style.Bold.Render("✓"))
 			fmt.Printf("  MR ID: %s\n", style.Bold.Render(mrID))
@@ -1276,12 +1638,13 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			if donePreVerified {
 				description += "\npre_verified: true"
 				description += fmt.Sprintf("\npre_verified_at: %s", time.Now().UTC().Format(time.RFC3339))
-				// Capture current origin/target HEAD as the verified base.
+				// Capture current clean target HEAD as the verified base.
 				// The polecat rebased onto this SHA before running gates.
-				if verifiedBase, baseErr := g.Rev("origin/" + target); baseErr == nil {
+				verifiedBaseRef := g.CleanBaseRef("origin", defaultBranch, target)
+				if verifiedBase, baseErr := g.Rev(verifiedBaseRef); baseErr == nil {
 					description += fmt.Sprintf("\npre_verified_base: %s", verifiedBase)
 				} else {
-					style.PrintWarning("could not resolve origin/%s for pre-verified base: %v (pre-verification data incomplete)", target, baseErr)
+					style.PrintWarning("could not resolve %s for pre-verified base: %v (pre-verification data incomplete)", verifiedBaseRef, baseErr)
 				}
 			}
 
@@ -1368,7 +1731,7 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			// GH#2599: Back-link source issue to MR bead for discoverability.
 			if issueID != "" {
 				comment := fmt.Sprintf("MR created: %s", mrID)
-				if _, err := bd.Run("comments", "add", issueID, comment); err != nil {
+				if err := bd.AddComment(issueID, comment); err != nil {
 					style.PrintWarning("could not back-link source issue %s to MR %s: %v", issueID, mrID, err)
 				}
 			}
@@ -1452,8 +1815,11 @@ notifyWitness:
 		style.PrintWarning("could not log feed event: %v", err)
 	}
 
-	// Update agent bead state (ZFC: self-report completion)
-	updateAgentStateOnDone(cwd, townRoot, exitType, issueID)
+	// Update agent bead state (ZFC: self-report completion). If push/MR failed,
+	// keep the hook intact so Witness can recover the still-open work.
+	if err := updateAgentStateAfterSubmission(cwd, townRoot, exitType, issueID, pushFailed, mrFailed); err != nil {
+		return err
+	}
 
 	// Nudge witness only after hook/cleanup state is updated. Otherwise witness can
 	// evaluate slot availability against stale hook_bead or cleanup_status and emit
@@ -1461,38 +1827,15 @@ notifyWitness:
 	nudgeWitness(rigName, fmt.Sprintf("POLECAT_DONE %s exit=%s", polecatName, exitType))
 	fmt.Printf("%s Witness notified of %s (via nudge)\n", style.Bold.Render("✓"), exitType)
 
-	// Persistent polecat model (gt-hdf8): polecats transition to IDLE after completion.
-	// Session stays alive, sandbox preserved, worktree synced to main for reuse.
-	// "done means idle" - not "done means dead".
+	// Clean successful polecats are retired after durable handoff. Preserve the
+	// feature branch and metadata; Witness/refinery cleanup owns the sandbox.
 	isPolecat := false
+	retirePolecat := false
 	if roleInfo, err := GetRoleWithContext(cwd, townRoot); err == nil && roleInfo.Role == RolePolecat {
 		isPolecat = true
 
-		fmt.Printf("%s Sandbox preserved for reuse (persistent polecat)\n", style.Bold.Render("✓"))
-
 		if pushFailed || mrFailed {
 			fmt.Printf("%s Work needs recovery (push or MR failed) — session preserved\n", style.Bold.Render("⚠"))
-		}
-
-		// Sync worktree to main so the polecat is ready for new assignments.
-		// Phase 3 of persistent-polecat-pool: DONE→IDLE syncs to main and deletes old branch.
-		// Non-fatal: if sync fails, the polecat is still IDLE and the Witness
-		// or next gt sling can handle the branch state.
-		//
-		// GUARD (gt-pvx): Refuse to sync if uncommitted changes remain.
-		// If the auto-commit safety net above failed (git add/commit error),
-		// switching branches would discard the work. Better to leave the worktree
-		// dirty on the feature branch so work can be recovered.
-		syncSafe := true
-		if cwdAvailable {
-			if ws, wsErr := g.CheckUncommittedWork(); wsErr != nil {
-				syncSafe = false
-				style.PrintWarning("could not inspect worktree before idle sync: %v — skipping sync to preserve work", wsErr)
-			} else if ws.HasUncommittedChanges && !ws.CleanExcludingRuntime() {
-				syncSafe = false
-				style.PrintWarning("uncommitted changes still present — skipping worktree sync to preserve work")
-				fmt.Printf("  Files: %s\n", ws.String())
-			}
 		}
 		if exitType == ExitCompleted && issueID != "" && convoyInfo == nil {
 			convoyInfo = getConvoyInfoFromIssue(issueID, cwd)
@@ -1504,37 +1847,12 @@ notifyWitness:
 		if convoyInfo != nil {
 			mergeStrategy = convoyInfo.MergeStrategy
 		}
-		if cwdAvailable && shouldSyncIdlePolecatWorktree(exitType, mergeStrategy, pushFailed, mrFailed, syncSafe) {
-			// Remember the old branch so we can delete it after switching
-			oldBranch := branch
-
-			fmt.Printf("%s Syncing worktree to %s...\n", style.Bold.Render("→"), defaultBranch)
-			syncRef := "origin/" + defaultBranch
-			if err := g.Fetch("origin"); err != nil {
-				style.PrintWarning("could not fetch origin before idle sync: %v (using local refs)", err)
-			}
-			if err := g.CheckoutDetach(syncRef); err != nil {
-				if fallbackErr := g.CheckoutDetach(defaultBranch); fallbackErr != nil {
-					style.PrintWarning("could not detach checkout %s: %v; fallback %s also failed: %v (worktree stays on feature branch)", syncRef, err, defaultBranch, fallbackErr)
-				} else {
-					fmt.Printf("%s Worktree synced to %s (detached fallback)\n", style.Bold.Render("✓"), defaultBranch)
-				}
-			} else {
-				fmt.Printf("%s Worktree synced to %s (detached)\n", style.Bold.Render("✓"), syncRef)
-			}
-
-			// Delete the old polecat branch (non-fatal: cleanup only).
-			// This prevents stale branch accumulation from persistent polecats.
-			if oldBranch != "" && oldBranch != defaultBranch && oldBranch != "master" {
-				if err := g.DeleteBranch(oldBranch, true); err != nil {
-					style.PrintWarning("could not delete old branch %s: %v", oldBranch, err)
-				} else {
-					fmt.Printf("%s Deleted old branch %s\n", style.Bold.Render("✓"), oldBranch)
-				}
-			}
+		retirePolecat = shouldRetirePolecatSessionAfterDone(exitType, mergeStrategy, pushFailed, mrFailed)
+		if retirePolecat {
+			fmt.Printf("%s Polecat session retiring after durable handoff\n", style.Bold.Render("✓"))
+		} else {
+			fmt.Printf("%s Session preserved for recovery or local review\n", style.Bold.Render("→"))
 		}
-
-		fmt.Printf("%s Polecat transitioned to IDLE — ready for new work\n", style.Bold.Render("✓"))
 	}
 
 	fmt.Println()
@@ -1543,33 +1861,24 @@ notifyWitness:
 		fmt.Printf("  Witness will handle cleanup.\n")
 	}
 
-	// Self-terminate AFTER all cleanup is complete (opt-in via config).
-	// When enabled, polecats kill their session after gt done finishes
-	// instead of transitioning to IDLE. This gives fresh context windows
-	// per task, reduces token waste, and eliminates stale state bugs.
-	// Must be the LAST thing gt done does — everything above must complete first.
-	if isPolecat {
-		daemonCfg := config.LoadOperationalConfig(townRoot).GetDaemonConfig()
-		if daemonCfg.PolecatSelfTerminate != nil && *daemonCfg.PolecatSelfTerminate {
-			fmt.Printf("%s Self-terminating session (polecat_self_terminate=true)\n", style.Bold.Render("✓"))
-			sessionName := session.PolecatSessionName(session.PrefixFor(rigName), polecatName)
-			go func() {
-				time.Sleep(3 * time.Second)
-				t := tmux.NewTmux()
-				_ = t.KillSessionWithProcesses(sessionName)
-			}()
+	// Retire the live session as the final action. The PID exclusion prevents
+	// killing gt done before all metadata and notifications above are written.
+	if retirePolecat {
+		fmt.Printf("%s Terminating polecat session\n", style.Bold.Render("→"))
+		if err := retirePolecatSessionAfterDone(rigName, polecatName, os.Getpid()); err != nil {
+			style.PrintWarning("could not terminate polecat session: %v", err)
 		}
 	}
 
 	return nil
 }
 
-// pushSubmoduleChanges detects submodules modified between origin/defaultBranch
+// pushSubmoduleChanges detects submodules modified between baseRef
 // and HEAD, and pushes each submodule's new commit to its remote before the
 // parent repo push. This prevents the parent's submodule pointer from
 // referencing commits that don't exist on the submodule's remote (gt-dzs).
-func pushSubmoduleChanges(g *git.Git, defaultBranch string) {
-	subChanges, err := g.SubmoduleChanges("origin/"+defaultBranch, "HEAD")
+func pushSubmoduleChanges(g *git.Git, baseRef string) {
+	subChanges, err := g.SubmoduleChanges(baseRef, "HEAD")
 	if err != nil {
 		// Non-fatal: repos without submodules return nil, nil.
 		// Only warn if the error is real (not just "no submodules").
@@ -1645,7 +1954,7 @@ func noteVerifiedPushFailure(cwd, issueID, branch, commit string, verifyErr erro
 	inProgress := "in_progress"
 	_ = bd.Update(issueID, beads.UpdateOptions{Status: &inProgress})
 	msg := fmt.Sprintf("verified_push_failed: commit %s not verified on origin/%s: %v", commit, branch, verifyErr)
-	_, _ = bd.Run("comments", "add", issueID, msg)
+	_ = bd.AddComment(issueID, msg)
 }
 
 func noteVerifiedPushSkipped(cwd, issueID, branch, commit, reason string) {
@@ -1653,7 +1962,7 @@ func noteVerifiedPushSkipped(cwd, issueID, branch, commit, reason string) {
 		return
 	}
 	msg := fmt.Sprintf("verified_push_skipped: commit %s branch origin/%s reason=%s", commit, branch, reason)
-	_, _ = beads.New(cwd).Run("comments", "add", issueID, msg)
+	_ = beads.New(cwd).AddComment(issueID, msg)
 }
 
 func verifyPushedCommitWithBareFallback(g *git.Git, townRoot, rigName, branch, commit string) error {
@@ -1814,16 +2123,16 @@ func clearDoneCheckpoints(bd *beads.Beads, agentBeadID string) {
 // Uses issueID directly to find the hooked bead instead of reading the agent bead's
 // hook_bead slot (hq-l6mm5: direct bead tracking).
 //
-// Per gt-zecmc: observable states ("done", "idle") removed - use tmux to discover.
-// Non-observable states ("stuck", "awaiting-gate") are still set since they represent
-// intentional agent decisions that can't be observed from tmux.
+// Clean completions use "done" to prevent dead completed sessions from
+// re-entering the idle reuse pool before witness/refinery cleanup finishes.
+// Escalated/deferred exits use "stuck" because they need recovery.
 //
 // Also self-reports cleanup_status for ZFC compliance (#10).
 //
 // BUG FIX (hq-3xaxy): This function must be resilient to working directory deletion.
 // If the polecat's worktree is deleted before gt done finishes, we use env vars as fallback.
 // All errors are warnings, not failures - gt done must complete even if bead ops fail.
-func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
+func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) error {
 	// Get role context - try multiple sources for resilience
 	roleInfo, err := GetRoleWithContext(cwd, townRoot)
 	if err != nil {
@@ -1836,7 +2145,7 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 		if envRole == "" || envRig == "" {
 			// Can't determine role, skip agent state update
 			style.PrintWarning("could not determine role for agent state update (env: GT_ROLE=%q, GT_RIG=%q)", envRole, envRig)
-			return
+			return nil
 		}
 
 		// Parse role string to get Role type
@@ -1863,7 +2172,7 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 	agentBeadID := getAgentBeadID(ctx)
 	if agentBeadID == "" {
 		style.PrintWarning("no agent bead ID found for %s/%s, skipping agent state update", ctx.Rig, ctx.Polecat)
-		return
+		return nil
 	}
 
 	// Use rig path for bd commands.
@@ -1915,6 +2224,16 @@ func updateAgentStateOnDone(cwd, townRoot, exitType, issueID string) {
 			// infrastructure. Skip close and fall through to idle state update.
 			if beads.HasLabel(hookedBead, "gt:rig") {
 				fmt.Fprintf(os.Stderr, "Note: hooked bead %s is a rig identity bead (gt:rig) — skipping close\n", hookedBeadID)
+				goto doneStateUpdate
+			}
+
+			if skipReason, fatal := doneSourceCloseSkipReason(bd, hookedBeadID, hookedBead); skipReason != "" {
+				style.PrintWarning("%s", skipReason)
+				fmt.Fprintf(os.Stderr, "  The bead will remain open for witness/mayor review.\n")
+				notifyDoneCloseSkipped(townRoot, ctx.Rig, detectSender(), hookedBeadID, skipReason)
+				if fatal {
+					return fmt.Errorf("cannot complete hooked work: %s", skipReason)
+				}
 				goto doneStateUpdate
 			}
 
@@ -1977,14 +2296,10 @@ doneStateUpdate:
 	// Best-effort: failures are non-fatal since the work is already done.
 	purgeClosedEphemeralBeads(bd)
 
-	// Self-managed completion (gt-1qlg, polecat-self-managed-completion.md Phase 2):
-	// Polecat sets agent_state=idle directly, skipping the intermediate "done" state.
-	// The witness is no longer in the critical path for routine completions.
 	// Completion metadata (exit_type, MR ID, branch) remains on the agent bead
 	// for audit purposes and anomaly detection by witness patrol.
-	// Exception: ESCALATED exits use "stuck" — the polecat needs help.
-	doneState := "idle"
-	if exitType == ExitEscalated {
+	doneState := string(beads.AgentStateDone)
+	if exitType != ExitCompleted {
 		doneState = "stuck"
 	}
 	// Use UpdateAgentState to sync both column and description (gt-ulom).
@@ -2009,6 +2324,7 @@ doneStateUpdate:
 	// lingering labels to detect the zombie and resume from checkpoints.
 	clearDoneIntentLabel(agentBd, agentBeadID)
 	clearDoneCheckpoints(agentBd, agentBeadID)
+	return nil
 }
 
 // ensureAgentBeadExists recreates a missing agent bead so done-intent labels,
@@ -2215,11 +2531,9 @@ func isPolecatActor(actor string) bool {
 // and a cleanup commit is created.
 //
 // Returns true if a cleanup commit was created.
-func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
-	originRef := "origin/" + defaultBranch
-
-	// Check which files changed on this branch vs origin/main
-	changedFiles, err := g.DiffNameOnly(originRef, "HEAD")
+func stripOverlayCLAUDEmd(g *git.Git, defaultBranch, baseRef string) bool {
+	// Check which files changed on this branch vs the clean target base.
+	changedFiles, err := g.DiffNameOnly(baseRef, "HEAD")
 	if err != nil {
 		// Can't determine diff — skip silently (push will still work)
 		return false
@@ -2247,10 +2561,10 @@ func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
 		// Read current CLAUDE.md from HEAD
 		currentContent, showErr := g.ShowFile("HEAD", "CLAUDE.md")
 		if showErr == nil && strings.Contains(currentContent, templates.PolecatLifecycleMarker) {
-			// Current CLAUDE.md has overlay content — restore from origin
-			origContent, origErr := g.ShowFile(originRef, "CLAUDE.md")
+			// Current CLAUDE.md has overlay content — restore from the clean base.
+			origContent, origErr := g.ShowFile(baseRef, "CLAUDE.md")
 			if origErr != nil {
-				// CLAUDE.md didn't exist on origin/main — the overlay created it.
+				// CLAUDE.md didn't exist on the clean base — the overlay created it.
 				// Remove it from tracking.
 				if rmErr := g.RmCached("CLAUDE.md"); rmErr == nil {
 					needsCommit = true
@@ -2258,9 +2572,9 @@ func stripOverlayCLAUDEmd(g *git.Git, defaultBranch string) bool {
 						style.Bold.Render("→"), defaultBranch)
 				}
 			} else {
-				// CLAUDE.md existed on origin — restore original content
+				// CLAUDE.md existed on the clean base — restore original content
 				_ = origContent // Restore via checkout
-				if coErr := g.CheckoutFileFromRef(originRef, "CLAUDE.md"); coErr == nil {
+				if coErr := g.CheckoutFileFromRef(baseRef, "CLAUDE.md"); coErr == nil {
 					if addErr := g.Add("CLAUDE.md"); addErr == nil {
 						needsCommit = true
 						fmt.Printf("%s Restored original CLAUDE.md (stripped Gas Town overlay)\n",

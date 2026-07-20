@@ -282,6 +282,7 @@ func New(config *Config) (*Daemon, error) {
 			logger.Printf("Set env %s=%s from daemon.json", k, v)
 		}
 	}
+	agentconfig.ApplyConfiguredDoltEnv(config.TownRoot)
 
 	// Load disabled_patrols from town settings (settings/config.json).
 	// This provides a simpler way to disable patrols than editing daemon.json.
@@ -299,17 +300,11 @@ func New(config *Config) (*Daemon, error) {
 	if patrolConfig != nil && patrolConfig.Patrols != nil && patrolConfig.Patrols.DoltServer != nil {
 		doltServer = NewDoltServerManager(config.TownRoot, patrolConfig.Patrols.DoltServer, logger.Printf)
 		if doltServer.IsEnabled() {
-			logger.Printf("Dolt server management enabled (port %d)", patrolConfig.Patrols.DoltServer.Port)
+			logger.Printf("Dolt server management enabled (port %d)", doltServer.config.Port)
 			// Propagate Dolt connection info to process env so AgentEnv() passes it to
 			// all spawned agent sessions. Without this, bd in agent sessions
 			// auto-starts rogue Dolt instances or connects to localhost. (GH#2412)
-			portStr := strconv.Itoa(patrolConfig.Patrols.DoltServer.Port)
-			os.Setenv("GT_DOLT_PORT", portStr)
-			os.Setenv("BEADS_DOLT_PORT", portStr)
-			if patrolConfig.Patrols.DoltServer.Host != "" {
-				os.Setenv("GT_DOLT_HOST", patrolConfig.Patrols.DoltServer.Host)
-				os.Setenv("BEADS_DOLT_SERVER_HOST", patrolConfig.Patrols.DoltServer.Host)
-			}
+			applyDoltServerConfigEnv(doltServer.config)
 		}
 	}
 
@@ -317,24 +312,24 @@ func New(config *Config) (*Daemon, error) {
 	// started independently of gt up), detect the port from dolt config.
 	// This ensures AgentEnv() always has the port for spawned sessions. (GH#2412)
 	if os.Getenv("GT_DOLT_PORT") == "" {
-		doltCfg := doltserver.DefaultConfig(config.TownRoot)
-		if doltCfg.Port > 0 {
-			portStr := strconv.Itoa(doltCfg.Port)
+		if port := agentconfig.ResolveConfiguredDoltPort(config.TownRoot); port > 0 {
+			portStr := strconv.Itoa(port)
 			os.Setenv("GT_DOLT_PORT", portStr)
+			os.Setenv("BEADS_DOLT_SERVER_PORT", portStr)
 			os.Setenv("BEADS_DOLT_PORT", portStr)
-			logger.Printf("Set GT_DOLT_PORT=%s from Dolt config (fallback)", portStr)
+			logger.Printf("Set GT_DOLT_PORT=%s from resolved Dolt config (fallback)", portStr)
 		}
+	} else {
+		portStr := os.Getenv("GT_DOLT_PORT")
+		os.Setenv("BEADS_DOLT_SERVER_PORT", portStr)
+		os.Setenv("BEADS_DOLT_PORT", portStr)
 	}
 
 	// Propagate Dolt host to process env so bd doesn't fall back to 127.0.0.1
-	// when the server runs on a remote machine (e.g., mini2 over Tailscale).
-	if os.Getenv("BEADS_DOLT_SERVER_HOST") == "" {
-		doltCfg := doltserver.DefaultConfig(config.TownRoot)
-		if doltCfg.Host != "" {
-			os.Setenv("BEADS_DOLT_SERVER_HOST", doltCfg.Host)
-			logger.Printf("Set BEADS_DOLT_SERVER_HOST=%s from Dolt config", doltCfg.Host)
-		}
-	}
+	// when the server runs on a remote machine. BEADS_DOLT_SERVER_HOST is a
+	// derived alias, not an authority, so stale inherited values are replaced or
+	// removed here.
+	applyConfiguredDoltHostEnv(config.TownRoot, logger.Printf)
 
 	// PATCH-006: Resolve binary paths at startup.
 	gtPath, err := exec.LookPath("gt")
@@ -402,6 +397,37 @@ func New(config *Config) (*Daemon, error) {
 		rigPool:         newRigWorkerPool(0, 0, logger), // defaults: 10 workers, 30s timeout
 	}
 	return d, nil
+}
+
+func applyDoltServerConfigEnv(config *DoltServerConfig) {
+	if config == nil {
+		return
+	}
+	if config.Port > 0 {
+		portStr := strconv.Itoa(config.Port)
+		os.Setenv("GT_DOLT_PORT", portStr)
+		os.Setenv("BEADS_DOLT_SERVER_PORT", portStr)
+		os.Setenv("BEADS_DOLT_PORT", portStr)
+	}
+	if config.Host != "" {
+		os.Setenv("GT_DOLT_HOST", config.Host)
+		os.Setenv("BEADS_DOLT_SERVER_HOST", config.Host)
+	}
+}
+
+func applyConfiguredDoltHostEnv(townRoot string, logf func(format string, v ...interface{})) {
+	if host := agentconfig.ResolveConfiguredDoltHost(townRoot); host != "" {
+		os.Setenv("GT_DOLT_HOST", host)
+		os.Setenv("BEADS_DOLT_SERVER_HOST", host)
+		if logf != nil {
+			logf("Set BEADS_DOLT_SERVER_HOST=%s from resolved Dolt host", host)
+		}
+		return
+	}
+	if _, _, ok := agentconfig.ManagedDoltEndpoint(townRoot); ok {
+		os.Unsetenv("GT_DOLT_HOST")
+	}
+	os.Unsetenv("BEADS_DOLT_SERVER_HOST")
 }
 
 func (d *Daemon) cleanupLegacySocketSessions() {
@@ -1797,6 +1823,20 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 		}
 		return
 	}
+	if stop, err := refinery.ActiveSafetyStop(d.config.TownRoot, rigName); err != nil {
+		d.logger.Printf("Skipping refinery auto-start for %s: cannot verify safety stop: %v", rigName, err)
+		return
+	} else if stop != nil {
+		d.logger.Printf("Skipping refinery auto-start for %s: %s", rigName, stop.Reason())
+		name := session.RefinerySessionName(session.PrefixFor(rigName))
+		if exists, _ := d.tmux.HasSession(name); exists {
+			d.logger.Printf("Killing leftover refinery %s (%s)", name, stop.Reason())
+			if err := d.tmux.KillSessionWithProcesses(name); err != nil {
+				d.logger.Printf("Error killing leftover refinery %s: %v", name, err)
+			}
+		}
+		return
+	}
 
 	// Event gate: don't spawn a new Claude session when there's nothing to process.
 	// If a refinery session is already running, Start() returns ErrAlreadyRunning (cheap).
@@ -1831,9 +1871,17 @@ func (d *Daemon) ensureRefineryRunning(rigName string) {
 	// See: daemon.log "is hung (no activity for 30m0s), killing for restart"
 
 	if err := mgr.Start(false, ""); err != nil {
-		if err == refinery.ErrAlreadyRunning {
+		if errors.Is(err, refinery.ErrAlreadyRunning) {
 			// Already running - this is the expected case when fix is working
 			d.logger.Printf("Refinery for %s already running, skipping spawn", rigName)
+			return
+		}
+		if errors.Is(err, refinery.ErrSafetyStopped) {
+			d.logger.Printf("Skipping refinery auto-start for %s: %v", rigName, err)
+			return
+		}
+		if errors.Is(err, refinery.ErrForkRig) {
+			d.logger.Printf("Skipping refinery auto-start for %s: %v", rigName, err)
 			return
 		}
 		d.logger.Printf("Error starting refinery for %s: %v", rigName, err)

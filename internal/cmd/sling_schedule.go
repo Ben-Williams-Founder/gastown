@@ -9,7 +9,6 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
-	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/scheduler/capacity"
@@ -104,8 +103,11 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 	// Create the sling context in the target rig's beads dir so that the target
 	// rig's witness can discover it during patrol. Previously this used the HQ
 	// beads dir, which meant non-HQ rig witnesses never saw the context. (GH#3468)
-	rigBeadsDir := doltserver.FindRigBeadsDir(townRoot, rigName)
-	rigBeads := beads.NewWithBeadsDir(townRoot, rigBeadsDir)
+	rigBeadsDir, ok := beads.ResolveRepoAliasBeadsDir(townRoot, rigName)
+	if !ok {
+		return fmt.Errorf("cannot resolve target rig %q beads database for bead %s", rigName, beadID)
+	}
+	rigBeads := beads.NewWithBeadsDir(filepath.Dir(rigBeadsDir), rigBeadsDir)
 	existingCtx, _, findErr := rigBeads.FindOpenSlingContext(beadID)
 	if findErr != nil {
 		return fmt.Errorf("checking for existing sling context: %w", findErr)
@@ -131,7 +133,7 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 	}
 
 	if opts.Formula != "" {
-		if err := verifyFormulaExists(opts.Formula); err != nil {
+		if err := verifyFormulaExists(opts.Formula, filepath.Dir(rigBeadsDir), townRoot); err != nil {
 			return fmt.Errorf("formula %q not found: %w", opts.Formula, err)
 		}
 	}
@@ -254,6 +256,7 @@ func runBatchSchedule(beadIDs []string, rigName, townRoot string) error {
 			DryRun:       false,
 			Force:        slingForce,
 			NoMerge:      slingNoMerge,
+			ReviewOnly:   slingReviewOnly,
 			Account:      slingAccount,
 			Agent:        slingAgent,
 			HookRawBead:  slingHookRawBead,
@@ -320,20 +323,11 @@ func resolveFormula(explicit string, hookRawBead bool, townRoot, rigName string)
 	return "mol-polecat-work"
 }
 
-// slingContextTTL is the maximum age of a sling context before it's considered
-// stale and ignored by areScheduled(). This prevents orphaned sling contexts
-// (from failed spawns or throttled dispatches) from permanently blocking tasks.
-// See GH#2279.
-const slingContextTTL = 30 * time.Minute
-
 // areScheduled returns a set of bead IDs that have open sling contexts.
 // Scans all rig beads dirs since sling contexts are created in the target
 // rig's beads dir (GH#3468). On error, fails closed: treats ALL requested
 // beads as scheduled to prevent false stranded detection and duplicate
 // scheduling attempts.
-//
-// Sling contexts older than slingContextTTL are ignored — they are likely
-// orphans from failed spawn attempts (GH#2279).
 func areScheduled(beadIDs []string) map[string]bool {
 	result := make(map[string]bool)
 	if len(beadIDs) == 0 {
@@ -350,22 +344,18 @@ func areScheduled(beadIDs []string) map[string]bool {
 	}
 
 	// Scan all rig beads dirs (sling contexts live in target rig's DB). (GH#3468)
-	contexts := listAllSlingContexts(townRoot)
-
-	// Build lookup of work bead IDs from open contexts, skipping stale ones.
-	scheduledWorkBeads := make(map[string]bool)
-	now := time.Now()
-	for _, ctx := range contexts {
-		// Skip stale sling contexts (GH#2279): contexts older than the TTL
-		// are likely orphans from failed spawn attempts. Ignoring them allows
-		// the task to appear as "ready" again for re-dispatch.
-		if ctx.CreatedAt != "" {
-			if created, err := time.Parse(time.RFC3339, ctx.CreatedAt); err == nil {
-				if now.Sub(created) > slingContextTTL {
-					continue
-				}
-			}
+	contexts, err := listAllSlingContexts(townRoot)
+	if err != nil {
+		for _, id := range beadIDs {
+			result[id] = true
 		}
+		return result
+	}
+
+	// Build lookup of work bead IDs from open contexts. Cleanup owns stale-state
+	// closure; idempotency must not use a different definition of scheduled.
+	scheduledWorkBeads := make(map[string]bool)
+	for _, ctx := range contexts {
 		fields := beads.ParseSlingContextFields(ctx.Description)
 		if fields != nil {
 			scheduledWorkBeads[fields.WorkBeadID] = true
@@ -424,7 +414,7 @@ func detectSchedulerIDType(id string) (string, error) {
 // not convoy or epic mode.
 var schedulerTaskOnlyFlagNames = []string{
 	"account", "agent", "ralph", "args", "var",
-	"merge", "base-branch", "no-convoy", "owned", "no-merge",
+	"merge", "base-branch", "no-convoy", "owned", "no-merge", "review-only",
 }
 
 // validateNoTaskOnlySchedulerFlags checks that no task-only flags were set.

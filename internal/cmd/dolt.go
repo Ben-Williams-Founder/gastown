@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	gtconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/daemon"
 	"github.com/steveyegge/gastown/internal/doltserver"
 	"github.com/steveyegge/gastown/internal/style"
@@ -712,15 +713,15 @@ type beadsRuntimeConfig struct {
 	Port     int
 }
 
-func currentBeadsRuntimeConfig(townRoot string) (beadsRuntimeConfig, bool) {
+func currentBeadsRuntimeConfig() (beadsRuntimeConfig, bool) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return beadsRuntimeConfig{}, false
 	}
-	return readBeadsRuntimeConfig(beads.ResolveBeadsDir(cwd), townRoot)
+	return readBeadsRuntimeConfig(beads.ResolveBeadsDir(cwd))
 }
 
-func readBeadsRuntimeConfig(beadsDir, townRoot string) (beadsRuntimeConfig, bool) {
+func readBeadsRuntimeConfig(beadsDir string) (beadsRuntimeConfig, bool) {
 	metadataPath := filepath.Join(beadsDir, "metadata.json")
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
@@ -748,7 +749,14 @@ func readBeadsRuntimeConfig(beadsDir, townRoot string) (beadsRuntimeConfig, bool
 	}
 	port := metadata.DoltServerPort
 	if port == 0 {
-		port = doltserver.DefaultConfig(townRoot).Port
+		if data, err := os.ReadFile(filepath.Join(beadsDir, "dolt-server.port")); err == nil {
+			if parsed, err := strconv.Atoi(strings.TrimSpace(string(data))); err == nil && parsed > 0 {
+				port = parsed
+			}
+		}
+	}
+	if port == 0 {
+		port = doltserver.DefaultPort
 	}
 	database := metadata.DoltDatabase
 	if database == "" {
@@ -764,7 +772,7 @@ func readBeadsRuntimeConfig(beadsDir, townRoot string) (beadsRuntimeConfig, bool
 }
 
 func printBeadsRuntimeConfig(townRoot string) {
-	cfg, ok := currentBeadsRuntimeConfig(townRoot)
+	cfg, ok := currentBeadsRuntimeConfig()
 	if !ok {
 		return
 	}
@@ -789,7 +797,7 @@ func beadsScopeHint(database, townRoot string) string {
 		return ""
 	}
 
-	return fmt.Sprintf("    Gas Town town beads use database hq. Use `bd -C %s <cmd>` for hq-* beads; do not use `bd --global`, which targets Beads' beads_global database.\n", townRoot)
+	return fmt.Sprintf("    Gas Town town beads use database hq. Use `bd -C %s <cmd>` for hq-* beads; do not use `bd --global`, which targets Beads' beads_global database.\n", gtconfig.ShellQuote(townRoot))
 }
 
 func netJoinHostPort(host string, port int) string {

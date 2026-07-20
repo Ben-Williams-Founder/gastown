@@ -32,7 +32,34 @@ var (
 	ErrNotRunning     = errors.New("refinery not running")
 	ErrAlreadyRunning = errors.New("refinery already running")
 	ErrNoQueue        = errors.New("no items in queue")
+	ErrForkRig        = errors.New("refinery disabled for fork-backed rig")
 )
+
+// ForkRigError reports that refinery startup is disabled because the rig has
+// an upstream_url and must use the fork/PR workflow instead of local MQ merge.
+type ForkRigError struct {
+	RigName     string
+	UpstreamURL string
+}
+
+func (e *ForkRigError) Error() string {
+	if e == nil {
+		return ErrForkRig.Error()
+	}
+	if e.UpstreamURL == "" {
+		return fmt.Sprintf("%s %s", ErrForkRig, e.RigName)
+	}
+	return fmt.Sprintf("%s %s (upstream %s)", ErrForkRig, e.RigName, util.RedactURL(e.UpstreamURL))
+}
+
+func (e *ForkRigError) Unwrap() error {
+	return ErrForkRig
+}
+
+// NewForkRigError returns a typed startup-blocking fork-rig error.
+func NewForkRigError(rigName, upstreamURL string) error {
+	return &ForkRigError{RigName: rigName, UpstreamURL: upstreamURL}
+}
 
 // Manager handles refinery lifecycle and queue operations.
 type Manager struct {
@@ -111,12 +138,43 @@ func (m *Manager) Status() (*tmux.SessionInfo, error) {
 // The agentOverride parameter allows specifying an agent alias to use instead of the town default.
 // ZFC-compliant: no state file, tmux session is source of truth.
 func (m *Manager) Start(foreground bool, agentOverride string) error {
+	return m.start(foreground, agentOverride, false)
+}
+
+// StartAllowingForkRig starts the refinery even when the rig has upstream_url.
+// It bypasses only the fork guard; safety stops and all other gates still apply.
+func (m *Manager) StartAllowingForkRig(foreground bool, agentOverride string) error {
+	return m.start(foreground, agentOverride, true)
+}
+
+func (m *Manager) start(foreground bool, agentOverride string, allowForkRig bool) error {
 	t := tmux.NewTmux()
 	sessionID := m.SessionName()
 
 	if foreground {
 		// Foreground mode is deprecated - the Refinery agent handles merge processing
 		return fmt.Errorf("foreground mode is deprecated; use background mode (remove --foreground flag)")
+	}
+
+	if !allowForkRig {
+		if err := m.blockForkRigStart(t); err != nil {
+			return err
+		}
+	}
+
+	townRoot := filepath.Dir(m.rig.Path)
+	stop, err := ActiveSafetyStop(townRoot, m.rig.Name)
+	if err != nil {
+		return fmt.Errorf("checking refinery safety stop: %w", err)
+	}
+	if stop != nil {
+		if running, _ := t.HasSession(sessionID); running {
+			_, _ = fmt.Fprintf(m.output, "Refinery %s is safety-stopped; killing leftover session %s.\n", m.rig.Name, sessionID)
+			if err := t.KillSessionWithProcesses(sessionID); err != nil {
+				return fmt.Errorf("%w: killing leftover refinery session: %v", NewSafetyStoppedError(stop), err)
+			}
+		}
+		return NewSafetyStoppedError(stop)
 	}
 
 	// Check if session already exists
@@ -166,7 +224,6 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 
 	// Ensure runtime settings exist in the shared refinery parent directory.
 	// Settings are passed to Claude Code via --settings flag.
-	townRoot := filepath.Dir(m.rig.Path)
 
 	// Resolve CLAUDE_CONFIG_DIR from accounts.json so refinery sessions
 	// use the correct account. Mirrors the daemon restart path (lifecycle.go).
@@ -277,6 +334,37 @@ func (m *Manager) Start(foreground bool, agentOverride string) error {
 	return nil
 }
 
+// ForkRigStartError returns ErrForkRig when the rig config has upstream_url.
+// The derived config guard is the single runtime policy for fork-backed rigs.
+func (m *Manager) ForkRigStartError() error {
+	cfg, err := rig.LoadRigConfig(m.rig.Path)
+	if err != nil || cfg == nil || strings.TrimSpace(cfg.UpstreamURL) == "" {
+		return nil
+	}
+	return NewForkRigError(m.rig.Name, cfg.UpstreamURL)
+}
+
+// BlockForkRigStart applies the fork-rig startup guard and kills any leftover
+// refinery session that would otherwise keep processing a fork-backed rig.
+func (m *Manager) BlockForkRigStart() error {
+	return m.blockForkRigStart(tmux.NewTmux())
+}
+
+func (m *Manager) blockForkRigStart(t *tmux.Tmux) error {
+	err := m.ForkRigStartError()
+	if err == nil {
+		return nil
+	}
+	sessionID := m.SessionName()
+	if running, _ := t.HasSession(sessionID); running {
+		_, _ = fmt.Fprintf(m.output, "Refinery %s is disabled for fork-backed rig; killing leftover session %s.\n", m.rig.Name, sessionID)
+		if killErr := t.KillSessionWithProcesses(sessionID); killErr != nil {
+			return fmt.Errorf("%w: killing leftover refinery session: %v", err, killErr)
+		}
+	}
+	return err
+}
+
 // repairRefineryWorktree recreates a missing refinery/rig worktree from the
 // shared bare repo (.repo.git). The refinery worktree is created during
 // `gt rig add` but can be lost if `git worktree prune` runs, the directory
@@ -341,6 +429,7 @@ func (m *Manager) Queue() ([]QueueItem, error) {
 		Label:    "gt:merge-request",
 		Status:   "open",
 		Priority: -1, // No priority filter
+		Rig:      m.rig.Name,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("querying merge queue from beads: %w", err)
@@ -445,7 +534,7 @@ func (m *Manager) issueToMR(issue *beads.Issue) *MergeRequest {
 		return &MergeRequest{
 			ID:           issue.ID,
 			IssueID:      issue.ID,
-			Status:       MROpen,
+			Status:       mrStatusFromIssue(issue),
 			CreatedAt:    parseTime(issue.CreatedAt),
 			TargetBranch: defaultBranch,
 		}
@@ -461,12 +550,31 @@ func (m *Manager) issueToMR(issue *beads.Issue) *MergeRequest {
 		ID:           issue.ID,
 		Branch:       fields.Branch,
 		Worker:       fields.Worker,
+		AgentBead:    fields.AgentBead,
 		IssueID:      fields.SourceIssue,
 		TargetBranch: target,
+		CommitSHA:    fields.CommitSHA,
+		PRURL:        fields.PRURL,
+		PRNumber:     fields.PRNumber,
 		MergeCommit:  fields.MergeCommit,
-		Status:       MROpen,
+		Status:       mrStatusFromIssue(issue),
+		CloseReason:  CloseReason(fields.CloseReason),
 		CreatedAt:    parseTime(issue.CreatedAt),
 	}
+}
+
+func mrStatusFromIssue(issue *beads.Issue) MRStatus {
+	if issue == nil {
+		return MROpen
+	}
+	status := beads.IssueStatus(strings.TrimSpace(issue.Status))
+	if status.IsTerminal() {
+		return MRClosed
+	}
+	if status == "in_progress" {
+		return MRInProgress
+	}
+	return MROpen
 }
 
 // parseTime parses a time string, returning zero time on error.
@@ -537,6 +645,25 @@ func (m *Manager) FindMR(idOrBranch string) (*MergeRequest, error) {
 	return nil, ErrMRNotFound
 }
 
+func (m *Manager) findMRForTerminalCleanup(idOrBranch string, b *beads.Beads) (*MergeRequest, error) {
+	mr, err := m.FindMR(idOrBranch)
+	if err == nil {
+		return mr, nil
+	}
+	if !errors.Is(err, ErrMRNotFound) {
+		return nil, err
+	}
+
+	issue, showErr := b.Show(idOrBranch)
+	if showErr != nil {
+		return nil, err
+	}
+	if issue == nil || !beads.HasLabel(issue, "gt:merge-request") {
+		return nil, err
+	}
+	return m.issueToMR(issue), nil
+}
+
 // Retry is deprecated - the Refinery agent handles retry logic autonomously.
 // ZFC-compliant: no state file, agent uses beads issue status.
 // The agent will automatically retry failed MRs in its patrol cycle.
@@ -556,31 +683,41 @@ func (m *Manager) RegisterMR(_ *MergeRequest) error {
 // It closes the MR with rejected status and optionally notifies the worker.
 // Returns the rejected MR for display purposes.
 func (m *Manager) RejectMR(idOrBranch string, reason string, notify bool) (*MergeRequest, error) {
-	mr, err := m.FindMR(idOrBranch)
+	b := beads.New(m.rig.BeadsPath())
+	mr, err := m.findMRForTerminalCleanup(idOrBranch, b)
 	if err != nil {
 		return nil, err
 	}
 
-	// Verify MR is open or in_progress (can't reject already closed)
-	if mr.IsClosed() {
-		return nil, fmt.Errorf("%w: MR is already closed with reason: %s", ErrClosedImmutable, mr.CloseReason)
-	}
-
-	// Close the bead in storage with the rejection reason
-	b := beads.New(m.rig.BeadsPath())
-	if err := b.CloseWithReason("rejected: "+reason, mr.ID); err != nil {
+	closeResult, err := closeTerminalMR(b, mr.ID, terminalMRCloseOptions{
+		Reason:        "rejected: " + reason,
+		AgentBeadHint: mr.AgentBead,
+	})
+	if err != nil {
 		return nil, fmt.Errorf("failed to close MR bead: %w", err)
+	}
+	if closeResult.AgentBead != "" {
+		mr.AgentBead = closeResult.AgentBead
+	}
+	if closeResult.AgentActiveMRClearErr != nil {
+		_, _ = fmt.Fprintf(m.output, "Warning: failed to clear agent bead %s active_mr: %v\n", closeResult.AgentBead, closeResult.AgentActiveMRClearErr)
 	}
 
 	// Update in-memory state for return value
-	if err := mr.Close(CloseReasonRejected); err != nil {
-		// Non-fatal: bead is already closed, just log
-		_, _ = fmt.Fprintf(m.output, "Warning: failed to update MR state: %v\n", err)
+	if closeResult.Closed {
+		if err := mr.Close(CloseReasonRejected); err != nil {
+			// Non-fatal: bead is already closed, just log
+			_, _ = fmt.Fprintf(m.output, "Warning: failed to update MR state: %v\n", err)
+		}
+	} else if closeResult.AlreadyTerminal {
+		mr.Status = MRClosed
+	} else {
+		return nil, fmt.Errorf("failed to close MR bead: MR %s status is not open or terminal", mr.ID)
 	}
 	mr.Error = reason
 
 	// Optionally notify worker
-	if notify {
+	if notify && !closeResult.AlreadyTerminal {
 		m.notifyWorkerRejected(mr, reason)
 	}
 
@@ -600,54 +737,69 @@ type PostMergeResult struct {
 // It closes the MR bead and its source issue. Branch deletion is handled
 // by the caller since the Manager doesn't have git access.
 func (m *Manager) PostMerge(idOrBranch string) (*PostMergeResult, error) {
-	mr, err := m.FindMR(idOrBranch)
+	b := beads.New(m.rig.BeadsPath())
+	mr, err := m.findMRForTerminalCleanup(idOrBranch, b)
 	if err != nil {
 		return nil, err
 	}
+	workBeadID := resolveMergedWorkBead(b.ForAgentBead(), mergedWorkBeadCloseRequest{
+		MRID:        mr.ID,
+		Branch:      mr.Branch,
+		SourceIssue: mr.IssueID,
+		AgentBead:   mr.AgentBead,
+	})
 
 	result := &PostMergeResult{
 		MR:            mr,
-		SourceIssueID: mr.IssueID,
+		SourceIssueID: workBeadID,
 	}
 
-	b := beads.New(m.rig.BeadsPath())
-
 	// Close the MR bead
-	if mr.IsClosed() {
+	closeResult, err := closeTerminalMR(b, mr.ID, terminalMRCloseOptions{
+		Reason:        string(CloseReasonMerged),
+		MergeCommit:   mr.MergeCommit,
+		AgentBeadHint: mr.AgentBead,
+	})
+	if err != nil {
+		return result, fmt.Errorf("closing MR bead: %w", err)
+	}
+	if closeResult.AgentBead != "" {
+		mr.AgentBead = closeResult.AgentBead
+	}
+	if closeResult.AgentActiveMRClearErr != nil {
+		_, _ = fmt.Fprintf(m.output, "Warning: failed to clear agent bead %s active_mr: %v\n", closeResult.AgentBead, closeResult.AgentActiveMRClearErr)
+	}
+	if closeResult.AlreadyTerminal {
 		_, _ = fmt.Fprintf(m.output, "  %s MR already closed\n", style.Dim.Render("—"))
 		result.MRClosed = true
-	} else {
-		if err := b.CloseWithReason("merged", mr.ID); err != nil {
-			return result, fmt.Errorf("closing MR bead: %w", err)
+		if mr.CloseReason != CloseReasonMerged {
+			if mr.CloseReason == "" {
+				return result, fmt.Errorf("post-merge retry for already-closed MR %s requires close_reason=%s", mr.ID, CloseReasonMerged)
+			}
+			return result, fmt.Errorf("post-merge retry for already-closed MR %s has close_reason=%s", mr.ID, mr.CloseReason)
 		}
+	} else if closeResult.Closed {
 		if closeErr := mr.Close(CloseReasonMerged); closeErr != nil {
 			_, _ = fmt.Fprintf(m.output, "Warning: failed to update MR state: %v\n", closeErr)
 		}
 		result.MRClosed = true
+	} else {
+		return result, fmt.Errorf("closing MR bead: MR %s status is not open or terminal", mr.ID)
 	}
 
 	// Close the source issue with reason and --force to bypass dependency checks.
-	// The source issue may have an attached molecule (wisp) whose open steps
-	// would block a normal bd close. ForceCloseWithReason bypasses this,
-	// matching how gt done handles closures for the no-MR path.
-	if mr.IssueID != "" {
-		closeReason := fmt.Sprintf("Merged in %s", mr.ID)
-		if mr.MergeCommit != "" {
-			closeReason = fmt.Sprintf("%s\ntarget_branch: %s\ncommit_sha: %s", closeReason, mr.TargetBranch, mr.MergeCommit)
-		}
-		if err := b.ForceCloseWithReason(closeReason, mr.IssueID); err != nil {
-			// Check if already closed (by polecat's gt done) — that's fine
-			if issue, showErr := b.Show(mr.IssueID); showErr == nil && beads.IssueStatus(issue.Status).IsTerminal() {
-				_, _ = fmt.Fprintf(m.output, "  %s source issue already closed: %s\n", style.Dim.Render("○"), mr.IssueID)
-				result.SourceIssueClosed = true
-			} else {
-				_, _ = fmt.Fprintf(m.output, "  %s source issue close: %v\n", style.Dim.Render("○"), err)
-				result.SourceIssueNotFound = true
-			}
-		} else {
-			result.SourceIssueClosed = true
-		}
-	}
+	// The source issue may have an attached molecule whose open steps would
+	// block a normal close. Resolve before MR close clears active_mr, then close
+	// only from this post-merge success path.
+	sourceResult := closeMergedWorkBead(b, nil, m.output, mergedWorkBeadCloseRequest{
+		MRID:        mr.ID,
+		Target:      mr.TargetBranch,
+		SourceIssue: workBeadID,
+		MergeCommit: mr.MergeCommit,
+	})
+	result.SourceIssueID = sourceResult.WorkBeadID
+	result.SourceIssueClosed = sourceResult.Closed
+	result.SourceIssueNotFound = sourceResult.NotFound
 
 	return result, nil
 }

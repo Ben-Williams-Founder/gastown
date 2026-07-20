@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+
+	agentconfig "github.com/steveyegge/gastown/internal/config"
 )
 
 var envKeysCaseInsensitive = runtime.GOOS == "windows"
@@ -16,11 +18,16 @@ var bdTargetEnvKeys = []string{
 	"BEADS_DB",
 	"BD_DB",
 	"BEADS_SHARED_SERVER_DIR",
+	"GT_DOLT_DATA",
 }
 
 // DatabaseNameFromMetadata reads the dolt_database field from .beads/metadata.json.
 // Returns empty string if metadata doesn't exist or has no database configured.
 func DatabaseNameFromMetadata(beadsDir string) string {
+	beadsDir = canonicalBeadsDir(beadsDir)
+	if beadsDir == "" {
+		return ""
+	}
 	data, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json"))
 	if err != nil {
 		return ""
@@ -46,8 +53,7 @@ func DatabaseEnv(beadsDir string) string {
 
 // StripBDTargetEnv removes inherited environment variables that can make a bd
 // subprocess select a database/server other than the .beads directory chosen by
-// Gas Town. It intentionally preserves BEADS_DOLT_AUTO_START so callers can keep
-// the shared-server guardrail enabled.
+// Gas Town. Callers re-add the small set of canonical bd env values they need.
 func StripBDTargetEnv(env []string) []string {
 	filtered := make([]string, 0, len(env))
 	for _, entry := range env {
@@ -69,7 +75,7 @@ func isBDTargetEnv(entry string) bool {
 			return true
 		}
 	}
-	return envKeyHasPrefix(keyName, "BEADS_DOLT_") && !envKeyMatches(keyName, "BEADS_DOLT_AUTO_START")
+	return envKeyHasPrefix(keyName, "BEADS_DOLT_")
 }
 
 // BuildPinnedBDEnv returns env for a bd subprocess pinned to beadsDir. BEADS_DIR
@@ -79,14 +85,15 @@ func isBDTargetEnv(entry string) bool {
 func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 	env := SuppressBDSideEffects(StripBDTargetEnv(base))
 	if beadsDir == "" {
-		return addGTDerivedDoltTargetEnv(env)
+		return addResolvedDoltConnectionEnv(env, "")
 	}
+	beadsDir = canonicalBeadsDir(beadsDir)
 	env = append(env, "BEADS_DIR="+beadsDir)
 	env = append(env, doltTargetEnvFromBeadsDir(beadsDir)...)
 	if dbEnv := DatabaseEnv(beadsDir); dbEnv != "" {
 		env = append(env, dbEnv)
 	}
-	return addGTDerivedDoltTargetEnv(env)
+	return addResolvedDoltConnectionEnv(env, beadsDir)
 }
 
 // BuildRoutingBDEnv returns env for a bd subprocess that intentionally relies on
@@ -94,8 +101,9 @@ func BuildPinnedBDEnv(base []string, beadsDir string) []string {
 // connection host/port from fallbackBeadsDir so routing can choose the database.
 func BuildRoutingBDEnv(base []string, fallbackBeadsDir string) []string {
 	env := SuppressBDSideEffects(StripBDTargetEnv(base))
+	fallbackBeadsDir = canonicalBeadsDir(fallbackBeadsDir)
 	env = append(env, doltTargetEnvFromBeadsDir(fallbackBeadsDir)...)
-	return addGTDerivedDoltTargetEnv(env)
+	return addResolvedDoltConnectionEnv(env, fallbackBeadsDir)
 }
 
 // BuildReadOnlyPinnedBDEnv returns env for a read-only bd subprocess pinned to
@@ -134,20 +142,36 @@ func BuildMutationNeutralBDEnv(base []string) []string {
 // ArgsAreReadOnly classifies bd CLI arguments for env policy. Unknown commands
 // are treated as mutations so they cannot accidentally inherit read-only mode.
 func ArgsAreReadOnly(args []string) bool {
-	args = stripBDGlobalFlags(args)
+	if len(args) == 1 && isBDReadOnlyGlobalFlag(args[0]) {
+		return true
+	}
+	if HasBDTargetSelectorFlag(append([]string{"bd"}, args...)) {
+		return false
+	}
+	var ok bool
+	args, ok = stripBDGlobalFlags(args)
+	if !ok {
+		return false
+	}
 	if len(args) == 0 {
 		return false
 	}
 	switch args[0] {
-	case "show", "list", "ready", "blocked", "stats", "stale", "orphans", "activity", "query", "version":
+	case "show", "list", "ready", "blocked", "stats", "stale", "orphans", "activity", "query", "search", "version", "help":
 		return true
 	case "dep":
 		return len(args) > 1 && args[1] == "list"
+	case "formula":
+		return len(args) > 1 && (args[1] == "list" || args[1] == "show")
+	case "kv":
+		return len(args) > 1 && (args[1] == "get" || args[1] == "list")
+	case "message":
+		return len(args) > 1 && args[1] == "thread"
 	case "mol":
-		return len(args) > 2 && args[1] == "wisp" && args[2] == "list"
+		return len(args) > 1 && (args[1] == "current" || (len(args) > 2 && args[1] == "wisp" && args[2] == "list"))
 	case "sql":
 		query := strings.ToLower(strings.Join(stripBDCommandFlags(args[1:]), " "))
-		return strings.HasPrefix(strings.TrimSpace(query), "select")
+		return hasReadOnlySQLPrefix(strings.TrimSpace(query))
 	case "config":
 		return len(args) > 1 && args[1] == "get"
 	default:
@@ -155,11 +179,28 @@ func ArgsAreReadOnly(args []string) bool {
 	}
 }
 
-func stripBDGlobalFlags(args []string) []string {
+func isBDReadOnlyGlobalFlag(arg string) bool {
+	return arg == "--version" || arg == "-V" || arg == "--help" || arg == "-h"
+}
+
+func stripBDGlobalFlags(args []string) ([]string, bool) {
 	for len(args) > 0 && strings.HasPrefix(args[0], "--") {
+		if args[0] == "--" {
+			return nil, false
+		}
+		name := args[0]
+		if cut, _, hasValue := strings.Cut(name, "="); hasValue {
+			name = cut
+		}
+		if !bdBoolGlobalFlags[name] {
+			return nil, false
+		}
 		args = args[1:]
 	}
-	return args
+	if len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		return nil, false
+	}
+	return args, true
 }
 
 func stripBDCommandFlags(args []string) []string {
@@ -169,6 +210,15 @@ func stripBDCommandFlags(args []string) []string {
 	return args
 }
 
+func hasReadOnlySQLPrefix(query string) bool {
+	for _, prefix := range []string{"select", "show", "explain", "describe"} {
+		if strings.HasPrefix(query, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // SuppressBDSideEffects disables Beads JSONL export/backup/push side effects for
 // Gas Town-managed subprocesses. The authoritative data plane is Dolt; exporting
 // JSONL from high-frequency gt callers re-invalidates Beads' import freshness
@@ -176,6 +226,7 @@ func stripBDCommandFlags(args []string) []string {
 func SuppressBDSideEffects(env []string) []string {
 	for _, key := range []string{
 		"BEADS_NO_AUTO_IMPORT",
+		"BEADS_DOLT_AUTO_START",
 		"BD_EXPORT_AUTO",
 		"BD_BACKUP_ENABLED",
 		"BD_DOLT_AUTO_PUSH",
@@ -187,6 +238,7 @@ func SuppressBDSideEffects(env []string) []string {
 	}
 	return append(env,
 		"BEADS_NO_AUTO_IMPORT=1",
+		"BEADS_DOLT_AUTO_START=0",
 		"BD_EXPORT_AUTO=false",
 		"BD_BACKUP_ENABLED=false",
 		"BD_DOLT_AUTO_PUSH=false",
@@ -209,6 +261,7 @@ func forceBDMutation(env []string) []string {
 }
 
 func doltTargetEnvFromBeadsDir(beadsDir string) []string {
+	beadsDir = canonicalBeadsDir(beadsDir)
 	if beadsDir == "" {
 		return nil
 	}
@@ -231,6 +284,10 @@ type doltMetadata struct {
 
 func readDoltMetadata(beadsDir string) doltMetadata {
 	var meta doltMetadata
+	beadsDir = canonicalBeadsDir(beadsDir)
+	if beadsDir == "" {
+		return meta
+	}
 	if data, err := os.ReadFile(filepath.Join(beadsDir, "dolt-server.port")); err == nil {
 		meta.Port = strings.TrimSpace(string(data))
 	}
@@ -250,6 +307,13 @@ func readDoltMetadata(beadsDir string) doltMetadata {
 		meta.Port = strconv.Itoa(raw.DoltServerPort)
 	}
 	return meta
+}
+
+func canonicalBeadsDir(beadsDir string) string {
+	if beadsDir == "" {
+		return ""
+	}
+	return ResolveBeadsDir(beadsDir)
 }
 
 // StripEnvKey removes all entries for key. Environment keys are case-insensitive
@@ -281,29 +345,58 @@ func envKeyHasPrefix(keyName, prefix string) bool {
 	return strings.HasPrefix(keyName, prefix)
 }
 
-func addGTDerivedDoltTargetEnv(env []string) []string {
+func addResolvedDoltConnectionEnv(env []string, beadsDir string) []string {
 	gtHost := envValue(env, "GT_DOLT_HOST")
 	gtPort := envValue(env, "GT_DOLT_PORT")
-	if gtHost != "" && envValue(env, "BEADS_DOLT_SERVER_HOST") == "" {
+	// GT_DOLT_DATA is intentionally not translated to BEADS_DOLT_DATA_DIR here:
+	// data-dir env selects direct-mode storage and can override metadata routing.
+	if gtHost != "" {
+		env = StripEnvKey(env, "BEADS_DOLT_SERVER_HOST")
 		env = append(env, "BEADS_DOLT_SERVER_HOST="+gtHost)
 	}
 	if gtPort != "" {
-		if envValue(env, "BEADS_DOLT_SERVER_PORT") == "" {
-			env = append(env, "BEADS_DOLT_SERVER_PORT="+gtPort)
+		env = StripEnvKey(env, "BEADS_DOLT_SERVER_PORT")
+		env = StripEnvKey(env, "BEADS_DOLT_PORT")
+		env = append(env, "BEADS_DOLT_SERVER_PORT="+gtPort, "BEADS_DOLT_PORT="+gtPort)
+	}
+	if beadsDir == "" {
+		return env
+	}
+	townRoot := FindTownRoot(filepath.Dir(beadsDir))
+	if townRoot == "" {
+		return env
+	}
+	managedHost, managedPort, hasManagedConfig := agentconfig.ManagedDoltEndpoint(townRoot)
+	if envValue(env, "BEADS_DOLT_SERVER_HOST") == "" {
+		if hasManagedConfig {
+			if managedHost != "" {
+				env = append(env, "BEADS_DOLT_SERVER_HOST="+managedHost)
+			}
+		} else if host := agentconfig.ResolveDoltHost(townRoot); host != "" {
+			env = append(env, "BEADS_DOLT_SERVER_HOST="+host)
 		}
-		if envValue(env, "BEADS_DOLT_PORT") == "" {
-			env = append(env, "BEADS_DOLT_PORT="+gtPort)
+	}
+	if envValue(env, "BEADS_DOLT_SERVER_PORT") == "" && envValue(env, "BEADS_DOLT_PORT") == "" {
+		if hasManagedConfig {
+			if managedPort > 0 {
+				portStr := strconv.Itoa(managedPort)
+				env = append(env, "BEADS_DOLT_SERVER_PORT="+portStr, "BEADS_DOLT_PORT="+portStr)
+			}
+		} else if port := agentconfig.ResolveDoltPort(townRoot); port > 0 {
+			portStr := strconv.Itoa(port)
+			env = append(env, "BEADS_DOLT_SERVER_PORT="+portStr, "BEADS_DOLT_PORT="+portStr)
 		}
 	}
 	return env
 }
 
 func envValue(env []string, key string) string {
+	var value string
 	for _, entry := range env {
-		keyName, value, ok := strings.Cut(entry, "=")
+		keyName, v, ok := strings.Cut(entry, "=")
 		if ok && envKeyMatches(keyName, key) {
-			return value
+			value = v
 		}
 	}
-	return ""
+	return value
 }

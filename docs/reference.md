@@ -192,7 +192,7 @@ bd update gt-rig-myrig --labels="polecat_branch_template:adam/{year}/{month}/{de
 **Default Behavior (backward compatible):**
 
 When `polecat_branch_template` is empty or not set:
-- With issue: `polecat/{name}/{issue}@{timestamp}`
+- With issue: `polecat/{name}/{issue}+{timestamp}`
 - Without issue: `polecat/{name}-{timestamp}`
 
 **Example Configurations:**
@@ -260,8 +260,8 @@ with = "macro-formula"
 ```
 1. Work through formula checklist (shown inline by gt prime)
 2. Submit to merge queue via gt done
-3. gt done nukes sandbox and exits
-4. Witness removes worktree + branch
+3. gt done preserves branch/MR metadata and exits the session
+4. Witness/refinery cleanup handles any retired sandbox state
 ```
 
 ### Session Cycling
@@ -461,7 +461,11 @@ gt config agent remove <name>     # Remove custom agent (built-ins protected)
 gt config default-agent [name]    # Get or set town default agent
 ```
 
-**Built-in agents**: `claude`, `gemini`, `codex`, `cursor`, `auggie`, `amp`, `opencode`, `copilot`
+**Built-in agents**: `claude`, `gemini`, `codex`, `kiro`, `cursor`, `auggie`, `amp`, `opencode`, `copilot`
+
+The `kiro` preset launches `kiro-cli chat --trust-all-tools` and uses Kiro's
+documented `--resume` / `--resume-id` session flags. Gas Town does not install
+Kiro hooks or `.kiro` project files for this preset.
 
 > **Note on GitHub Copilot**: The `copilot` preset uses executable lifecycle hooks in
 > `.github/hooks/gastown.json` (`sessionStart`, `userPromptSubmitted`, `preToolUse`,

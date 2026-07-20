@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/constants"
 )
 
@@ -304,7 +305,7 @@ func (d *testDAG) BdStubScript() string {
 	sb.WriteString(fmt.Sprintf("    echo '%s'\n", convoyListJSON))
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
-	sb.WriteString("  list\\ --json\\ --limit=0|list\\ --json\\ --limit=0\\ --all|list\\ --json\\ --limit=0\\ --status=*)\n")
+	sb.WriteString("  list\\ --json\\ --limit=0*)\n")
 	sb.WriteString("    echo '[]'\n")
 	sb.WriteString("    exit 0\n")
 	sb.WriteString("    ;;\n")
@@ -383,8 +384,7 @@ func (d *testDAG) Setup(t *testing.T) (townRoot, logPath string) {
 	}
 
 	// Write sentinel files so beads.EnsureCustomTypes/Statuses skip bd calls.
-	typesList := strings.Join(constants.BeadsCustomTypesList(), ",")
-	if err := os.WriteFile(filepath.Join(townRoot, ".beads", ".gt-types-configured"), []byte(typesList+"\n"), 0644); err != nil {
+	if err := os.WriteFile(filepath.Join(townRoot, ".beads", ".gt-types-configured"), []byte(beads.TypeConfigSentinelValue()+"\n"), 0644); err != nil {
 		t.Fatalf("write types sentinel: %v", err)
 	}
 	statusesList := strings.Join(constants.BeadsCustomStatusesList(), ",")

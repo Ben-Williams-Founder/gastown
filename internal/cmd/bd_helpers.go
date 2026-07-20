@@ -22,6 +22,7 @@ type bdCmd struct {
 	args       []string
 	dir        string
 	env        []string
+	stdin      io.Reader
 	stderr     io.Writer
 	autoCommit bool
 	allowStale bool
@@ -111,6 +112,12 @@ func (b *bdCmd) Stderr(w io.Writer) *bdCmd {
 	return b
 }
 
+// Stdin sets the stdin reader for the command.
+func (b *bdCmd) Stdin(r io.Reader) *bdCmd {
+	b.stdin = r
+	return b
+}
+
 // filterEnvKey removes all entries matching the given key from the env slice.
 // This ensures appended values aren't shadowed by existing entries, since
 // glibc getenv() returns the first match in the environment array.
@@ -118,29 +125,9 @@ func filterEnvKey(env []string, key string) []string {
 	return beads.StripEnvKey(env, key)
 }
 
-func filterBdTargetEnv(env []string) []string {
-	return beads.StripBDTargetEnv(env)
-}
-
-func pinBeadsDirEnv(env []string, beadsDir string) []string {
-	if beadsDir == "" {
-		return beads.StripBDTargetEnv(env)
-	}
-	return beads.BuildPinnedBDEnv(env, beadsDir)
-}
-
 // buildEnv constructs the final environment slice based on configured options.
 func (b *bdCmd) buildEnv() []string {
-	env := b.env
-
-	// Add BD_DOLT_AUTO_COMMIT=on for sequential dependent calls.
-	// Filter existing entries first — glibc getenv() returns the first match,
-	// so an existing "off" entry would shadow the appended "on".
-	if b.autoCommit {
-		env = filterEnvKey(env, "BD_DOLT_AUTO_COMMIT")
-		env = filterEnvKey(env, "BD_READONLY")
-		env = append(env, "BD_DOLT_AUTO_COMMIT=on")
-	}
+	env := append([]string{}, b.env...)
 
 	// Add GT_ROOT if specified.
 	// Filter existing entries first for the same reason as above.
@@ -149,25 +136,31 @@ func (b *bdCmd) buildEnv() []string {
 		env = append(env, "GT_ROOT="+b.gtRoot)
 	}
 
-	// Add BEADS_DIR if specified.
-	// This prevents inherited BEADS_DIR from causing bd to target the wrong
-	// database (e.g., HQ instead of rig). See gt-ctir.
-	//
-	// Also clear inherited Dolt target variables. Dashboard and agent shells can
-	// carry a town-level or remote BEADS_DOLT_* target; keeping it while changing
-	// BEADS_DIR makes `bd show <displayed-id>` query a different database than
-	// `gt ready` used to render the row.
-	if b.routing {
-		env = beads.BuildRoutingBDEnv(env, beads.ResolveBeadsDir(b.dir))
-	} else if b.beadsDir != "" {
-		env = pinBeadsDirEnv(env, b.beadsDir)
-	} else if b.dir != "" {
-		env = pinBeadsDirEnv(env, beads.ResolveBeadsDir(b.dir))
-	} else {
-		env = beads.SuppressBDSideEffects(beads.StripBDTargetEnv(env))
+	mode := beads.MutationRouting
+	if beads.ArgsAreReadOnly(b.args) && !b.autoCommit {
+		mode = beads.ReadOnlyRouting
 	}
 
-	return env
+	beadsDir := ""
+	if b.beadsDir != "" {
+		beadsDir = b.beadsDir
+		if mode == beads.ReadOnlyRouting {
+			mode = beads.ReadOnlyPinned
+		} else {
+			mode = beads.MutationPinned
+		}
+	} else if b.dir != "" {
+		beadsDir = beads.ResolveBeadsDir(b.dir)
+		if !b.routing {
+			if mode == beads.ReadOnlyRouting {
+				mode = beads.ReadOnlyPinned
+			} else {
+				mode = beads.MutationPinned
+			}
+		}
+	}
+
+	return beads.EnvForSubprocessMode(env, beadsDir, mode)
 }
 
 // Build returns the configured exec.Cmd.
@@ -177,6 +170,7 @@ func (b *bdCmd) Build() *exec.Cmd {
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = b.dir
 	cmd.Env = b.buildEnv()
+	cmd.Stdin = b.stdin
 	cmd.Stderr = b.stderr
 	return cmd
 }
@@ -196,6 +190,7 @@ func (b *bdCmd) buildContextCommand(ctx context.Context) *exec.Cmd {
 	util.SetProcessGroup(cmd)
 	cmd.Dir = b.dir
 	cmd.Env = b.buildEnv()
+	cmd.Stdin = b.stdin
 	cmd.Stderr = b.stderr
 	return cmd
 }
@@ -291,6 +286,7 @@ func (b *bdCmd) CombinedOutput() ([]byte, error) {
 	util.SetProcessGroup(cmd)
 	cmd.Dir = b.dir
 	cmd.Env = b.buildEnv()
+	cmd.Stdin = b.stdin
 	out, err := cmd.CombinedOutput()
 	return out, b.wrapCommandError(ctx, err, deadline)
 }

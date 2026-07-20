@@ -15,10 +15,12 @@ import (
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/deacon"
+	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/rig"
 	"github.com/steveyegge/gastown/internal/session"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/templates"
+	"github.com/steveyegge/gastown/internal/util"
 	"github.com/steveyegge/gastown/internal/workspace"
 )
 
@@ -62,14 +64,7 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 	// Get town name for session names
 	townName, _ := workspace.GetTownName(ctx.TownRoot)
 
-	// Get default branch from rig config (default to "main" if not set)
-	defaultBranch := "main"
-	if ctx.Rig != "" && ctx.TownRoot != "" {
-		rigPath := filepath.Join(ctx.TownRoot, ctx.Rig)
-		if rigCfg, err := rig.LoadRigConfig(rigPath); err == nil && rigCfg.DefaultBranch != "" {
-			defaultBranch = rigCfg.DefaultBranch
-		}
-	}
+	defaultBranch, isForkRig, upstreamURL := roleRigContext(ctx)
 
 	data := templates.RoleData{
 		Role:          roleName,
@@ -78,6 +73,8 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 		TownName:      townName,
 		WorkDir:       ctx.WorkDir,
 		DefaultBranch: defaultBranch,
+		IsForkRig:     isForkRig,
+		UpstreamURL:   upstreamURL,
 		Polecat:       ctx.Polecat,
 		DogName:       ctx.Polecat, // ctx.Polecat holds the dog name for RoleDog
 		MayorSession:  session.MayorSessionName(),
@@ -92,6 +89,25 @@ func outputPrimeContext(ctx RoleContext) (string, error) {
 
 	fmt.Print(output)
 	return output, nil
+}
+
+func roleRigContext(ctx RoleContext) (defaultBranch string, isForkRig bool, upstreamURL string) {
+	defaultBranch = "main"
+	if ctx.Rig == "" || ctx.TownRoot == "" {
+		return defaultBranch, false, ""
+	}
+	rigPath := filepath.Join(ctx.TownRoot, ctx.Rig)
+	rigCfg, err := rig.LoadRigConfig(rigPath)
+	if err != nil || rigCfg == nil {
+		return defaultBranch, false, ""
+	}
+	if rigCfg.DefaultBranch != "" {
+		defaultBranch = rigCfg.DefaultBranch
+	}
+	if strings.TrimSpace(rigCfg.UpstreamURL) != "" {
+		return defaultBranch, true, util.RedactURL(rigCfg.UpstreamURL)
+	}
+	return defaultBranch, false, ""
 }
 
 // outputRoleDirectives loads and emits operator-provided role directives.
@@ -267,7 +283,11 @@ func outputPolecatContext(ctx RoleContext) {
 	fmt.Println("- `" + cli.Name() + " mail inbox` - Check your inbox for work assignments")
 	fmt.Println("- `bd show <issue>` - View your assigned issue")
 	fmt.Println("- `bd close <issue>` - Mark issue complete")
-	fmt.Println("- `" + cli.Name() + " done` - Signal work ready for merge")
+	if _, isForkRig, _ := roleRigContext(ctx); isForkRig {
+		fmt.Println("- Fork rig: push to origin and use PR/no-merge workflow; do not submit upstream changes to MQ")
+	} else {
+		fmt.Println("- `" + cli.Name() + " done` - Signal work ready for merge")
+	}
 	fmt.Println()
 	fmt.Println("## Hookable Mail")
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
@@ -295,6 +315,9 @@ func outputCrewContext(ctx RoleContext) {
 	fmt.Println("- `bd ready` - Available issues")
 	fmt.Println("- `bd show <issue>` - View issue details")
 	fmt.Println("- `bd close <issue>` - Mark issue complete")
+	if _, isForkRig, _ := roleRigContext(ctx); isForkRig {
+		fmt.Println("- Fork rig: branch from upstream, push to origin, create PR against upstream")
+	}
 	fmt.Println()
 	fmt.Println("## Hookable Mail")
 	fmt.Println("Mail can be hooked for ad-hoc instructions: `" + cli.Name() + " hook attach <mail-id>`")
@@ -518,6 +541,20 @@ func outputStartupDirective(ctx RoleContext) {
 			fmt.Println("---")
 			fmt.Println()
 			fmt.Printf("Rig %s is %s. No patrol needed. Exit cleanly.\n", ctx.Rig, reason)
+			return
+		}
+		if stop, err := refinery.ActiveSafetyStop(ctx.TownRoot, ctx.Rig); err != nil {
+			fmt.Println()
+			fmt.Println("---")
+			fmt.Println()
+			style.PrintWarning("could not check refinery safety stop: %v", err)
+			fmt.Println("No patrol needed. Exit cleanly until safety-stop state can be verified.")
+			return
+		} else if stop != nil {
+			fmt.Println()
+			fmt.Println("---")
+			fmt.Println()
+			fmt.Printf("Refinery %s is %s. No patrol needed. Exit cleanly.\n", ctx.Rig, stop.Reason())
 			return
 		}
 		fmt.Println()

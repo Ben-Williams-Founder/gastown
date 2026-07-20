@@ -2,10 +2,14 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -449,18 +453,25 @@ func getTownBeadsDir() (string, error) {
 // "exit status 1". BEADS_DIR is stripped from the subprocess environment to
 // prevent stale overrides from interfering with bd's workspace detection.
 func runBdJSON(dir string, args ...string) ([]byte, error) {
-	return runBdJSONWithOptions(dir, false, args...)
+	return runBdJSONWithOptions(dir, false, false, args...)
 }
 
 func runBdJSONAllowStale(dir string, args ...string) ([]byte, error) {
-	return runBdJSONWithOptions(dir, true, args...)
+	return runBdJSONWithOptions(dir, true, false, args...)
 }
 
-func runBdJSONWithOptions(dir string, allowStale bool, args ...string) ([]byte, error) {
+func runBdJSONWithAutoCommit(dir string, args ...string) ([]byte, error) {
+	return runBdJSONWithOptions(dir, false, true, args...)
+}
+
+func runBdJSONWithOptions(dir string, allowStale, autoCommit bool, args ...string) ([]byte, error) {
 	var stdout, stderr bytes.Buffer
 	bdc := BdCmd(args...).Dir(dir).StripBeadsDir().Stderr(&stderr)
 	if allowStale {
 		bdc.AllowStale()
+	}
+	if autoCommit {
+		bdc.WithAutoCommit()
 	}
 	cmd := bdc.Build()
 	cmd.Dir = dir
@@ -492,49 +503,137 @@ func bdDepListRawIDs(dir, issueID, direction, depType string) ([]string, error) 
 		return nil, fmt.Errorf("invalid bead ID: %q", issueID)
 	}
 
-	// The dependency target was historically a single depends_on_id column.
-	// The schema migration split it into typed columns
-	// (depends_on_issue_id / depends_on_wisp_id / depends_on_external), where
-	// cross-database refs live in depends_on_external as "external:<prefix>:<id>".
-	// "down": targets issueID depends on → COALESCE the three target columns.
-	// "up":   issues that depend on issueID → match issueID against all three.
-	var selectExpr, whereClause, parseKey string
+	var parseKey string
 	if direction == "up" {
-		selectExpr = "issue_id"
 		parseKey = "issue_id"
-		whereClause = fmt.Sprintf(
-			"(depends_on_issue_id = '%s' OR depends_on_wisp_id = '%s' OR %s)",
-			issueID, issueID, sqlExternalDepTargetClause(issueID))
 	} else {
-		selectExpr = "COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS depends_on_id"
 		parseKey = "depends_on_id"
-		whereClause = fmt.Sprintf("issue_id = '%s'", issueID)
+	}
+	if depType != "" && !isValidBeadID(depType) {
+		return nil, fmt.Errorf("invalid dep type: %q", depType)
 	}
 
-	query := fmt.Sprintf("SELECT %s FROM dependencies WHERE %s", selectExpr, whereClause)
-	if depType != "" {
-		if !isValidBeadID(depType) {
-			return nil, fmt.Errorf("invalid dep type: %q", depType)
+	if ids, err := bdDepListRawIDsViaDolt(dir, issueID, direction, depType); err == nil {
+		return ids, nil
+	}
+
+	var lastErr error
+	for _, legacy := range []bool{false, true} {
+		query := rawDepSQLLiteral(issueID, direction, depType, legacy)
+		out, err := runBdJSONWithAutoCommit(dir, "sql", query, "--json")
+		if err != nil {
+			lastErr = err
+			continue
 		}
-		query += fmt.Sprintf(" AND type = '%s'", depType)
+		ids, err := parseRawDepRows(out, parseKey)
+		if err != nil {
+			return nil, fmt.Errorf("parsing dep sql for %s: %w", issueID, err)
+		}
+		return ids, nil
 	}
+	return nil, fmt.Errorf("bd sql for deps of %s: %w", issueID, lastErr)
+}
 
-	out, err := runBdJSON(dir, "sql", query, "--json")
+func bdDepListRawIDsViaDolt(dir, issueID, direction, depType string) ([]string, error) {
+	beadsDir := beads.ResolveBeadsDir(dir)
+	cfg, ok := readBeadsRuntimeConfig(beadsDir)
+	if !ok || cfg.Database == "" || cfg.Port == 0 {
+		return nil, fmt.Errorf("missing server metadata for %s", beadsDir)
+	}
+	host := cfg.Host
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	dsn := fmt.Sprintf("root@tcp(%s)/%s?parseTime=true", net.JoinHostPort(host, strconv.Itoa(cfg.Port)), url.PathEscape(cfg.Database))
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("bd sql for deps of %s: %w", issueID, err)
+		return nil, err
 	}
+	defer db.Close()
 
-	// Parse JSON array of single-column rows
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	typedQuery, typedArgs := rawDepSQLArgs(issueID, direction, depType, false)
+	ids, err := queryRawDepIDs(ctx, db, typedQuery, typedArgs)
+	if err == nil {
+		return ids, nil
+	}
+	legacyQuery, legacyArgs := rawDepSQLArgs(issueID, direction, depType, true)
+	return queryRawDepIDs(ctx, db, legacyQuery, legacyArgs)
+}
+
+func rawDepSQLArgs(issueID, direction, depType string, legacy bool) (string, []any) {
+	var query string
+	var args []any
+	if direction == "up" {
+		if legacy {
+			query = "SELECT issue_id FROM dependencies WHERE depends_on_id = ?"
+			args = append(args, issueID)
+		} else {
+			query = "SELECT issue_id FROM dependencies WHERE (depends_on_issue_id = ? OR depends_on_wisp_id = ? OR depends_on_external LIKE ? ESCAPE '!')"
+			args = append(args, issueID, issueID, "%:"+strings.ReplaceAll(issueID, "_", "!_"))
+		}
+	} else if legacy {
+		query = "SELECT depends_on_id FROM dependencies WHERE issue_id = ?"
+		args = append(args, issueID)
+	} else {
+		query = "SELECT COALESCE(depends_on_issue_id, depends_on_wisp_id, depends_on_external) AS depends_on_id FROM dependencies WHERE issue_id = ?"
+		args = append(args, issueID)
+	}
+	if depType != "" {
+		query += " AND type = ?"
+		args = append(args, depType)
+	}
+	return query, args
+}
+
+func rawDepSQLLiteral(issueID, direction, depType string, legacy bool) string {
+	query, args := rawDepSQLArgs(issueID, direction, depType, legacy)
+	for _, arg := range args {
+		query = strings.Replace(query, "?", "'"+arg.(string)+"'", 1)
+	}
+	return query
+}
+
+func queryRawDepIDs(ctx context.Context, db *sql.DB, query string, args []any) ([]string, error) {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	seen := make(map[string]bool)
+	var ids []string
+	for rows.Next() {
+		var rawID sql.NullString
+		if err := rows.Scan(&rawID); err != nil {
+			return nil, err
+		}
+		if !rawID.Valid {
+			continue
+		}
+		id := beads.ExtractIssueID(rawID.String)
+		if id != "" && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func parseRawDepRows(out []byte, parseKey string) ([]string, error) {
 	var rows []map[string]string
 	if err := json.Unmarshal(out, &rows); err != nil {
-		return nil, fmt.Errorf("parsing dep sql for %s: %w", issueID, err)
+		return nil, err
 	}
-
 	seen := make(map[string]bool, len(rows))
 	var ids []string
 	for _, row := range rows {
-		rawID := row[parseKey]
-		id := beads.ExtractIssueID(rawID)
+		id := beads.ExtractIssueID(row[parseKey])
 		if id != "" && !seen[id] {
 			seen[id] = true
 			ids = append(ids, id)
@@ -848,6 +947,9 @@ func runConvoyAdd(cmd *cobra.Command, args []string) error {
 				return fmt.Errorf("couldn't clear convoy completion notification state: %w", err)
 			}
 		}
+		if err := persistTownBeadsJSONL(townBeads); err != nil {
+			return fmt.Errorf("couldn't persist reopened convoy to JSONL: %w", err)
+		}
 		reopened = true
 		fmt.Printf("%s Reopened convoy %s\n", style.Bold.Render("↺"), convoyID)
 	}
@@ -958,7 +1060,7 @@ func closeConvoyIfComplete(townBeads, convoyID, title string, tracked []trackedI
 
 	reason := "All tracked issues completed"
 	closeArgs := []string{"close", convoyID, "-r", reason}
-	if err := BdCmd(closeArgs...).Dir(townBeads).WithAutoCommit().Run(); err != nil {
+	if err := runTownMutationAndExport(townBeads, closeArgs...); err != nil {
 		return false, fmt.Errorf("closing convoy: %w", err)
 	}
 
@@ -1003,7 +1105,7 @@ func checkSingleConvoy(townBeads, convoyID string, dryRun bool) error {
 	// Check if convoy is already closed
 	if normalizeConvoyStatus(convoy.Status) == convoyStatusClosed {
 		fmt.Printf("%s Convoy %s is already closed\n", style.Dim.Render("○"), convoyID)
-		return nil
+		return persistAndNotifyConvoyCompletion(townBeads, convoyID, convoy.Title)
 	}
 
 	// Get tracked issues
@@ -1058,7 +1160,7 @@ func runConvoyClose(cmd *cobra.Command, args []string) error {
 	// Idempotent: if already closed, just report it
 	if normalizeConvoyStatus(convoy.Status) == convoyStatusClosed {
 		fmt.Printf("%s Convoy %s is already closed\n", style.Dim.Render("○"), convoyID)
-		return nil
+		return persistAndNotifyConvoyCompletion(townBeads, convoyID, convoy.Title)
 	}
 	if err := validateConvoyStatusTransition(convoy.Status, convoyStatusClosed); err != nil {
 		return fmt.Errorf("can't close convoy '%s': %w", convoyID, err)
@@ -1108,7 +1210,7 @@ func runConvoyClose(cmd *cobra.Command, args []string) error {
 
 	// Close the convoy
 	closeArgs := []string{"close", convoyID, "-r", reason}
-	if err := BdCmd(closeArgs...).Dir(townBeads).WithAutoCommit().Run(); err != nil {
+	if err := runTownMutationAndExport(townBeads, closeArgs...); err != nil {
 		return fmt.Errorf("closing convoy: %w", err)
 	}
 
@@ -1152,12 +1254,25 @@ func runConvoyClose(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func convoyNotifyFrom(convoyID string) string {
+	return "convoy/" + convoyID
+}
+
+func convoyMailArgs(addr, subject, body, convoyID string) []string {
+	return []string{"mail", "send", addr, "-s", subject, "-m", body, "--from", convoyNotifyFrom(convoyID), "--no-notify"}
+}
+
+func convoyNudgeEnv(convoyID string) []string {
+	env := filterEnvKey(os.Environ(), "GT_ROLE")
+	return append(env, "GT_ROLE="+convoyNotifyFrom(convoyID))
+}
+
 // sendCloseNotification sends a notification about convoy closure.
 func sendCloseNotification(addr, convoyID, title, reason string) {
 	subject := fmt.Sprintf("🚚 Convoy closed: %s", title)
 	body := fmt.Sprintf("Convoy %s has been closed.\n\nReason: %s", convoyID, reason)
 
-	mailArgs := []string{"mail", "send", addr, "-s", subject, "-m", body}
+	mailArgs := convoyMailArgs(addr, subject, body, convoyID)
 	mailCmd := exec.Command("gt", mailArgs...)
 	if err := mailCmd.Run(); err != nil {
 		style.PrintWarning("couldn't send notification: %v", err)
@@ -1214,7 +1329,7 @@ func runConvoyLand(cmd *cobra.Command, args []string) error {
 	}
 	if normalizeConvoyStatus(convoy.Status) == convoyStatusClosed {
 		fmt.Printf("%s Convoy %s is already closed\n", style.Dim.Render("○"), convoyID)
-		return nil
+		return persistAndNotifyConvoyCompletion(townBeads, convoyID, convoy.Title)
 	}
 
 	// Get tracked issues
@@ -1281,7 +1396,7 @@ func runConvoyLand(cmd *cobra.Command, args []string) error {
 	// Phase 2: Close the convoy
 	reason := "Landed by owner"
 	closeArgs := []string{"close", convoyID, "-r", reason}
-	if err := BdCmd(closeArgs...).Dir(townBeads).WithAutoCommit().Run(); err != nil {
+	if err := runTownMutationAndExport(townBeads, closeArgs...); err != nil {
 		return fmt.Errorf("closing convoy: %w", err)
 	}
 
@@ -1683,6 +1798,34 @@ func checkAndCloseCompletedConvoys(townBeads string, dryRun bool) ([]struct{ ID,
 	return closed, nil
 }
 
+// persistTownBeadsJSONL writes the current town Beads state to the JSONL file
+// used by bd's fallback import path. Convoy close/check suppresses bd's implicit
+// auto-export for normal command hygiene, but close state must survive a later
+// Dolt rebuild from .beads/issues.jsonl.
+func persistTownBeadsJSONL(townBeads string) error {
+	beadsDir := beads.ResolveBeadsDir(townBeads)
+	if beadsDir == "" {
+		return fmt.Errorf("could not resolve town .beads directory")
+	}
+	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	return BdCmd("export", "-o", issuesPath).Dir(townBeads).Run()
+}
+
+func runTownMutationAndExport(townBeads string, args ...string) error {
+	if err := BdCmd(args...).Dir(townBeads).WithAutoCommit().Run(); err != nil {
+		return err
+	}
+	return persistTownBeadsJSONL(townBeads)
+}
+
+func persistAndNotifyConvoyCompletion(townBeads, convoyID, title string) error {
+	if err := persistTownBeadsJSONL(townBeads); err != nil {
+		return fmt.Errorf("persisting convoy close to JSONL: %w", err)
+	}
+	notifyConvoyCompletion(townBeads, convoyID, title)
+	return nil
+}
+
 // notifyConvoyCompletion sends notifications to owner, any notify addresses, and mayor/.
 func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	stdout, err := runBdJSON(townBeads, "show", convoyID, "--json")
@@ -1704,12 +1847,6 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 		fields = &beads.ConvoyFields{}
 	}
 	if fields.CompletionNotifiedAt != "" {
-		return
-	}
-	fields.CompletionNotifiedAt = time.Now().UTC().Format(time.RFC3339)
-	newDesc := beads.SetConvoyFields(&beads.Issue{Description: convoys[0].Description}, fields)
-	if err := BdCmd("update", convoyID, "--description="+newDesc).Dir(townBeads).WithAutoCommit().Run(); err != nil {
-		style.PrintWarning("could not record convoy completion notification state for %s: %v", convoyID, err)
 		return
 	}
 
@@ -1741,9 +1878,10 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 
 	for _, addr := range fields.NotificationAddresses() {
 		notifiedAddrs[addr] = true
-		mailArgs := []string{"mail", "send", addr,
-			"-s", fmt.Sprintf("🚚 Convoy landed: %s", title),
-			"-m", fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.", convoyID)}
+		mailArgs := convoyMailArgs(addr,
+			fmt.Sprintf("🚚 Convoy landed: %s", title),
+			fmt.Sprintf("Convoy %s has completed.\n\nAll tracked issues are now closed.", convoyID),
+			convoyID)
 		mailCmd := exec.Command("gt", mailArgs...)
 		if err := mailCmd.Run(); err != nil {
 			style.PrintWarning("could not notify %s: %v", addr, err)
@@ -1754,6 +1892,7 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 	for _, addr := range fields.NudgeNotificationAddresses() {
 		nudgeMsg := fmt.Sprintf("🚚 Convoy landed: %s — Convoy %s has completed. All tracked issues are now closed.", title, convoyID)
 		nudgeCmd := exec.Command("gt", "nudge", addr, "-m", nudgeMsg)
+		nudgeCmd.Env = convoyNudgeEnv(convoyID)
 		if err := nudgeCmd.Run(); err != nil {
 			style.PrintWarning("could not nudge %s: %v", addr, err)
 		}
@@ -1761,9 +1900,7 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 
 	// Always notify mayor/ for strategic visibility, unless already notified above.
 	if !notifiedAddrs["mayor/"] {
-		mailArgs := []string{"mail", "send", "mayor/",
-			"-s", fmt.Sprintf("Convoy complete: %s", title),
-			"-m", mayorBody}
+		mailArgs := convoyMailArgs("mayor/", fmt.Sprintf("Convoy complete: %s", title), mayorBody, convoyID)
 		mailCmd := exec.Command("gt", mailArgs...)
 		if err := mailCmd.Run(); err != nil {
 			style.PrintWarning("could not notify mayor/ of convoy completion: %v", err)
@@ -1772,6 +1909,13 @@ func notifyConvoyCompletion(townBeads, convoyID, title string) {
 
 	// Push notification to active Mayor session if configured.
 	notifyMayorSession(townBeads, convoyID, title)
+
+	fields.CompletionNotifiedAt = time.Now().UTC().Format(time.RFC3339)
+	newDesc := beads.SetConvoyFields(&beads.Issue{Description: convoys[0].Description}, fields)
+	if err := runTownMutationAndExport(townBeads, "update", convoyID, "--description="+newDesc); err != nil {
+		style.PrintWarning("could not record convoy completion notification state for %s: %v", convoyID, err)
+		return
+	}
 }
 
 // notifyMayorSession pushes a convoy completion notification into the active
@@ -1788,6 +1932,7 @@ func notifyMayorSession(townBeads, convoyID, title string) {
 
 	nudgeMsg := fmt.Sprintf("🚚 Convoy landed: %s — Convoy %s has completed. All tracked issues are now closed.", title, convoyID)
 	nudgeCmd := exec.Command("gt", "nudge", "mayor", "-m", nudgeMsg)
+	nudgeCmd.Env = convoyNudgeEnv(convoyID)
 	if err := nudgeCmd.Run(); err != nil {
 		style.PrintWarning("could not nudge Mayor session: %v", err)
 	}

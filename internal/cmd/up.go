@@ -8,9 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -180,6 +180,7 @@ func runUp(cmd *cobra.Command, args []string) error {
 			os.Setenv(k, v)
 		}
 	}
+	config.ApplyConfiguredDoltEnv(townRoot)
 
 	allOK := true
 	var services []ServiceStatus
@@ -330,8 +331,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 		doltCfg := doltserver.DefaultConfig(townRoot)
 		portStr := fmt.Sprintf("%d", doltCfg.Port)
 		os.Setenv("GT_DOLT_PORT", portStr)
+		os.Setenv("BEADS_DOLT_SERVER_PORT", portStr)
 		os.Setenv("BEADS_DOLT_PORT", portStr)
 		if doltCfg.Host != "" {
+			os.Setenv("GT_DOLT_HOST", doltCfg.Host)
 			os.Setenv("BEADS_DOLT_SERVER_HOST", doltCfg.Host)
 		}
 	}
@@ -755,8 +758,11 @@ func upStartRefinery(rigName string, r *rig.Rig) agentStartResult {
 
 	mgr := refinery.NewManager(r)
 	if err := mgr.Start(false, ""); err != nil {
-		if err == refinery.ErrAlreadyRunning {
+		if errors.Is(err, refinery.ErrAlreadyRunning) {
 			return agentStartResult{name: name, ok: true, detail: mgr.SessionName()}
+		}
+		if errors.Is(err, refinery.ErrForkRig) {
+			return agentStartResult{name: name, ok: true, detail: "skipped (fork-backed rig; use PR workflow)"}
 		}
 		return agentStartResult{name: name, ok: false, detail: err.Error()}
 	}
@@ -1065,4 +1071,3 @@ func recoverOrphanedBeads(townRoot string, rigs []string, prefetchedRigs map[str
 
 	return services
 }
-

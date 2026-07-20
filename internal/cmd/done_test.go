@@ -12,6 +12,7 @@ import (
 
 	"github.com/steveyegge/gastown/internal/beads"
 	gitpkg "github.com/steveyegge/gastown/internal/git"
+	"github.com/steveyegge/gastown/internal/session"
 )
 
 // TestDoneUsesResolveBeadsDir verifies that the done command correctly uses
@@ -119,6 +120,327 @@ func TestForceCloseIssueWithRetryReturnsFinalError(t *testing.T) {
 	}
 	if calls != 3 {
 		t.Fatalf("close calls = %d, want 3", calls)
+	}
+}
+
+func TestReviewOnlyCloseRequiresEvidence(t *testing.T) {
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		Description: "review_only: true\n",
+	}
+
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+	if reason == "" {
+		t.Fatal("expected review-only close skip reason")
+	}
+	if !fatal {
+		t.Fatal("review-only close without evidence should fail closed")
+	}
+	if !strings.Contains(reason, "no fresh assignment timestamp") {
+		t.Fatalf("reason = %q, want missing evidence", reason)
+	}
+}
+
+func TestReviewOnlyCloseRejectsNotesAndDesignEvidence(t *testing.T) {
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
+		Assignee:    "gastown/polecats/toast",
+		Notes:       "FINDINGS: reviewed and no code changes needed",
+		Design:      "PR-SHERIFF-EVIDENCE: pass\nhead_sha: abc123",
+	}
+
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+	if reason == "" || !fatal {
+		t.Fatalf("notes/design should not satisfy review evidence: reason=%q fatal=%v", reason, fatal)
+	}
+}
+
+func TestReviewOnlyCloseAllowsFreshEvidenceComment(t *testing.T) {
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
+		Assignee:    "gastown/polecats/toast",
+		Comments: []beads.Comment{
+			{
+				Author:    "gastown/polecats/toast",
+				CreatedAt: "2026-07-01T12:05:00Z",
+				Text:      "PR-SHERIFF-EVIDENCE: pass\nhead_sha: abc123",
+			},
+		},
+	}
+
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+	if reason != "" || fatal {
+		t.Fatalf("doneReviewOnlyCloseSkipReason = %q, %v; want allowed", reason, fatal)
+	}
+}
+
+func TestReviewOnlyGeneratedCommentsDoNotCountAsEvidence(t *testing.T) {
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
+		Assignee:    "gastown/polecats/toast",
+		Comments: []beads.Comment{
+			{Author: "gastown/polecats/toast", CreatedAt: "2026-07-01T12:05:00Z", Text: "verified_push_skipped: --skip-verify on no-MR close\nPR-SHERIFF-EVIDENCE: pass\nhead_sha: abc123"},
+			{Author: "gastown/polecats/toast", CreatedAt: "2026-07-01T12:06:00Z", Text: "MR created: gt-wisp-abc\nPR-SHERIFF-EVIDENCE: pass\nhead_sha: abc123"},
+		},
+	}
+
+	reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+	if reason == "" || !fatal {
+		t.Fatalf("generated comments should not satisfy review evidence: reason=%q fatal=%v", reason, fatal)
+	}
+}
+
+func TestReviewOnlyCloseRejectsStaleComment(t *testing.T) {
+	tests := []struct {
+		name      string
+		createdAt string
+	}{
+		{name: "before attached_at", createdAt: "2026-07-01T11:59:59Z"},
+		{name: "equal to attached_at", createdAt: "2026-07-01T12:00:00Z"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issue := &beads.Issue{
+				ID:          "gt-review",
+				Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
+				Assignee:    "gastown/polecats/toast",
+				Comments: []beads.Comment{{
+					Author:    "gastown/polecats/toast",
+					CreatedAt: tt.createdAt,
+					Text:      "PR-SHERIFF-EVIDENCE: pass\nhead_sha: abc123",
+				}},
+			}
+
+			reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+			if reason == "" || !fatal {
+				t.Fatalf("stale comment should not satisfy review evidence: reason=%q fatal=%v", reason, fatal)
+			}
+		})
+	}
+}
+
+func TestReviewOnlyCloseRejectsWrongAuthorOrHead(t *testing.T) {
+	tests := []struct {
+		name    string
+		author  string
+		head    string
+		current string
+	}{
+		{name: "wrong author", author: "gastown/polecats/other", head: "abc123", current: "abc123"},
+		{name: "wrong head", author: "gastown/polecats/toast", head: "def456", current: "abc123"},
+		{name: "missing head", author: "gastown/polecats/toast", head: "", current: "abc123"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			text := "PR-SHERIFF-EVIDENCE: pass"
+			if tt.head != "" {
+				text += "\nhead_sha: " + tt.head
+			}
+			issue := &beads.Issue{
+				ID:          "gt-review",
+				Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
+				Assignee:    "gastown/polecats/toast",
+				Comments: []beads.Comment{{
+					Author:    tt.author,
+					CreatedAt: "2026-07-01T12:05:00Z",
+					Text:      text,
+				}},
+			}
+			reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, tt.current)
+			if reason == "" || !fatal {
+				t.Fatalf("invalid evidence should fail closed: reason=%q fatal=%v", reason, fatal)
+			}
+		})
+	}
+}
+
+func TestReviewOnlyCloseRejectsMissingAssigneeOrInvalidCommentTime(t *testing.T) {
+	tests := []struct {
+		name      string
+		assignee  string
+		createdAt string
+	}{
+		{name: "missing assignee", assignee: "", createdAt: "2026-07-01T12:05:00Z"},
+		{name: "invalid comment time", assignee: "gastown/polecats/toast", createdAt: "not-a-time"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issue := &beads.Issue{
+				ID:          "gt-review",
+				Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
+				Assignee:    tt.assignee,
+				Comments: []beads.Comment{{
+					Author:    "gastown/polecats/toast",
+					CreatedAt: tt.createdAt,
+					Text:      "PR-SHERIFF-EVIDENCE: pass\nhead_sha: abc123",
+				}},
+			}
+			reason, fatal := doneReviewOnlyCloseSkipReasonForHead(nil, issue.ID, issue, "abc123")
+			if reason == "" || !fatal {
+				t.Fatalf("invalid metadata should fail closed: reason=%q fatal=%v", reason, fatal)
+			}
+		})
+	}
+}
+
+func TestNonReviewOnlyCloseDoesNotRequireEvidence(t *testing.T) {
+	issue := &beads.Issue{
+		ID:          "gt-review",
+		Description: "no_merge: true\n",
+	}
+
+	reason, fatal := doneReviewOnlyCloseSkipReason(nil, issue.ID, issue)
+	if reason != "" || fatal {
+		t.Fatalf("non-review-only close gate = %q, %v; want no restriction", reason, fatal)
+	}
+}
+
+func TestNonReviewOnlyReviewGateDoesNotChangeCriteriaHandling(t *testing.T) {
+	issue := &beads.Issue{
+		ID:                 "gt-review",
+		Description:        "no_merge: true\n",
+		AcceptanceCriteria: "- [ ] still open\n",
+	}
+
+	reason, fatal := doneSourceCloseSkipReason(nil, issue.ID, issue)
+	if reason == "" || fatal {
+		t.Fatalf("criteria gate = %q, %v; want non-fatal skip", reason, fatal)
+	}
+	if !strings.Contains(reason, "unchecked acceptance criteria") {
+		t.Fatalf("reason = %q, want criteria reason", reason)
+	}
+}
+
+func TestSourceCloseRejectsNonConcreteIssue(t *testing.T) {
+	issue := &beads.Issue{
+		ID:     "gt-mr",
+		Labels: []string{"gt:merge-request"},
+	}
+
+	reason, fatal := doneSourceCloseSkipReason(nil, issue.ID, issue)
+	if reason == "" || !fatal {
+		t.Fatalf("source close gate = %q, %v; want fatal non-concrete rejection", reason, fatal)
+	}
+	if !strings.Contains(reason, "not concrete") {
+		t.Fatalf("reason = %q, want non-concrete reason", reason)
+	}
+}
+
+func TestSourceCloseRejectsLocalMergeStrategy(t *testing.T) {
+	issue := &beads.Issue{
+		ID:          "gt-work",
+		Type:        "task",
+		Description: "merge_strategy: local\n",
+	}
+
+	reason, fatal := doneSourceCloseSkipReason(nil, issue.ID, issue)
+	if reason == "" || fatal {
+		t.Fatalf("local source close gate = %q, %v; want non-fatal skip", reason, fatal)
+	}
+	if !strings.Contains(reason, "merge_strategy=local") {
+		t.Fatalf("reason = %q, want local merge strategy reason", reason)
+	}
+}
+
+func TestDirectMergeRejectsUnsafeSourceBeforePush(t *testing.T) {
+	freshEvidenceReviewOnly := &beads.Issue{
+		ID:          "gt-review",
+		Type:        "task",
+		Description: "review_only: true\nattached_at: 2026-07-01T12:00:00Z\n",
+		Assignee:    "gastown/polecats/toast",
+		Comments: []beads.Comment{{
+			Author:    "gastown/polecats/toast",
+			CreatedAt: "2026-07-01T12:05:00Z",
+			Text:      "PR-SHERIFF-EVIDENCE: pass\nhead_sha: abc123",
+		}},
+	}
+	tests := []struct {
+		name        string
+		issueID     string
+		issue       *beads.Issue
+		wantReason  string
+		wantAllowed bool
+	}{
+		{
+			name:       "missing source id",
+			issue:      &beads.Issue{ID: "gt-work", Type: "task"},
+			wantReason: "source issue is required",
+		},
+		{
+			name:       "non concrete source",
+			issueID:    "gt-mr",
+			issue:      &beads.Issue{ID: "gt-mr", Labels: []string{"gt:merge-request"}},
+			wantReason: "not concrete",
+		},
+		{
+			name:       "review only source",
+			issueID:    "gt-review",
+			issue:      freshEvidenceReviewOnly,
+			wantReason: "review-only issue gt-review cannot be direct-merged",
+		},
+		{
+			name:       "no merge source",
+			issueID:    "gt-work",
+			issue:      &beads.Issue{ID: "gt-work", Type: "task", Description: "no_merge: true\n"},
+			wantReason: "no_merge=true",
+		},
+		{
+			name:       "local merge strategy source",
+			issueID:    "gt-work",
+			issue:      &beads.Issue{ID: "gt-work", Type: "task", Description: "merge_strategy: local\n"},
+			wantReason: "merge_strategy=local",
+		},
+		{
+			name:       "unchecked criteria",
+			issueID:    "gt-work",
+			issue:      &beads.Issue{ID: "gt-work", Type: "task", AcceptanceCriteria: "- [ ] still open\n"},
+			wantReason: "unchecked acceptance criteria",
+		},
+		{
+			name:        "eligible source",
+			issueID:     "gt-work",
+			issue:       &beads.Issue{ID: "gt-work", Type: "task"},
+			wantAllowed: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason := doneDirectMergeSkipReason(nil, tt.issueID, tt.issue, "main")
+			if tt.wantAllowed {
+				if reason != "" {
+					t.Fatalf("direct merge gate = %q; want allowed", reason)
+				}
+				return
+			}
+			if reason == "" || !strings.Contains(reason, tt.wantReason) {
+				t.Fatalf("direct merge gate = %q; want reason containing %q", reason, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestSourceValidationRejectsInternalIssues(t *testing.T) {
+	if err := validateConcreteSourceIssue("gt-work", &beads.Issue{ID: "gt-work", Type: "task"}); err != nil {
+		t.Fatalf("concrete source rejected: %v", err)
+	}
+	if err := validateConcreteSourceIssue("gt-mr", &beads.Issue{ID: "gt-mr", Labels: []string{"gt:merge-request"}}); err == nil {
+		t.Fatal("internal source accepted; want rejection")
+	}
+}
+
+func TestValidateMergeRequestSourceRejectsMissingAndMismatchedSource(t *testing.T) {
+	missing := &beads.Issue{ID: "gt-mr", Description: "branch: polecat/test/gt-work\n"}
+	if err := validateMergeRequestSource(nil, missing, "gt-work"); err == nil || !strings.Contains(err.Error(), "missing source_issue") {
+		t.Fatalf("missing source validation error = %v, want missing source_issue", err)
+	}
+
+	mismatched := &beads.Issue{ID: "gt-mr", Description: "source_issue: gt-other\n"}
+	if err := validateMergeRequestSource(nil, mismatched, "gt-work"); err == nil || !strings.Contains(err.Error(), "does not match expected") {
+		t.Fatalf("mismatched source validation error = %v, want mismatch", err)
 	}
 }
 
@@ -585,35 +907,144 @@ func TestShouldNudgeRefinery(t *testing.T) {
 	}
 }
 
-func TestShouldSyncIdlePolecatWorktree(t *testing.T) {
+func TestShouldUpdateAgentStateOnDone(t *testing.T) {
+	tests := []struct {
+		name       string
+		pushFailed bool
+		mrFailed   bool
+		want       bool
+	}{
+		{"clean submission updates state", false, false, true},
+		{"push failure preserves hook", true, false, false},
+		{"mr failure preserves hook", false, true, false},
+		{"both failures preserve hook", true, true, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldUpdateAgentStateOnDone(tt.pushFailed, tt.mrFailed)
+			if got != tt.want {
+				t.Errorf("shouldUpdateAgentStateOnDone(%v, %v) = %v, want %v", tt.pushFailed, tt.mrFailed, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestUpdateAgentStateAfterSubmissionSkipsFailedSubmissions(t *testing.T) {
+	calls := 0
+	old := updateAgentStateOnDoneFn
+	updateAgentStateOnDoneFn = func(cwd, townRoot, exitType, issueID string) error {
+		calls++
+		return nil
+	}
+	t.Cleanup(func() { updateAgentStateOnDoneFn = old })
+
+	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", true, false); err != nil {
+		t.Fatalf("updateAgentStateAfterSubmission push failure: %v", err)
+	}
+	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", false, true); err != nil {
+		t.Fatalf("updateAgentStateAfterSubmission mr failure: %v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("state update calls after failed submissions = %d, want 0", calls)
+	}
+
+	if err := updateAgentStateAfterSubmission("/work", "/town", ExitCompleted, "gt-abc", false, false); err != nil {
+		t.Fatalf("updateAgentStateAfterSubmission clean submission: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("state update calls after clean submission = %d, want 1", calls)
+	}
+}
+
+func TestShouldRetirePolecatSessionAfterDone(t *testing.T) {
 	tests := []struct {
 		name          string
 		exitType      string
 		mergeStrategy string
 		pushFailed    bool
 		mrFailed      bool
-		syncSafe      bool
 		want          bool
 	}{
-		{"completed default strategy syncs", ExitCompleted, "", false, false, true, true},
-		{"completed direct strategy syncs", ExitCompleted, "direct", false, false, true, true},
-		{"completed mr strategy syncs", ExitCompleted, "mr", false, false, true, true},
-		{"local strategy keeps branch", ExitCompleted, "local", false, false, true, false},
-		{"deferred keeps branch", ExitDeferred, "", false, false, true, false},
-		{"escalated keeps branch", ExitEscalated, "", false, false, true, false},
-		{"push failure keeps branch", ExitCompleted, "", true, false, true, false},
-		{"mr failure keeps branch", ExitCompleted, "", false, true, true, false},
-		{"unsafe sync keeps branch", ExitCompleted, "", false, false, false, false},
+		{"completed default strategy retires", ExitCompleted, "", false, false, true},
+		{"completed direct strategy retires", ExitCompleted, "direct", false, false, true},
+		{"completed mr strategy retires", ExitCompleted, "mr", false, false, true},
+		{"local strategy preserves session", ExitCompleted, "local", false, false, false},
+		{"deferred preserves session", ExitDeferred, "", false, false, false},
+		{"escalated preserves session", ExitEscalated, "", false, false, false},
+		{"push failure preserves session", ExitCompleted, "", true, false, false},
+		{"mr failure preserves session", ExitCompleted, "", false, true, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := shouldSyncIdlePolecatWorktree(tt.exitType, tt.mergeStrategy, tt.pushFailed, tt.mrFailed, tt.syncSafe)
+			got := shouldRetirePolecatSessionAfterDone(tt.exitType, tt.mergeStrategy, tt.pushFailed, tt.mrFailed)
 			if got != tt.want {
-				t.Errorf("shouldSyncIdlePolecatWorktree(%q, %q, %v, %v, %v) = %v, want %v",
-					tt.exitType, tt.mergeStrategy, tt.pushFailed, tt.mrFailed, tt.syncSafe, got, tt.want)
+				t.Errorf("shouldRetirePolecatSessionAfterDone(%q, %q, %v, %v) = %v, want %v",
+					tt.exitType, tt.mergeStrategy, tt.pushFailed, tt.mrFailed, got, tt.want)
 			}
 		})
+	}
+}
+
+type fakeDoneSessionKiller struct {
+	name        string
+	excludePIDs []string
+	calls       int
+}
+
+func (f *fakeDoneSessionKiller) KillSessionWithProcessesExcluding(name string, excludePIDs []string) error {
+	f.calls++
+	f.name = name
+	f.excludePIDs = append([]string(nil), excludePIDs...)
+	return nil
+}
+
+func TestRetirePolecatSessionAfterDoneUsesPIDExclusion(t *testing.T) {
+	fake := &fakeDoneSessionKiller{}
+	old := newDoneSessionKiller
+	newDoneSessionKiller = func() doneSessionKiller { return fake }
+	t.Cleanup(func() { newDoneSessionKiller = old })
+
+	if err := retirePolecatSessionAfterDone("gastown", "nitro", 12345); err != nil {
+		t.Fatalf("retirePolecatSessionAfterDone: %v", err)
+	}
+	if fake.calls != 1 {
+		t.Fatalf("killer calls = %d, want 1", fake.calls)
+	}
+	wantSession := session.PolecatSessionName(session.PrefixFor("gastown"), "nitro")
+	if fake.name != wantSession {
+		t.Fatalf("session name = %q, want %q", fake.name, wantSession)
+	}
+	if len(fake.excludePIDs) != 1 || fake.excludePIDs[0] != "12345" {
+		t.Fatalf("excludePIDs = %#v, want [12345]", fake.excludePIDs)
+	}
+}
+
+func TestRetirePolecatSessionAfterDoneNoopsWithoutIdentity(t *testing.T) {
+	fake := &fakeDoneSessionKiller{}
+	old := newDoneSessionKiller
+	newDoneSessionKiller = func() doneSessionKiller { return fake }
+	t.Cleanup(func() { newDoneSessionKiller = old })
+
+	for _, tt := range []struct {
+		name        string
+		rigName     string
+		polecatName string
+		pid         int
+	}{
+		{"missing rig", "", "nitro", 12345},
+		{"missing polecat", "gastown", "", 12345},
+		{"missing pid", "gastown", "nitro", 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := retirePolecatSessionAfterDone(tt.rigName, tt.polecatName, tt.pid); err != nil {
+				t.Fatalf("retirePolecatSessionAfterDone: %v", err)
+			}
+		})
+	}
+	if fake.calls != 0 {
+		t.Fatalf("killer calls = %d, want 0", fake.calls)
 	}
 }
 
@@ -634,6 +1065,66 @@ func TestCleanupStatusAfterSuccessfulPush(t *testing.T) {
 		t.Run(tt.status, func(t *testing.T) {
 			if got := cleanupStatusAfterSuccessfulPush(tt.status); got != tt.want {
 				t.Errorf("cleanupStatusAfterSuccessfulPush(%q) = %q, want %q", tt.status, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCleanupStatusFromWorkState(t *testing.T) {
+	pushErr := errors.New("remote unavailable")
+	tests := []struct {
+		name          string
+		status        *gitpkg.UncommittedWorkStatus
+		branchPushed  bool
+		unpushedCount int
+		pushErr       error
+		want          string
+	}{
+		{name: "nil", status: nil, branchPushed: true, want: "unknown"},
+		{
+			name:         "runtime only pushed",
+			status:       &gitpkg.UncommittedWorkStatus{HasUncommittedChanges: true, ModifiedFiles: []string{".opencode/plugins/gastown.js"}},
+			branchPushed: true,
+			want:         "clean",
+		},
+		{
+			name:         "runtime plus source",
+			status:       &gitpkg.UncommittedWorkStatus{HasUncommittedChanges: true, ModifiedFiles: []string{".opencode/plugins/gastown.js", "internal/cmd/done.go"}},
+			branchPushed: true,
+			want:         "uncommitted",
+		},
+		{
+			name:         "runtime plus stash",
+			status:       &gitpkg.UncommittedWorkStatus{HasUncommittedChanges: true, ModifiedFiles: []string{".opencode/plugins/gastown.js"}, StashCount: 1},
+			branchPushed: true,
+			want:         "stash",
+		},
+		{
+			name:          "runtime plus unpushed",
+			status:        &gitpkg.UncommittedWorkStatus{HasUncommittedChanges: true, ModifiedFiles: []string{".opencode/plugins/gastown.js"}},
+			branchPushed:  true,
+			unpushedCount: 1,
+			want:          "unpushed",
+		},
+		{
+			name:         "runtime plus push error",
+			status:       &gitpkg.UncommittedWorkStatus{HasUncommittedChanges: true, ModifiedFiles: []string{".opencode/plugins/gastown.js"}},
+			branchPushed: true,
+			pushErr:      pushErr,
+			want:         "unpushed",
+		},
+		{
+			name:         "runtime conflict",
+			status:       &gitpkg.UncommittedWorkStatus{HasUncommittedChanges: true, UnmergedFiles: []string{".opencode/plugins/gastown.js"}},
+			branchPushed: true,
+			want:         "uncommitted",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := cleanupStatusFromWorkState(tt.status, tt.branchPushed, tt.unpushedCount, tt.pushErr); got != tt.want {
+				t.Fatalf("cleanupStatusFromWorkState() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -1497,7 +1988,7 @@ func TestPushSubmoduleChanges_Integration(t *testing.T) {
 
 	// Call pushSubmoduleChanges — this should push the submodule commit
 	g := gitpkg.NewGit(parent)
-	pushSubmoduleChanges(g, "main")
+	pushSubmoduleChanges(g, "origin/main")
 
 	// Verify the submodule commit IS now on the remote
 	lsCmd = exec.Command("git", "ls-remote", subRemote, "refs/heads/main")
@@ -1537,7 +2028,7 @@ func TestPushSubmoduleChanges_NoSubmodules(t *testing.T) {
 
 	// Should not panic or error — just a no-op
 	g := gitpkg.NewGit(parent)
-	pushSubmoduleChanges(g, "main")
+	pushSubmoduleChanges(g, "origin/main")
 }
 
 // TestAutoCommitSafetyNet verifies that the gt done auto-commit safety net

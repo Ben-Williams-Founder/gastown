@@ -95,6 +95,8 @@ func sdkIssueToIssue(si *beadsdk.Issue) *Issue {
 		ID:                 si.ID,
 		Title:              si.Title,
 		Description:        si.Description,
+		Design:             si.Design,
+		Notes:              si.Notes,
 		Status:             string(si.Status),
 		Priority:           si.Priority,
 		Type:               string(si.IssueType),
@@ -107,6 +109,13 @@ func sdkIssueToIssue(si *beadsdk.Issue) *Issue {
 		AcceptanceCriteria: si.AcceptanceCriteria,
 		Metadata:           si.Metadata,
 	}
+	for _, c := range si.Comments {
+		comment, ok := sdkCommentToComment(c)
+		if !ok {
+			continue
+		}
+		issue.Comments = append(issue.Comments, comment)
+	}
 
 	if si.ClosedAt != nil {
 		issue.ClosedAt = si.ClosedAt.Format(time.RFC3339)
@@ -117,16 +126,16 @@ func sdkIssueToIssue(si *beadsdk.Issue) *Issue {
 	if len(si.Dependencies) > 0 {
 		var deps []string
 		for _, dep := range si.Dependencies {
-			switch dep.Type {
-			case beadsdk.DepParentChild:
+			if dep.IssueID != si.ID {
+				continue
+			}
+
+			switch {
+			case dep.Type == beadsdk.DepParentChild:
 				// If this issue depends on the parent, the parent is the DependsOnID
-				if dep.IssueID == si.ID {
-					issue.Parent = dep.DependsOnID
-				}
-			case beadsdk.DepBlocks:
-				if dep.IssueID == si.ID {
-					deps = append(deps, dep.DependsOnID)
-				}
+				issue.Parent = dep.DependsOnID
+			case isBlockingDependencyType(string(dep.Type)):
+				deps = append(deps, dep.DependsOnID)
 			}
 		}
 		if len(deps) > 0 {
@@ -135,6 +144,49 @@ func sdkIssueToIssue(si *beadsdk.Issue) *Issue {
 	}
 
 	return issue
+}
+
+func sdkCommentToComment(c *beadsdk.Comment) (Comment, bool) {
+	if c == nil {
+		return Comment{}, false
+	}
+	return Comment{
+		ID:        c.ID,
+		IssueID:   c.IssueID,
+		Author:    c.Author,
+		Text:      c.Text,
+		CreatedAt: c.CreatedAt.Format(time.RFC3339Nano),
+	}, true
+}
+
+func sdkDependencyMetadataToIssueDep(dep *beadsdk.IssueWithDependencyMetadata) IssueDep {
+	if dep == nil {
+		return IssueDep{}
+	}
+	return IssueDep{
+		ID:             dep.ID,
+		Title:          dep.Title,
+		Status:         string(dep.Status),
+		Priority:       dep.Priority,
+		Type:           string(dep.IssueType),
+		DependencyType: string(dep.DependencyType),
+		CloseReason:    dep.CloseReason,
+	}
+}
+
+func sdkDependencyMetadataToIssueDeps(deps []*beadsdk.IssueWithDependencyMetadata) []IssueDep {
+	if len(deps) == 0 {
+		return nil
+	}
+	issueDeps := make([]IssueDep, 0, len(deps))
+	for _, dep := range deps {
+		issueDep := sdkDependencyMetadataToIssueDep(dep)
+		if issueDep.ID == "" {
+			continue
+		}
+		issueDeps = append(issueDeps, issueDep)
+	}
+	return issueDeps
 }
 
 // sdkIssuesToIssues converts a slice of SDK issues to gastown issues.
@@ -186,6 +238,8 @@ func issueFilterFromListOpts(opts ListOptions) beadsdk.IssueFilter {
 	if opts.Ephemeral {
 		eph := true
 		f.Ephemeral = &eph
+	} else {
+		f.SkipWisps = true
 	}
 
 	return f
@@ -245,7 +299,10 @@ func (b *Beads) storeShow(id string) (*Issue, error) {
 		return nil, fmt.Errorf("store show: %w", err)
 	}
 
-	issue := sdkIssueToIssue(si)
+	issue, err := b.storeHydrateIssueDetails(ctx, sdkIssueToIssue(si))
+	if err != nil {
+		return nil, err
+	}
 
 	// Enrich with labels (SDK GetIssue may not include them)
 	if issue.Labels == nil {
@@ -274,9 +331,26 @@ func (b *Beads) storeShowMultiple(ids []string) (map[string]*Issue, error) {
 
 	result := make(map[string]*Issue, len(sdkIssues))
 	for _, si := range sdkIssues {
-		result[si.ID] = sdkIssueToIssue(si)
+		issue, hydrateErr := b.storeHydrateIssueDetails(ctx, sdkIssueToIssue(si))
+		if hydrateErr != nil {
+			return nil, hydrateErr
+		}
+		result[si.ID] = issue
 	}
 	return result, nil
+}
+
+func (b *Beads) storeHydrateIssueDetails(ctx context.Context, issue *Issue) (*Issue, error) {
+	if issue == nil {
+		return nil, nil
+	}
+	deps, err := b.store.GetDependenciesWithMetadata(ctx, issue.ID)
+	if err != nil {
+		return nil, fmt.Errorf("store dependencies for %s: %w", issue.ID, err)
+	}
+	issue.Dependencies = sdkDependencyMetadataToIssueDeps(deps)
+	issue.DependencyCount = len(issue.Dependencies)
+	return issue, nil
 }
 
 // storeCreate implements Create using the in-process store.

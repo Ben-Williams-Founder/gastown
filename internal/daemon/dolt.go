@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	agentconfig "github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
@@ -162,11 +163,26 @@ func NewDoltServerManager(townRoot string, config *DoltServerConfig, logger func
 	if config == nil {
 		config = DefaultDoltServerConfig(townRoot)
 	}
+	config = normalizeDoltServerConfig(townRoot, config)
 	return &DoltServerManager{
 		config:   config,
 		townRoot: townRoot,
 		logger:   logger,
 	}
+}
+
+func normalizeDoltServerConfig(townRoot string, config *DoltServerConfig) *DoltServerConfig {
+	if config == nil {
+		return nil
+	}
+	normalized := *config
+	if host, port, ok := agentconfig.ManagedDoltEndpoint(townRoot); ok {
+		normalized.Host = host
+		if port > 0 {
+			normalized.Port = port
+		}
+	}
+	return &normalized
 }
 
 // SetRecoveryCallback registers fn to be called (in a goroutine) whenever Dolt
@@ -921,12 +937,6 @@ func (m *DoltServerManager) startLocked() error {
 		m.logger("Warning: failed to write Dolt config.yaml: %v", err)
 	}
 
-	// Build command arguments
-	args := []string{
-		"sql-server",
-		"--config", configPath,
-	}
-
 	// Open log file
 	logFile, err := os.OpenFile(m.config.LogFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err != nil {
@@ -934,8 +944,7 @@ func (m *DoltServerManager) startLocked() error {
 	}
 
 	// Start dolt sql-server as background process
-	cmd := exec.Command(doltPath, args...)
-	cmd.Dir = m.config.DataDir
+	cmd := doltserver.NewSQLServerCommand(doltPath, m.config.DataDir, configPath)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 

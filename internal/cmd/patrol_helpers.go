@@ -2,12 +2,15 @@ package cmd
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
+	"github.com/steveyegge/gastown/internal/constants"
+	"github.com/steveyegge/gastown/internal/refinery"
 	"github.com/steveyegge/gastown/internal/style"
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -51,14 +54,10 @@ func findActivePatrol(cfg PatrolConfig) (patrolID, patrolLine string, found bool
 		b = beads.New(cfg.BeadsDir)
 	}
 
-	// Find hooked patrol beads for this agent
-	hookedBeads, listErr := b.List(beads.ListOptions{
-		Status:   beads.StatusHooked,
-		Assignee: cfg.Assignee,
-		Priority: -1,
-	})
+	// Find active patrol beads for this agent across durable issues and wisps.
+	hookedBeads, listErr := listAssignedActiveWorkAcrossStatuses(b, cfg.Assignee)
 	if listErr != nil {
-		return "", "", false, fmt.Errorf("listing hooked beads: %w", listErr)
+		return "", "", false, fmt.Errorf("listing active patrol work: %w", listErr)
 	}
 
 	// Identify active patrol and collect stale ones for cleanup.
@@ -128,11 +127,7 @@ func findActivePatrol(cfg PatrolConfig) (patrolID, patrolLine string, found bool
 // children materialized yet. This prevents findActivePatrol from closing a
 // just-created patrol during the window between root creation and step population.
 func checkHasOpenChildren(b *beads.Beads, parentID string) (bool, error) {
-	children, err := b.List(beads.ListOptions{
-		Parent:   parentID,
-		Status:   "all",
-		Priority: -1,
-	})
+	children, err := listChildrenAcrossTables(b, parentID)
 	if err != nil {
 		return false, err
 	}
@@ -164,14 +159,10 @@ func burnPreviousPatrolWisps(cfg PatrolConfig) {
 		b = beads.New(cfg.BeadsDir)
 	}
 
-	// Find all hooked patrol beads for this agent
-	hookedBeads, err := b.List(beads.ListOptions{
-		Status:   beads.StatusHooked,
-		Assignee: cfg.Assignee,
-		Priority: -1,
-	})
+	// Find all active patrol beads for this agent across durable issues and wisps.
+	hookedBeads, err := listAssignedActiveWorkAcrossStatuses(b, cfg.Assignee)
 	if err != nil {
-		style.PrintWarning("burn: could not list hooked beads: %v", err)
+		style.PrintWarning("burn: could not list active patrol work: %v", err)
 		return
 	}
 
@@ -201,6 +192,12 @@ func burnPreviousPatrolWisps(cfg PatrolConfig) {
 // self-cleaning regardless of the caller.
 // Returns the patrol ID or an error.
 func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
+	if stop, err := refineryPatrolSafetyStop(cfg); err != nil {
+		return "", err
+	} else if stop != nil {
+		return "", refinery.NewSafetyStoppedError(stop)
+	}
+
 	// Resolve the beads directory following redirects.
 	// This ensures bd targets the correct database (e.g., rig database
 	// instead of HQ) regardless of inherited BEADS_DIR. See gt-ctir.
@@ -303,7 +300,49 @@ func autoSpawnPatrol(cfg PatrolConfig) (string, error) {
 		return patrolID, fmt.Errorf("created wisp %s but failed to hook", patrolID)
 	}
 
+	desc, err := renderPatrolWispDescription(cfg)
+	if err != nil {
+		style.PrintWarning("could not render patrol description for %s: %v", patrolID, err)
+	} else if err := updatePatrolWispDescription(cfg, resolvedBeadsDir, patrolID, desc); err != nil {
+		style.PrintWarning("could not write patrol description for %s: %v", patrolID, err)
+	}
+
 	return patrolID, nil
+}
+
+func renderPatrolWispDescription(cfg PatrolConfig) (string, error) {
+	rigName := patrolRigName(cfg)
+	ctx := RoleContext{TownRoot: cfg.BeadsDir, Rig: rigName}
+	var vars []string
+	switch cfg.PatrolMolName {
+	case constants.MolWitnessPatrol:
+		vars = buildWitnessPatrolVars(ctx)
+	case constants.MolRefineryPatrol:
+		vars = buildRefineryPatrolVars(ctx)
+	}
+	vars = append(vars, cfg.ExtraVars...)
+	return renderFormulaRootAndStepsFull(cfg.PatrolMolName, cfg.BeadsDir, rigName, vars)
+}
+
+func patrolRigName(cfg PatrolConfig) string {
+	rigName, _, ok := strings.Cut(cfg.Assignee, "/")
+	if !ok {
+		return ""
+	}
+	return rigName
+}
+
+func updatePatrolWispDescription(cfg PatrolConfig, resolvedBeadsDir, patrolID, desc string) error {
+	desc = strings.TrimSpace(desc)
+	if desc == "" {
+		return nil
+	}
+	return BdCmd("update", patrolID, "--body-file=-").
+		Stdin(strings.NewReader(desc)).
+		WithAutoCommit().
+		WithBeadsDir(resolvedBeadsDir).
+		Dir(cfg.BeadsDir).
+		Run()
 }
 
 // outputPatrolContext is the main function that handles patrol display logic.
@@ -331,6 +370,10 @@ func outputPatrolContext(cfg PatrolConfig) {
 		var err error
 		patrolID, err = autoSpawnPatrol(cfg)
 		if err != nil {
+			if errors.Is(err, refinery.ErrSafetyStopped) {
+				fmt.Println(style.Dim.Render(err.Error()))
+				return
+			}
 			if patrolID != "" {
 				fmt.Printf("⚠ %s\n", err.Error())
 			} else {
@@ -357,4 +400,15 @@ func outputPatrolContext(cfg PatrolConfig) {
 		fmt.Println()
 		fmt.Printf("Current patrol ID: %s\n", patrolID)
 	}
+}
+
+func refineryPatrolSafetyStop(cfg PatrolConfig) (*refinery.SafetyStop, error) {
+	if cfg.RoleName != "refinery" {
+		return nil, nil
+	}
+	rigName := strings.TrimSuffix(cfg.Assignee, "/refinery")
+	if rigName == cfg.Assignee || rigName == "" {
+		return nil, nil
+	}
+	return refinery.ActiveSafetyStop(cfg.BeadsDir, rigName)
 }
