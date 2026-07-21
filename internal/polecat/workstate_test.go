@@ -126,7 +126,11 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			// `git cherry` reports every checkpoint as unmerged). Clean worktree.
 			// WorkBeadClosed must make this SAFE_TO_NUKE, not NEEDS_RECOVERY.
 			name: "closed work bead with unpushed checkpoints is safe",
-			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/nitro", UnpushedCommits: 36, WorkBeadClosed: true, MQCheckRequired: true, HasSubmittableWork: true, AssignedBeadTerminal: true},
+			// A closed/merged work bead's MR was submitted and merged (upstream's
+			// MQ gate now requires MRSubmitted to reach "submitted"), so set it.
+			// The case still exercises M: 36 unpushed pre-squash checkpoints that
+			// WorkBeadClosed must suppress from the git-unpushed recovery block.
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/nitro", UnpushedCommits: 36, WorkBeadClosed: true, MQCheckRequired: true, HasSubmittableWork: true, MRSubmitted: true, AssignedBeadTerminal: true},
 			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, MQStatus: "submitted", ReuseStatus: "idle-preserved"},
 		},
 		{
