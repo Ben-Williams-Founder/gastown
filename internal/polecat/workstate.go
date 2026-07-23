@@ -74,7 +74,20 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 	}
 
-	if in.State != StateIdle {
+	// StateDone is the completion state: the polecat called `gt done`, cleared
+	// its assignment, and its session is expected to be dead. Whether such a
+	// polecat is safe to reap is fully determined by the git/cleanup/MR facts
+	// gathered below (which already handle preserved/merged MRs, pending MRs,
+	// and at-risk WIP). Short-circuiting it to NEEDS_RECOVERY here — as every
+	// other non-idle state does — pins a dead-session, clean-tree, merged-MR
+	// polecat in NEEDS_RECOVERY with EMPTY blockers ("unknown recovery
+	// predicate"), so the auto-reaper (which only nukes on SAFE_TO_NUKE) never
+	// clears it and a human must `gt polecat nuke --force`
+	// (Q-gastown-reaper-active-mr-recovery-gap). Let StateDone fall through to
+	// fact-based evaluation. A done polecat with a still-pending MR is already
+	// caught as PENDING_MR above; genuinely at-risk state (dirty/stash/unpushed/
+	// unsubmitted MR) still flags NEEDS_RECOVERY with a NAMED blocker below.
+	if in.State != StateIdle && in.State != StateDone {
 		verdict := WorkstateVerdictNeedsRecovery
 		needsRecovery := true
 		if in.State == StateWorking {
@@ -89,6 +102,14 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		}
 		if in.ActiveWorkBlocker != "" {
 			d.Blockers = append(d.Blockers, in.ActiveWorkBlocker)
+		}
+		// Never emit a NEEDS_RECOVERY with no blockers: an empty Blockers list
+		// renders as "Cleanup refused by an unknown recovery predicate" in
+		// check-recovery, which tells an operator nothing about why cleanup was
+		// refused. Name the actual refusing predicate (the non-idle lifecycle
+		// state) so the message is actionable.
+		if needsRecovery && len(d.Blockers) == 0 {
+			d.Blockers = append(d.Blockers, "state="+string(in.State)+" session=not-idle")
 		}
 		return d
 	}

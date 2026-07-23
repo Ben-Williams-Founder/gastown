@@ -104,9 +104,47 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: "idle-pr-open", Blockers: []string{"active_mr=gt-mr-open status=open"}},
 		},
 		{
-			name: "done without mr blocks reuse until cleanup",
+			// Q-gastown-reaper-active-mr-recovery-gap: a done polecat with a dead
+			// session and a clean tree and no at-risk work is reap-eligible. It
+			// must NOT be pinned in NEEDS_RECOVERY (which the auto-reaper skips),
+			// forcing a manual `gt polecat nuke --force`.
+			name: "done with clean tree and no at-risk work is safe to nuke",
 			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean},
-			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, ReuseStatus: "idle-clean"},
+		},
+		{
+			// Q-gastown-reaper-active-mr-recovery-gap (the exact observed case):
+			// dead-session done polecat, cleanup_status=clean, an active_mr whose
+			// work is already merged/preserved so the gatherer omits ActiveMRBlocker
+			// and reports no submittable (unpreserved) work. Previously the
+			// State!=StateIdle short-circuit forced NEEDS_RECOVERY with empty
+			// blockers ("unknown recovery predicate"); now the git-truth facts win
+			// and the reaper can clear it.
+			name: "done with merged/preserved active mr is safe to nuke",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/nitro", ActiveMR: "gt-mr-merged", WorkBeadClosed: true, AssignedBeadTerminal: true, MQCheckRequired: true, HasSubmittableWork: false},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, MQStatus: "not_required", ReuseStatus: "idle-preserved"},
+		},
+		{
+			// Retain guard: a done polecat whose MR is still pending in the merge
+			// queue must stay PENDING_MR, never get reaped.
+			name: "done with pending active mr stays pending",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/nitro", ActiveMR: "gt-mr-open", ActiveMRBlocker: "active_mr=gt-mr-open status=open"},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictPendingMR, Reason: "active-mr-open", ReuseStatus: "idle-pr-open", Blockers: []string{"active_mr=gt-mr-open status=open"}},
+		},
+		{
+			// Retain guard: a done polecat with genuinely at-risk unpushed work on
+			// an OPEN bead must still flag NEEDS_RECOVERY — now with a NAMED blocker
+			// instead of the old empty "unknown recovery predicate".
+			name: "done with unpreserved unpushed work still needs recovery",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/nitro", UnpushedCommits: 3, WorkBeadClosed: false},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "git-unpushed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"git_state=has_unpushed unpushed_commits=3"}},
+		},
+		{
+			// A genuine recovery state (stalled) with no other blocker must still
+			// name a predicate rather than rendering "unknown recovery predicate".
+			name: "stalled with no other blocker names the predicate",
+			in:   WorkstateInput{State: StateStalled, CleanupStatus: CleanupClean},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "not-idle", NeedsRecovery: true, CountsTowardCapacity: true, Blockers: []string{"state=stalled session=not-idle"}},
 		},
 		{
 			name: "working counts as working capacity",

@@ -107,13 +107,17 @@ func TestBuildPolecatInventoryItem(t *testing.T) {
 			wantVerdict: polecat.WorkstateVerdictPendingMR,
 		},
 		{
-			name:         "done without active mr is not reusable",
+			// Q-gastown-reaper-active-mr-recovery-gap: a done polecat with a clean
+			// tree and no active MR and no at-risk work is reap-eligible, not pinned
+			// in NEEDS_RECOVERY (which the auto-reaper skips → manual nuke).
+			name:         "done with clean tree and no active mr is safe to nuke",
 			polecatName:  "done",
 			fields:       &beads.AgentFields{AgentState: string(beads.AgentStateDone), CleanupStatus: string(polecat.CleanupClean)},
 			wantState:    polecat.StateDone,
-			wantVerdict:  polecat.WorkstateVerdictNeedsRecovery,
-			wantRecovery: true,
-			wantCapacity: true,
+			wantVerdict:  polecat.WorkstateVerdictSafeToNuke,
+			wantReusable: true,
+			wantRecovery: false,
+			wantCapacity: false,
 		},
 		{
 			name:        "done with active mr remains pending",
