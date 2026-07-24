@@ -290,6 +290,15 @@ func dispatchScheduledWork(townRoot, actor string, batchOverride int, dryRun boo
 					style.Dim.Render("○"), b.WorkBeadID, err)
 				return
 			} else {
+				// Surface the actual per-bead dispatch failure at run time. Without this,
+				// the operator only sees the aggregate summary "reason: <plan-reason>"
+				// (e.g. "reason: batch", which merely describes the batch-size limit, not
+				// the failure) and cannot tell WHY a bead failed — the real error was
+				// recorded to the feed event and the context's LastFailure but never
+				// printed. This turns an opaque per-bead jam into a self-diagnosing one.
+				// See Q-gastown-dispatch-batch-circuit-break.
+				fmt.Fprintf(os.Stderr, "%s Dispatch of %s → %s failed: %v\n",
+					style.Warning.Render("⚠"), b.WorkBeadID, b.TargetRig, err)
 				_ = events.LogFeed(events.TypeSchedulerDispatchFailed, actor,
 					events.SchedulerDispatchFailedPayload(b.WorkBeadID, b.TargetRig, err.Error()))
 			}
