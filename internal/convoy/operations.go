@@ -13,6 +13,7 @@ import (
 
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/constants"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -172,6 +173,76 @@ var slingableTypes = map[string]bool{
 // Exported for use by cmd/convoy.go stranded scan path.
 func IsSlingableType(issueType string) bool {
 	return slingableTypes[issueType]
+}
+
+// controlPlaneTypes is the DENYLIST of bead types that must never be dispatched
+// to a rig worker (polecat/crew): containers, coordination beads, inter-agent
+// comms, and non-work meta. A worker executing one of these (e.g. a
+// mol-deacon-patrol molecule) can cause duplicate patrols, mail loss, spawn
+// storms, or town-freeze-class SIGTERMs (hq-ku7i).
+//
+// It is DERIVED from constants.BeadsCustomTypesList() (every gastown-registered
+// custom type is control-plane infra: agent/role/rig/convoy/slot/queue/event/
+// message/molecule/gate/merge-request) PLUS the bd built-in container / non-work
+// types that are not custom (epic/sub-epic/milestone/decision) and the gt:handoff
+// comms marker. Deriving from the constant keeps it from drifting when a new
+// custom type is registered — a hand-maintained list previously missed "queue".
+//
+// This is a DENYLIST, not the inverse of the slingable set, on purpose: bd
+// supports custom/aliased LEAF work types (spike, story, research, docs, ...) and
+// treats "unknown/empty → slingable". Work types (task/bug/feature/chore/spike/
+// story) and custom/unknown leaf types are NOT here and remain dispatchable.
+var controlPlaneTypes = buildControlPlaneTypes()
+
+func buildControlPlaneTypes() map[string]bool {
+	m := map[string]bool{
+		"epic":      true, // bd built-in container
+		"sub-epic":  true, // bd built-in container
+		"milestone": true, // bd built-in: marks completion, no work itself
+		"decision":  true, // bd built-in: non-work
+		"handoff":   true, // gt:handoff inter-agent comms marker
+	}
+	// All gastown custom types are control-plane infra.
+	for _, t := range constants.BeadsCustomTypesList() {
+		m[normalizeType(t)] = true
+	}
+	return m
+}
+
+// normalizeType lower-cases and trims a raw issue type or label-derived type so
+// that casing/whitespace variants ("Molecule", " molecule ") classify the same
+// as the canonical lowercase form. bd does not normalize types on write.
+func normalizeType(t string) string {
+	return strings.TrimSpace(strings.ToLower(t))
+}
+
+// IsControlPlaneType reports whether a bead TYPE string is control-plane and must
+// not be dispatched to a worker. Work types (task/bug/feature/chore/spike/story),
+// custom leaf types, and empty (defaults to task) are NOT control-plane. Prefer
+// IsControlPlaneBead when both the issue_type field and labels are available,
+// since bead types have migrated from the field into gt:<type> labels. See hq-ku7i.
+func IsControlPlaneType(issueType string) bool {
+	return controlPlaneTypes[normalizeType(issueType)]
+}
+
+// IsControlPlaneBead reports whether a bead is control-plane based on EITHER its
+// issue_type field OR any gt:<type> label. Types are increasingly stored as
+// gt:<type> labels with the issue_type field defaulting to "task" (e.g. a convoy
+// reads issue_type="task" + labels=["gt:convoy"]), so a field-only check fails
+// open. Non-type gt:* labels are safely ignored because they won't match the
+// control-plane denylist. Mirrors the field-or-label pattern in internal/web/api.go.
+func IsControlPlaneBead(issueType string, labels []string) bool {
+	if IsControlPlaneType(issueType) {
+		return true
+	}
+	for _, l := range labels {
+		if t, ok := strings.CutPrefix(normalizeType(l), "gt:"); ok {
+			if controlPlaneTypes[t] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // blockingDepTypes are dependency types that prevent an issue from being

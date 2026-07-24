@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/nudge"
 	"github.com/steveyegge/gastown/internal/runtime"
@@ -267,6 +268,25 @@ func runHook(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("finding town root: %w", err)
 	}
 	townBeadsDir := filepath.Join(townRoot, ".beads")
+
+	// Control-plane guard (hq-ku7i): never hook a control-plane bead (molecule/
+	// gate/epic/convoy/queue/decision/message/event/...) onto a RIG WORKER
+	// (polecat/crew). Same invariant as gt sling, enforced here because gt hook is a
+	// separate raw bd-update path. Gated on the resolved target being a rig worker,
+	// so control agents (mayor/deacon/witness) and the Deacon's dogs may still hold
+	// control-plane beads. Detected via issue_type field OR gt:<type> label. Fails
+	// CLOSED on a read error (consistent with the sling/executeSling guards): the
+	// bead was just verified to exist, so we must be able to read its type before
+	// hooking it to a worker.
+	if isRigWorkerTarget(agentID) {
+		hookInfo, hookErr := getBeadInfo(beadID)
+		if hookErr != nil {
+			return fmt.Errorf("cannot verify bead %s type before hooking to rig worker %s: %w", beadID, agentID, hookErr)
+		}
+		if convoy.IsControlPlaneBead(hookInfo.IssueType, hookInfo.Labels) {
+			return fmt.Errorf("refusing to hook %s onto rig worker %s: it is a control-plane bead (issue_type=%q labels=%v) and must not execute on a worker — control-plane beads are run by the control plane, not a worker", beadID, agentID, hookInfo.IssueType, hookInfo.Labels)
+		}
+	}
 
 	// Resolve the beads directory for the target agent.
 	// For remote targets, resolve from the agent bead's prefix to find the

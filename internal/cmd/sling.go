@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/lock"
 	"github.com/steveyegge/gastown/internal/mail"
@@ -768,6 +769,22 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 	// resuming an existing PR instead of creating a fresh branch.
 	if slingResumeBranch != "" {
 		slingVars = append(slingVars, fmt.Sprintf("resume_branch=%s", slingResumeBranch))
+	}
+
+	// Control-plane guard (hq-ku7i): a RIG WORKER (polecat/crew) that runs a
+	// control-plane bead — a molecule (e.g. mol-deacon-patrol), or an epic/convoy/
+	// gate/decision/message/event/... — can trigger duplicate patrols, mail loss,
+	// spawn storms or town-freeze-class SIGTERMs. Detected via the issue_type field
+	// OR a gt:<type> label (types have migrated into labels; a field-only check fails
+	// open). Applies to polecats AND crew (not just polecats), but NOT dogs (the
+	// Deacon's control-plane executors). NOT --force-overridable — there is no
+	// legitimate reason to run a control-plane bead on a rig worker. Skipped for
+	// self-sling (an agent dispatching to itself).
+	if isRigWorkerTarget(targetAgent) && !isSelfSling {
+		if convoy.IsControlPlaneBead(info.IssueType, info.Labels) {
+			rollbackSpawnedPolecat("Control-plane bead refused")
+			return fmt.Errorf("refusing to sling %s to worker %s: it is a control-plane bead (issue_type=%q labels=%v) and must not execute on a worker — control-plane beads (molecule/gate/epic/convoy/decision/message/event/...) are run by the control plane, not a worker", beadID, targetAgent, info.IssueType, info.Labels)
+		}
 	}
 
 	// Cross-rig guard: prevent slinging beads to polecats in the wrong rig (gt-myecw).

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/mail"
 	"github.com/steveyegge/gastown/internal/style"
@@ -137,6 +138,18 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 	if info.Status == "closed" || info.Status == "tombstone" {
 		result.ErrMsg = "already " + info.Status
 		return result, fmt.Errorf("bead %s is %s (work already completed)", params.BeadID, info.Status)
+	}
+
+	// Control-plane guard (hq-ku7i): a rig dispatch spawns/feeds a worker polecat.
+	// Refuse control-plane/container beads (molecule/gate/epic/convoy/decision/
+	// message/event/...) here so that batch sling, the scheduler queue, and any
+	// keepfed-style auto-dispatcher cannot land one on a worker. Detected via the
+	// issue_type field OR a gt:<type> label (types have migrated into labels; a
+	// field-only check fails open). Mirrors the runSling guard (sling.go). Not
+	// --force-overridable — there is no legitimate reason to run a control-plane bead on a worker.
+	if params.RigName != "" && convoy.IsControlPlaneBead(info.IssueType, info.Labels) {
+		result.ErrMsg = "control-plane bead refused"
+		return result, fmt.Errorf("refusing to dispatch %s to rig %q: it is a control-plane bead (issue_type=%q labels=%v) and must not execute on a worker polecat; control-plane beads (molecule/gate/epic/convoy/decision/message/event/...) are run by the control plane, not a worker", params.BeadID, params.RigName, info.IssueType, info.Labels)
 	}
 
 	// Save explicit force state before dead-agent auto-force, so the deferred

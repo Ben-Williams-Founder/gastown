@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/steveyegge/gastown/internal/constants"
+
 	beadsdk "github.com/steveyegge/beads"
 )
 
@@ -66,6 +68,108 @@ func TestIsSlingableType(t *testing.T) {
 				t.Errorf("IsSlingableType(%q) = %v, want %v", tt.issueType, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestIsControlPlaneType verifies the control-plane DENYLIST: known container/
+// coordination/comms/meta types are control-plane; leaf work types (including
+// custom/unknown and empty) are NOT — so custom work types like spike/story are
+// dispatchable and only the enumerated control-plane types are refused (hq-ku7i).
+func TestIsControlPlaneType(t *testing.T) {
+	tests := []struct {
+		issueType string
+		want      bool
+	}{
+		// Work types (incl. real custom leaf types) — NOT control-plane.
+		{"task", false},
+		{"bug", false},
+		{"feature", false},
+		{"chore", false},
+		{"spike", false},    // real bd work type (timeboxed investigation)
+		{"story", false},    // real bd work type
+		{"research", false}, // custom leaf work type
+		{"docs", false},     // custom leaf work type
+		{"", false},         // empty defaults to task
+		{"unknown", false},  // unknown/custom types default to slingable, not control-plane
+		// Control-plane / container / comms / meta — control-plane.
+		{"molecule", true},
+		{"gate", true},
+		{"epic", true},
+		{"sub-epic", true},
+		{"convoy", true},
+		{"milestone", true},
+		{"decision", true},
+		{"message", true},
+		{"handoff", true},
+		{"merge-request", true},
+		{"event", true},
+		{"queue", true}, // mail-routing infra (regression: was missed by the hand-list)
+		{"slot", true},
+		{"agent", true},
+		{"role", true},
+		{"rig", true},
+		// Casing / whitespace must normalize.
+		{"Molecule", true},
+		{"MOLECULE", true},
+		{" molecule ", true},
+		{"Task", false},
+		{" task", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.issueType, func(t *testing.T) {
+			if got := IsControlPlaneType(tt.issueType); got != tt.want {
+				t.Errorf("IsControlPlaneType(%q) = %v, want %v", tt.issueType, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestIsControlPlaneBead verifies field-OR-label detection. Bead types have
+// migrated into gt:<type> labels while the issue_type field defaults to "task",
+// so a control-plane bead (e.g. a convoy: issue_type="task", labels=["gt:convoy"])
+// must be caught by its label. Non-type gt:* labels must be ignored (no over-block).
+func TestIsControlPlaneBead(t *testing.T) {
+	tests := []struct {
+		name      string
+		issueType string
+		labels    []string
+		want      bool
+	}{
+		{"molecule via field", "molecule", nil, true},
+		{"convoy via label, task field", "task", []string{"gt:convoy"}, true}, // the live fail-open case
+		{"message via label, task field", "task", []string{"gt:message"}, true},
+		{"epic via label, empty field", "", []string{"gt:epic"}, true},
+		{"molecule via label, empty field", "", []string{"gt:molecule"}, true},
+		{"cased/spaced label", "task", []string{" GT:Convoy "}, true},
+		{"plain task, no labels", "task", nil, false},
+		{"task with non-type gt label", "task", []string{"gt:urgent"}, false}, // non-type gt: label ignored
+		{"spike work bead with sprint label", "spike", []string{"gt:sprint-3"}, false},
+		{"custom work type", "research", nil, false},
+		{"queue via label, task field", "task", []string{"gt:queue"}, true}, // mail-routing infra
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsControlPlaneBead(tt.issueType, tt.labels); got != tt.want {
+				t.Errorf("IsControlPlaneBead(%q, %v) = %v, want %v", tt.issueType, tt.labels, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestControlPlaneDenylistCoversAllCustomTypes is a drift guard: every gastown
+// custom type (constants.BeadsCustomTypesList) is control-plane infra and MUST be
+// in the denylist. A hand-maintained list previously missed "queue"; deriving the
+// denylist from the constant plus this test prevents that regression from
+// recurring when a new custom type is registered.
+func TestControlPlaneDenylistCoversAllCustomTypes(t *testing.T) {
+	for _, typ := range constants.BeadsCustomTypesList() {
+		if !IsControlPlaneType(typ) {
+			t.Errorf("custom type %q is not classified control-plane — it would dispatch to a worker (fail-open)", typ)
+		}
+		if !IsControlPlaneBead("task", []string{"gt:" + typ}) {
+			t.Errorf("custom type %q via gt:%s label is not caught by IsControlPlaneBead (fail-open)", typ, typ)
+		}
 	}
 }
 

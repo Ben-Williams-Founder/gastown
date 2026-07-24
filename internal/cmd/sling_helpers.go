@@ -100,6 +100,22 @@ type beadInfo struct {
 	IssueType    string           `json:"issue_type,omitempty"`
 }
 
+// isRigWorkerTarget reports whether a resolved sling/hook target agent address is
+// a RIG WORKER — a polecat or crew member — which does product/code work and must
+// never execute a control-plane bead (hq-ku7i). Address forms:
+// "<rig>/polecats/<name>", "<rig>/crew/<name>".
+//
+// Deliberately EXCLUDES dogs ("deacon/dogs/<name>"): dogs are the Deacon's
+// town-level control-plane executors and run operational molecules by design
+// (mol-dog-backup runs `dolt backup sync`, mol-dog-reaper, ...). Blocking
+// control-plane beads to a dog would break legitimate deacon dog dispatch. It
+// also excludes control-plane agents (mayor, deacon, witness, refinery), which
+// may legitimately receive molecules/patrols.
+func isRigWorkerTarget(targetAgent string) bool {
+	return strings.Contains(targetAgent, "/polecats/") ||
+		strings.Contains(targetAgent, "/crew/")
+}
+
 // isDeferredBead checks whether a bead should be rejected from slinging because
 // it has been deferred. Returns true if the bead has status "deferred" or if its
 // description contains deferral keywords like "deferred to post-launch".

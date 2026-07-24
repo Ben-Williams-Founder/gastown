@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/convoy"
 	"github.com/steveyegge/gastown/internal/events"
 	"github.com/steveyegge/gastown/internal/style"
 	"github.com/steveyegge/gastown/internal/workspace"
@@ -94,6 +95,14 @@ func runAssign(_ *cobra.Command, args []string) error {
 	}
 
 	agentID := rigName + "/crew/" + crewName
+
+	// Control-plane guard (hq-ku7i): gt assign always creates+hooks a bead to a crew
+	// member (a rig worker), so refuse a control-plane bead (molecule/gate/epic/convoy/
+	// decision/message/event/...). Checked on the requested --type and --label before
+	// the bead is created — rig workers must not execute control-plane beads.
+	if convoy.IsControlPlaneBead(assignType, assignLabels) {
+		return fmt.Errorf("refusing to assign a control-plane bead to crew member %s: type=%q labels=%v — control-plane beads (molecule/gate/epic/convoy/decision/message/event/...) must not be executed by a rig worker", agentID, assignType, assignLabels)
+	}
 
 	if assignDryRun {
 		fmt.Printf("Would create bead: %q (type=%s, priority=%s)\n", title, assignType, assignPriority)
