@@ -71,6 +71,20 @@ needs = ["observe"]
 description = """
 Analyze observations and decide what action to take.
 
+**⛔ SCOPE GUARD (read first — this is your ONLY job).** You assess DEACON SESSION
+HEALTH only: is the Deacon session alive, working, idle, or stuck. Your ONLY
+outputs are START / NUDGE / WAKE / INTERRUPT / NOTHING on the DEACON. If the
+Deacon session is alive and not stuck, the answer is **NOTHING** — exit quietly.
+
+You do NOT assess dispatch, the scheduler, ready-bead counts, or town idleness,
+and you must NEVER file an escalation or mail about "dispatch stall",
+"dispatch blocked / hold", "N ready items waiting", "last dispatch was N days ago",
+or an idle town. Those are MAYOR-owned. An idle town whose only ready items are
+hq/town beads (goals/decisions/coordination) is NORMAL — not a stall, not a hold.
+Dispatchable work = `gt ready --rig <r>` > 0 (never `bd ready`); that is the
+Mayor's call, not yours. Repeatedly HIGH-escalating idle-town is the exact
+malfunction this guard exists to stop (hq-t93r).
+
 **Decision Matrix**
 
 | Deacon State | Pane Activity | Action |
