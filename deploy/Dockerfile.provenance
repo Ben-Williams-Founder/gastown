@@ -1,0 +1,26 @@
+# Dockerfile.provenance — isolated drill environment for the provenance contract.
+# Deliberately minimal: go toolchain + git + bash + tmux. No dolt/bd/town services
+# (the drill exercises build/attest/deploy tooling, not town runtime), no baked
+# gt binary (the recorded container gap: baking upstream gt violates the pinned-
+# fork rule — this image builds gt from the mounted fork mirror instead).
+#
+#   docker build -f deploy/Dockerfile.provenance -t gt-provenance-drill deploy/
+#   docker run --rm \
+#     -v <bare-mirror>:/mirror:ro \
+#     -v $(go env GOMODCACHE):/modcache:ro \
+#     -v <scratch>:/scratch \
+#     -v <out>:/out \
+#     gt-provenance-drill /tools/container-drill.sh
+FROM golang:1.26-alpine
+
+# git: clone/rev-list · bash: scripts · tmux: FR-03 · coreutils: comm/sha256sum
+# binutils: strings (used by the certifier's str-kind signatures)
+RUN apk add --no-cache git bash tmux coreutils binutils
+
+# Only the drill entrypoint is baked; everything it tests comes from /mirror.
+COPY container-drill.sh /tools/container-drill.sh
+RUN chmod +x /tools/container-drill.sh
+
+WORKDIR /scratch
+ENTRYPOINT ["/bin/bash"]
+CMD ["/tools/container-drill.sh"]

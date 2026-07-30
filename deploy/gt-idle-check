@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+#
+# gt-idle-check — Boot-triage idle gate for the gt daemon.
+#
+# Referenced by internal/daemon/daemon.go (~L1365): the daemon runs this binary
+# each Boot-triage tick BEFORE deciding whether to spawn the expensive AI Boot.
+#   exit 0  => town is IDLE  => daemon uses cheap mechanical Boot triage
+#              (runDegradedBootTriage: "is the deacon alive? start if dead, else
+#              nothing") and SKIPS the AI Boot session entirely.
+#   exit 1  => town is BUSY (or state indeterminate) => daemon runs the full AI Boot.
+#
+# WHY THIS EXISTS (installed by mayor 2026-07-28, root cause of the boot-escalation flood):
+#   This binary was MISSING. With it absent the daemon fell through to the full AI
+#   Boot every ~3 minutes into a completely idle town, and the AI Boot improvised
+#   false HIGH/URGENT "dispatch-blocked" escalations for ~a week (re-reading a stale
+#   self-directive from its own state.json, which the formula scope-guard could not
+#   hold). Restoring the designed idle gate makes idle ticks mechanical (zero tokens,
+#   no improvisation) while preserving the AI Boot's richer stuck-deacon detection
+#   for when real work is actually in flight.
+#
+# IDLE PREDICATE: no rig-worker tmux session is running.
+#   Session naming (internal/session/names.go):
+#     polecat  = "<rigPrefix>-<name>"        crew    = "<rigPrefix>-crew-<name>"   [WORKERS]
+#     town     = "hq-*"                       witness = "*-witness"                 [infra]
+#     refinery = "*-refinery"                 dog     = "hq-dog-*"                  [infra]
+#   Infrastructure sessions and orphan test sessions ("gt-test-*") do NOT count as work.
+#
+# FAIL-SAFE: any error or indeterminate state => exit 1 (status-quo full Boot), so this
+# gate can only SUPPRESS the AI Boot during confident-idle — it can never mask a busy town.
+#
+# REVERT: rm /home/dev/gt/bin/gt-idle-check  (daemon reverts to full-Boot-every-tick on next tick)
+
+set -o pipefail
+
+uid="$(id -u 2>/dev/null)" || { echo "gt-idle-check: cannot resolve uid"; exit 1; }
+sockdir="/tmp/tmux-${uid}"
+[ -d "$sockdir" ] || { echo "gt-idle-check: no tmux socket dir $sockdir"; exit 1; }
+
+# Discover the town's tmux socket without hardcoding the path-hashed name
+# (townSocketName in internal/session/registry.go): it's the socket hosting the Deacon.
+sock=""
+for f in "$sockdir"/*; do
+  [ -S "$f" ] || continue
+  n="$(basename "$f")"
+  if tmux -L "$n" has-session -t hq-deacon 2>/dev/null; then
+    sock="$n"; break
+  fi
+done
+[ -n "$sock" ] || { echo "gt-idle-check: no live town socket (deacon session not found)"; exit 1; }
+
+sessions="$(tmux -L "$sock" ls -F '#{session_name}' 2>/dev/null)" || { echo "gt-idle-check: tmux ls failed on $sock"; exit 1; }
+
+workers=0
+while IFS= read -r s; do
+  [ -n "$s" ] || continue
+  case "$s" in
+    hq-*|*-witness|*-refinery|gt-test-*) : ;;   # infrastructure / test pollution: not work
+    *) workers=$((workers + 1)) ;;               # a rig worker (polecat/crew): busy
+  esac
+done <<< "$sessions"
+
+if [ "$workers" -eq 0 ]; then
+  exit 0   # IDLE -> daemon runs mechanical Boot triage
+fi
+echo "gt-idle-check: ${workers} rig-worker session(s) active"
+exit 1     # BUSY -> daemon runs full AI Boot

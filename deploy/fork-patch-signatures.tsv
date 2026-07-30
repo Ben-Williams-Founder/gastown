@@ -1,0 +1,40 @@
+# fork-patch-signatures.tsv — COMPLETENESS map of EVERY fork patch in the live gt.
+#
+# verify-fork-patches.sh derives the patch set from git (`git rev-list --no-merges
+# <merge-base origin/main..LIVE>..LIVE`) and REQUIRES every commit to appear here,
+# as a signature (must be present in the binary) OR an explicit `waive` (accounted
+# for, no distinct binary signature). An UNMAPPED commit => RED BUILD ("unguarded
+# patch"). A mapped signature MISSING from the binary => RED BUILD ("dropped patch").
+# This makes coverage provably complete (diffed against git), not hand-maintained —
+# fixing the earlier presence-only guard's false green (hq-qk6x).
+#
+# Format (TAB-separated):  <shortsha>\t<kind>\t<value>\t<subject>
+#   sym   value = `go tool nm` symbol substring — MUST be in binary
+#   str   value = `strings` substring          — MUST be in binary
+#   tool  value = go toolchain substring        — `go version <bin>` MUST contain it
+#   waive value = reason                        — commit accounted-for, no distinct signature
+#
+# When you land a new fork patch: add its row (signature preferred; waive only when
+# there is genuinely no distinct binary marker). Leaving a new commit unmapped is a RED BUILD.
+#
+a19c5352	str	CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY	fork(hooks): survey-disable env
+bd5891d2	waive	scheduler max_polecats=-1/governor decouple — behavioral, no distinct symbol	fork(scheduler): decouple -1 from governor bypass
+2b0d79d5	waive	done: defer worktree sync/branch-delete — behavioral	fork(done): defer worktree sync for pr strategy
+eda42a0a	waive	polecat cgroup-slice placement — spawn/config behavioral	feat(polecat): cgroup-slice placement
+79f13d8a	waive	polecat slice fail-open — behavioral	fix(polecat): slice placement fail-open
+c294154a	waive	dashboard --snapshot flag — CLI flag, no stable distinct string	feat(dashboard): --snapshot flag
+1481de0b	waive	daemon dispatch ticker 45s — timing behavioral	feat(daemon): dedicated dispatch ticker
+3211b09f	waive	governor admit-gate splice — behavioral wiring	feat(scheduler): Option B admit-gate
+46dfc344	waive	governor ENFORCE flip — behavioral wiring	feat(scheduler): Option B ENFORCE flip
+dcaa3fc5	waive	reaper Dog-dispatch gate — behavioral	fix(reaper): gate hourly Dog dispatch
+2d8c3f90	sym	reapWispsInline	fix(reaper): reap inline (deterministic)
+bcc20d1e	sym	cleanDanglingParentRefs	fix(reaper): auto-clean dangling parent-refs (hq-qk6x)
+68b930f4	str	persist after auto-clean	fix(reaper): non-mutating scan + dangling cleanup
+66f62630	str	SAFE_TO_NUKE	fix(recovery): bead-closed => SAFE_TO_NUKE
+f377af50	waive	refinery merge_queue canonical config read — behavioral	fix(refinery): merge_queue canonical settings
+2f33d5c0	waive	go1.26.4 pin — SUPERSEDED by go1.26.5 (b8dcde05)	build(deps): pin go1.26.4 (crypto/x509 CVE)
+b0af52b7	waive	TEST-ONLY — no binary impact	test(workstate): adapt closed-bead case
+b8dcde05	tool	go1.26.5	chore(build): go1.26.5 (GO-2026-5856 crypto/tls ECH CVE)
+e598d9d4	sym	mergeTreeNoopBetweenRefs	fix(reaper): active-MR auto-reap
+fb380d75	sym	IsControlPlaneBead	feat(sling): control-plane dispatch guard (hq-ku7i)
+24ad9d34	waive	inline stderr print, arrow-fragmented string, no distinct symbol; superset-verify covers	feat(scheduler): dispatch-failure visibility (hq-1q8c)
