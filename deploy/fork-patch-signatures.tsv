@@ -38,3 +38,4 @@ b8dcde05	tool	go1.26.5	chore(build): go1.26.5 (GO-2026-5856 crypto/tls ECH CVE)
 e598d9d4	sym	mergeTreeNoopBetweenRefs	fix(reaper): active-MR auto-reap
 fb380d75	sym	IsControlPlaneBead	feat(sling): control-plane dispatch guard (hq-ku7i)
 24ad9d34	waive	inline stderr print, arrow-fragmented string, no distinct symbol; superset-verify covers	feat(scheduler): dispatch-failure visibility (hq-1q8c)
+b26551a19	sym	printProvenance	provenance stamp + gated deploy tooling (Stage-1)
