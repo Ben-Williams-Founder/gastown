@@ -40,6 +40,10 @@ echo "=== P0 preconditions (headless, isolated) ==="
 # Container runs as root; the RO-mounted mirror is owned by the host uid. Without
 # this, git aborts every operation with "dubious ownership" (first-run failure).
 git config --global --add safe.directory '*'
+# /scratch persists across runs for the Go caches — clean the WORK dirs only
+# (a stale /scratch/repo from a prior run must never masquerade as this run's
+# restore; run-3 lesson: clone refused a non-empty destination, by design).
+rm -rf /scratch/repo /scratch/live-src /scratch/live-sim-gt /scratch/att.bak /scratch/n1 /scratch/n2 /scratch/fr02
 { echo "go: $(go version)"; echo "git: $(git --version)"; echo "tmux: $(tmux -V)"; } | tee /out/env.txt
 
 echo "=== T1 (FR-01) restore drill: full chain from /mirror alone ==="
