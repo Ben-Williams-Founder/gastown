@@ -1,0 +1,8 @@
+[Unit]
+Description=15-min heartbeat for the gt provenance watchdog
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=provenance-watch.service
+[Install]
+WantedBy=timers.target

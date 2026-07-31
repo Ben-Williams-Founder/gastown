@@ -1,0 +1,7 @@
+[Unit]
+Description=Instant provenance check on any change to the live gt binary
+[Path]
+PathChanged=%h/.local/bin/gt
+Unit=provenance-watch.service
+[Install]
+WantedBy=paths.target

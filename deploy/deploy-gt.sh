@@ -92,10 +92,14 @@ else
   DEST="$TARGET"; DIR="$(dirname "$DEST")"
   BAK="$DEST.bak-$(date +%Y%m%dT%H%M%S)"
   STAGE="$DIR/.gt-staging-$$"
+  # MANIFEST FIRST (adversarial lens-1 fix): the watchdog's path unit fires the
+  # instant the swap lands — it must find an already-coherent manifest, or every
+  # legitimate deploy raises a false CRITICAL. The brief manifest≠old-binary
+  # window before the swap is absorbed by the watchdog's debounce.
+  gen_manifest "$DIR/PINNED-BUILD.generated.md"
   cp "$OUTBIN" "$STAGE"                      # stage on the SAME filesystem
   [ -f "$DEST" ] && cp "$DEST" "$BAK"        # timestamped backup of live
   mv -f "$STAGE" "$DEST"                     # atomic rename (never cp onto live: ETXTBSY)
-  gen_manifest "$DIR/PINNED-BUILD.generated.md"
   echo "== LIVE deploy complete: $DEST (sha256 ${SHA:0:12}); backup $BAK; manifest $DIR/PINNED-BUILD.generated.md =="
   echo "   next: restart gastown-daemon.service, behavioral-verify, commit the generated manifest to the fork."
 fi

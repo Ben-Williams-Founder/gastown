@@ -1,0 +1,7 @@
+# Installed to ~/.config/systemd/user/ by bootstrap (fork-hosted: deploy/units/)
+[Unit]
+Description=gt provenance coherence check (exec-free bypass detector)
+[Service]
+Type=oneshot
+ExecStart=%h/gt/bin/provenance-watch.sh
+TimeoutStartSec=180

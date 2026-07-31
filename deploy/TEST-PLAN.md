@@ -50,3 +50,22 @@ upstream binary (the recorded container/A1 supply-chain gap).
 `/out/RESULTS.md` (verdict table) + per-case logs + `attestation.json` +
 `PINNED-BUILD.generated.md` + `provenance.txt` — feed T-/DEMO- verification
 records for the RVTM rows above.
+
+## Watchdog addendum (DEC-OPS-gt-provenance-watchdog; 2026-07-31)
+
+| # | RVTM row | Case | Expected |
+|---|---|---|---|
+| T9a/T9a2 | FR-06 | Coherent pair → GREEN, no sentinel, bd baselined | ok |
+| N6 | FR-06 | Tampered binary → RED "sha mismatch" (exec-free) | refuse |
+| N7 | NFR-02 | Repeat RED same sha → stable sha-keyed sentinel | ok |
+| T9b/T9b2 | NFR-02 | Restored coherence → GREEN auto-clears sentinel | ok |
+| N8 | FR-06 | Tampered manifest → RED | refuse |
+| T9c | NFR-02 | ACK-<sha12> → RED visible, acknowledged, escalation suppressed | ok |
+| T9d | FR-08 | Mid-deploy incoherence resolving in debounce → NO false RED | ok |
+| N9/N9b | FR-06/NFR-02 | bd digest-pin: unacked change RED; acked change re-pins | mixed |
+| T10a/b | FR-07 | Consumer hook injects iff sentinel present | ok |
+
+**Out of container scope** (live-enable verification): systemd unit *wiring*
+(no systemd in the drill container — units syntax-reviewed only), real
+`gt escalate` emission, PATH guard on the real box (`WD_SKIP_PATH_GUARD=1` in
+drill), fork-manifest anchor (needs the fork checkout).

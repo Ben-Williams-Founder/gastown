@@ -44,7 +44,7 @@ git config --global --add safe.directory '*'
 # /scratch persists across runs for the Go caches — clean the WORK dirs only
 # (a stale /scratch/repo from a prior run must never masquerade as this run's
 # restore; run-3 lesson: clone refused a non-empty destination, by design).
-rm -rf /scratch/repo /scratch/live-src /scratch/live-sim-gt /scratch/att.bak /scratch/n1 /scratch/n2 /scratch/fr02
+rm -rf /scratch/repo /scratch/live-src /scratch/live-sim-gt /scratch/att.bak /scratch/n1 /scratch/n2 /scratch/fr02 /scratch/wd /scratch/wd-state
 { echo "go: $(go version)"; echo "git: $(git --version)"; echo "tmux: $(tmux -V)"; } | tee /out/env.txt
 
 echo "=== T1 (FR-01) restore drill: full chain from /mirror alone ==="
@@ -148,6 +148,54 @@ ck T8c FR-03 "witness (infra) session -> still exit 0 (not a worker)" ok $?
 tmux kill-server 2>/dev/null; sleep 1
 env -u TMUX "$IC" > /out/fr03-failsafe.log 2>&1
 ckr T8d FR-03 "no deacon-hosting socket -> fail-safe full Boot" $? /out/fr03-failsafe.log "no live town socket"
+
+echo "=== T9/N6-N9 (FR-06/FR-08/NFR-02) provenance watchdog — producer logic ==="
+W=/scratch/wd; WS=/scratch/wd-state; mkdir -p "$W" "$WS"
+cp /out/deploy/gt "$W/gt"; cp /out/deploy/PINNED-BUILD.generated.md "$W/man"
+printf 'fake-bd-v1\n' > "$W/bd"
+wd() { WD_BIN="$W/gt" WD_MANIFEST="$W/man" WD_STATE_DIR="$WS" WD_DEBOUNCE=2 WD_BD="$W/bd" WD_SKIP_PATH_GUARD=1 "$D/provenance-watch.sh"; }
+wd > /out/wd-t9a.log 2>&1
+ck T9a FR-06 "coherent binary+manifest -> GREEN (exit 0, no sentinel; bd baselined)" ok $?
+[ ! -f "$WS/PROVENANCE-RED" ]; ck T9a2 FR-06 "no sentinel after GREEN" ok $?
+printf 'X' >> "$W/gt"
+wd > /out/wd-n6.log 2>&1
+ckr N6 FR-06 "tampered binary -> RED sentinel, exec-free detection" $? /out/wd-n6.log "sha mismatch"
+S1="$(sed -n 's/^sha12: *//p' "$WS/PROVENANCE-RED")"
+wd > /out/wd-n7.log 2>&1; rc=$?
+S2="$(sed -n 's/^sha12: *//p' "$WS/PROVENANCE-RED")"
+[ $rc -ne 0 ] && [ "$S1" = "$S2" ] && [ -n "$S1" ]; ck N7 NFR-02 "repeat RED same sha -> stable sha-keyed sentinel (once-per-sha)" ok $?
+cp /out/deploy/gt "$W/gt"
+wd > /out/wd-t9b.log 2>&1
+ck T9b NFR-02 "restored coherence -> GREEN auto-clears sentinel" ok $?
+[ ! -f "$WS/PROVENANCE-RED" ]; ck T9b2 NFR-02 "sentinel actually removed" ok $?
+sed -i 's/^binarySha256: .*/binarySha256: 1111111111111111111111111111111111111111111111111111111111111111/' "$W/man"
+wd > /out/wd-n8.log 2>&1
+ckr N8 FR-06 "tampered manifest -> RED (timer-class detection)" $? /out/wd-n8.log "sha mismatch"
+cp /out/deploy/PINNED-BUILD.generated.md "$W/man"; wd >/dev/null 2>&1   # clear
+printf 'X' >> "$W/gt"
+ACK12="$(sha256sum "$W/gt" | cut -c1-12)"; touch "$WS/PROVENANCE-ACK-$ACK12"
+wd > /out/wd-t9c.log 2>&1; rc=$?
+[ $rc -ne 0 ] && grep -q "acknowledged: yes" "$WS/PROVENANCE-RED"; ck T9c NFR-02 "ack-<sha12> -> incident visible but acknowledged (escalation suppressed)" ok $?
+cp /out/deploy/gt "$W/gt"; rm -f "$WS/PROVENANCE-ACK-$ACK12"; wd >/dev/null 2>&1
+sed -i 's/^binarySha256: .*/binarySha256: 2222222222222222222222222222222222222222222222222222222222222222/' "$W/man"
+( sleep 1; cp /out/deploy/PINNED-BUILD.generated.md "$W/man" ) &
+WD_BIN="$W/gt" WD_MANIFEST="$W/man" WD_STATE_DIR="$WS" WD_DEBOUNCE=3 WD_BD="$W/bd" WD_SKIP_PATH_GUARD=1 "$D/provenance-watch.sh" > /out/wd-t9d.log 2>&1
+ck T9d FR-08 "mid-deploy incoherence resolving within debounce -> NO false RED" ok $?
+wait
+printf 'fake-bd-v2\n' > "$W/bd"
+wd > /out/wd-n9.log 2>&1
+ckr N9 FR-06 "bd changed without ack -> RED (digest-pin)" $? /out/wd-n9.log "bd changed without ack"
+BDACK="$(sha256sum "$W/bd" | cut -c1-12)"; touch "$WS/PROVENANCE-ACK-$BDACK"
+wd > /out/wd-n9b.log 2>&1
+ck N9b NFR-02 "acked bd change -> GREEN + re-pinned" ok $?
+
+echo "=== T10 (FR-07) provenance watchdog — consumer injection ==="
+printf 'PROVENANCE INCIDENT — drill\nsha12: deadbeef0000\n' > "$WS/PROVENANCE-RED"
+WD_STATE_DIR="$WS" "$D/hooks/provenance-inject.sh" > /out/wd-t10.log 2>&1
+grep -q "PROVENANCE INCIDENT" /out/wd-t10.log; ck T10a FR-07 "sentinel present -> hook injects system-reminder" ok $?
+rm -f "$WS/PROVENANCE-RED"
+OUT10="$(WD_STATE_DIR="$WS" "$D/hooks/provenance-inject.sh")"
+[ -z "$OUT10" ]; ck T10b FR-07 "sentinel absent -> hook silent" ok $?
 
 echo "=== results ==="
 TOTAL=$((PASS+FAIL))
