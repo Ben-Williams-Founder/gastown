@@ -66,7 +66,7 @@ ck T2 setup "reference (live-sim) binary builds from recorded lineage commit" ok
 
 D=/scratch/repo/deploy
 echo "=== T3 (FR-05) happy path: attest -> gated build -> stamp self-check ==="
-( cd /scratch/repo && GO=go "$D/attest.sh" /scratch/live-sim-gt "$LIVE_COMMIT" ) > /out/attest.log 2>&1
+( cd /scratch/repo && GO=go "$D/attest.sh" --allow-dep-churn "drill: candidate lineage carries grpc/x-text CVE bumps over pre-bump live-sim reference" /scratch/live-sim-gt "$LIVE_COMMIT" ) > /out/attest.log 2>&1
 ck T3 FR-05 "attest.sh: G1 superset 0-missing + G2 patches PASS -> attestation emitted" ok $?
 ( cd /scratch/repo && GO=go "$D/deploy-gt.sh" --dry-run /out/deploy ) > /out/deploy.log 2>&1
 ck T4 FR-05 "deploy-gt.sh --dry-run: stamped build + self-check + generated manifest" ok $?
@@ -100,7 +100,7 @@ git -C /scratch/repo reset -q --hard HEAD~1
   && grep -v "IsControlPlaneBead" deploy/fork-patch-signatures.tsv > /tmp/tsv && cp /tmp/tsv deploy/fork-patch-signatures.tsv \
   && git add deploy/fork-patch-signatures.tsv \
   && git -c user.email=drill@test -c user.name=drill commit -qm "drop a signature row" \
-  && GO=go "$D/attest.sh" /scratch/live-sim-gt "$LIVE_COMMIT" ) > /out/n3.log 2>&1
+  && GO=go "$D/attest.sh" --allow-dep-churn "drill: candidate lineage carries grpc/x-text CVE bumps over pre-bump live-sim reference" /scratch/live-sim-gt "$LIVE_COMMIT" ) > /out/n3.log 2>&1
 ckr N3 FR-04 "TSV row removed -> attest gate RED (no silent gap)" $? /out/n3.log "UNGUARDED"
 git -C /scratch/repo reset -q --hard HEAD~1
 
@@ -108,7 +108,7 @@ git -C /scratch/repo reset -q --hard HEAD~1
   && sed -i 's/IsControlPlaneBead/IsControlPlaneBead_TAMPERED_SIGNATURE/' deploy/fork-patch-signatures.tsv \
   && git add deploy/fork-patch-signatures.tsv \
   && git -c user.email=drill@test -c user.name=drill commit -qm "corrupt a signature" \
-  && GO=go "$D/attest.sh" /scratch/live-sim-gt "$LIVE_COMMIT" ) > /out/n4.log 2>&1
+  && GO=go "$D/attest.sh" --allow-dep-churn "drill: candidate lineage carries grpc/x-text CVE bumps over pre-bump live-sim reference" /scratch/live-sim-gt "$LIVE_COMMIT" ) > /out/n4.log 2>&1
 ckr N4 FR-04 "signature absent from binary -> attest gate RED (no false green)" $? /out/n4.log "DROPPED"
 git -C /scratch/repo reset -q --hard HEAD~1
 

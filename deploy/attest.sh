@@ -60,7 +60,7 @@ comm -23 \
 #                      via --allow-dep-churn "<reason>"; declaration + counts are
 #                      recorded in the attestation (auditable, fail-closed default).
 GAST_MISS="$(grep -c "steveyegge/gastown" "$MISSLIST" || true)"
-ART_MISS="$(grep -cE '^\$f(32|64)\.|\.\.stmp_[0-9]+$' "$MISSLIST" || true)"
+ART_MISS="$(grep -cE '^\$f(32|64)\.|\.\.stmp_[0-9]+$|^go:itab\.' "$MISSLIST" || true)"   # go:itab = linker-generated (run-5 evidence)
 TOT_MISS="$(wc -l < "$MISSLIST")"
 DEP_MISS=$((TOT_MISS - GAST_MISS - ART_MISS))
 echo "   missing: total=$TOT_MISS gastown=$GAST_MISS dep=$DEP_MISS compiler-artifact=$ART_MISS"
