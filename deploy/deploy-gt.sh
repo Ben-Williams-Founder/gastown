@@ -55,7 +55,7 @@ M=github.com/steveyegge/gastown/internal/cmd
 STAMP="-X $M.VerifiedBase=$VB -X $M.PatchSetHash=$PSH -X $M.AttestationID=$AID \
        -X $M.Version=$VERSION -X $M.Commit=$COMMIT -X $M.Branch=$BRANCH -X $M.Build=deploy"
 OUTBIN="$HERE/.attest/stamped-gt"
-( cd "$REPO" && CGO_ENABLED=0 "$GO" build -ldflags "$STAMP" -o "$OUTBIN" ./cmd/gt )
+( cd "$REPO" && "$GO" build -ldflags "$STAMP" -o "$OUTBIN" ./cmd/gt )   # ambient CGO — must match the attested candidate recipe
 
 echo "== self-check: binary must report the attested provenance =="
 PROV="$("$OUTBIN" version --provenance)"

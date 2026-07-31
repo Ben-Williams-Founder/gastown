@@ -13,6 +13,7 @@
 set -uo pipefail
 export GT_MAIN_REF=origin/upstream-main   # mirror branches appear as remote refs in the clone
 export GOMODCACHE=/scratch/gomod GOCACHE=/scratch/gocache
+export CGO_ENABLED=0   # container tests the MECHANISM cgo-less on musl; live G1 runs against the TRUE live binary with the live (cgo-on) recipe
 export GOPROXY="file:///modcache/cache/download,https://proxy.golang.org"
 export GOFLAGS=-buildvcs=true
 mkdir -p /scratch /out

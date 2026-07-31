@@ -41,7 +41,7 @@ TREE_HASH="$(git -C "$REPO" rev-parse 'HEAD^{tree}')"
 
 echo "== attest: building candidate from HEAD ${HEAD_COMMIT:0:9} (tree ${TREE_HASH:0:9}) =="
 CAND="$OUT/cand-gt"
-( cd "$REPO" && CGO_ENABLED=0 "$GO" build -o "$CAND" ./cmd/gt )
+( cd "$REPO" && "$GO" build -o "$CAND" ./cmd/gt )   # ambient CGO: live gt embeds dolt (cgo-gated); CGO_ENABLED=0 here cost a 134k-symbol false candidate (run-5 lesson)
 
 echo "== G1 superset-verify: live symbols ⊆ candidate symbols =="
 MISSING="$(comm -23 \
