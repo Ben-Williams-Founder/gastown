@@ -3,5 +3,6 @@
 Description=gt provenance coherence check (exec-free bypass detector)
 [Service]
 Type=oneshot
+Environment=WD_FORK_MANIFEST=/home/dev/whiz/gastown-provenance/deploy/PINNED-BUILD.generated.md
 ExecStart=%h/gt/bin/provenance-watch.sh
 TimeoutStartSec=180
