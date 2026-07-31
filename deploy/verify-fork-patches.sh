@@ -18,7 +18,7 @@ if [ -z "$BIN" ] || [ -z "$LIVE" ]; then
 fi
 [ -f "$BIN" ] || { echo "FAIL: binary not found: $BIN" >&2; exit 2; }
 [ -f "$MAN" ] || { echo "FAIL: manifest not found: $MAN" >&2; exit 2; }
-[ -d "$SRC/.git" ] || { echo "FAIL: not a git repo: $SRC" >&2; exit 2; }
+git -C "$SRC" rev-parse --git-dir >/dev/null 2>&1 || { echo "FAIL: not a git repo: $SRC" >&2; exit 2; }   # -e not -d: worktrees have a .git FILE
 GO="${GO:-$HOME/.local/go/bin/go}"; command -v "$GO" >/dev/null 2>&1 || GO="go"
 
 BASE="$(git -C "$SRC" merge-base "${GT_MAIN_REF:-origin/main}" "$LIVE" 2>/dev/null)" || { echo "FAIL: cannot merge-base ${GT_MAIN_REF:-origin/main}..$LIVE (fetch origin?)" >&2; exit 2; }
