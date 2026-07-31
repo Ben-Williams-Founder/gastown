@@ -22,8 +22,12 @@
 #                       with the stamp; symbols are compared pre-stamp)
 set -euo pipefail
 
+ALLOW_DEP_CHURN=""
+if [ "${1:-}" = "--allow-dep-churn" ]; then
+  ALLOW_DEP_CHURN="${2:?--allow-dep-churn requires a reason string}"; shift 2
+fi
 LIVE_BIN="${1:-}"; LIVE_COMMIT="${2:-}"
-[ -n "$LIVE_BIN" ] && [ -n "$LIVE_COMMIT" ] || { echo "usage: attest.sh <live-gt-binary> <live-lineage-commit> [out-dir]" >&2; exit 2; }
+[ -n "$LIVE_BIN" ] && [ -n "$LIVE_COMMIT" ] || { echo "usage: attest.sh [--allow-dep-churn <reason>] <live-gt-binary> <live-lineage-commit> [out-dir]" >&2; exit 2; }
 [ -f "$LIVE_BIN" ] || { echo "FAIL: live binary not found: $LIVE_BIN" >&2; exit 2; }
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -44,14 +48,33 @@ CAND="$OUT/cand-gt"
 ( cd "$REPO" && "$GO" build -o "$CAND" ./cmd/gt )   # ambient CGO: live gt embeds dolt (cgo-gated); CGO_ENABLED=0 here cost a 134k-symbol false candidate (run-5 lesson)
 
 echo "== G1 superset-verify: live symbols ⊆ candidate symbols =="
-MISSING="$(comm -23 \
+MISSLIST="$OUT/g1-missing.txt"
+comm -23 \
   <("$GO" tool nm "$LIVE_BIN"  2>/dev/null | awk '{print $NF}' | LC_ALL=C sort -u) \
-  <("$GO" tool nm "$CAND"      2>/dev/null | awk '{print $NF}' | LC_ALL=C sort -u) | wc -l)"
-if [ "$MISSING" -ne 0 ]; then
-  echo "FAIL G1: $MISSING live symbols MISSING from candidate — a live fix would be dropped. DO NOT DEPLOY." >&2
+  <("$GO" tool nm "$CAND"      2>/dev/null | awk '{print $NF}' | LC_ALL=C sort -u) > "$MISSLIST"
+# Three-way triage (run-5 lesson: strict-0 is the wrong contract under dep bumps,
+# but loosening silently would be a false-green vector):
+#   gastown symbols  — fork functionality: missing => ALWAYS FATAL.
+#   compiler noise   — $f32./$f64./..stmp_N numbering churn: counted, never fatal.
+#   dependency syms  — FATAL unless the operator explicitly declares the churn
+#                      via --allow-dep-churn "<reason>"; declaration + counts are
+#                      recorded in the attestation (auditable, fail-closed default).
+GAST_MISS="$(grep -c "steveyegge/gastown" "$MISSLIST" || true)"
+ART_MISS="$(grep -cE '^\$f(32|64)\.|\.\.stmp_[0-9]+$' "$MISSLIST" || true)"
+TOT_MISS="$(wc -l < "$MISSLIST")"
+DEP_MISS=$((TOT_MISS - GAST_MISS - ART_MISS))
+echo "   missing: total=$TOT_MISS gastown=$GAST_MISS dep=$DEP_MISS compiler-artifact=$ART_MISS"
+if [ "$GAST_MISS" -ne 0 ]; then
+  grep "steveyegge/gastown" "$MISSLIST" | head -10
+  echo "FAIL G1: $GAST_MISS gastown symbols MISSING — fork functionality would be dropped. DO NOT DEPLOY." >&2
   exit 1
 fi
-echo "   G1 PASS: 0 live symbols missing"
+if [ "$DEP_MISS" -gt 0 ] && [ -z "$ALLOW_DEP_CHURN" ]; then
+  grep -vE '^\$f(32|64)\.|\.\.stmp_[0-9]+$|steveyegge/gastown' "$MISSLIST" | sed 's/\..*//' | sort | uniq -c | sort -rn | head -8
+  echo "FAIL G1: $DEP_MISS dependency symbols missing and no --allow-dep-churn declaration. If this is a declared dep bump, re-run with --allow-dep-churn \"<reason>\". DO NOT DEPLOY undeclared." >&2
+  exit 1
+fi
+echo "   G1 PASS: gastown=0 missing; dep churn ${DEP_MISS} $( [ -n "$ALLOW_DEP_CHURN" ] && echo "(declared: $ALLOW_DEP_CHURN)" )"
 
 echo "== G2 fork-patch completeness (candidate must carry every lineage patch) =="
 "$HERE/verify-fork-patches.sh" "$CAND" "$HEAD_COMMIT" "$REPO" "$HERE/fork-patch-signatures.tsv" || {
@@ -70,7 +93,7 @@ cat > "$OUT/attestation.json" <<EOF
   "commit": "$HEAD_COMMIT",
   "verifiedBase": "$LIVE_COMMIT",
   "patchSetSha256": "$PATCHSET_HASH",
-  "gates": { "supersetMissingSymbols": 0, "forkPatches": "PASS" },
+  "gates": { "supersetGastownMissing": 0, "supersetDepMissing": $DEP_MISS, "supersetArtifactMissing": $ART_MISS, "depChurnDeclared": "${ALLOW_DEP_CHURN:-none}", "forkPatches": "PASS" },
   "builder": "attest.sh",
   "buildFinishedOn": "$TS"
 }
