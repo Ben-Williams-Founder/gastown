@@ -80,6 +80,15 @@ echo "== G2 fork-patch completeness (candidate must carry every lineage patch) =
 "$HERE/verify-fork-patches.sh" "$CAND" "$HEAD_COMMIT" "$REPO" "$HERE/fork-patch-signatures.tsv" || {
   echo "FAIL G2: fork-patch completeness — see above. DO NOT DEPLOY." >&2; exit 1; }
 
+# Rebase-deferral trigger (DEC-OPS-gt-fork-rebase-deferral — Tier-1 mechanization):
+# every gated rebuild prints the upstream delta; >500 behind flips the DEC to revisit.
+BEHIND="$(git -C "$REPO" rev-list --count "$(git -C "$REPO" merge-base "${GT_MAIN_REF:-origin/main}" HEAD)"..${GT_MAIN_REF:-origin/main} 2>/dev/null || echo '?')"
+echo "== rebase-deferral trigger: ${BEHIND} commits behind upstream =="
+echo "   predicates: (A) CVE fixable only upstream? (B) needed upstream fix in an open bead? Either => open the rebase."
+if [ "${BEHIND:-0}" != "?" ] && [ "${BEHIND:-0}" -gt 500 ]; then
+  echo "   ⚠ TRIGGER FIRED: >500 behind — flip DEC-OPS-gt-fork-rebase-deferral to revisit." >&2
+fi
+
 PATCHSET_HASH="$(sha256sum "$HERE/fork-patch-signatures.tsv" | awk '{print $1}')"
 TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Deterministic id over the verified facts (not the timestamp).
