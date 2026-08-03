@@ -1,0 +1,6 @@
+[Unit]
+Description=Token-budget signal producer (writes ~/gt/USAGE-STATUS.json; deterministic, fail-open)
+[Service]
+Type=oneshot
+ExecStart=%h/gt/bin/usage-monitor.sh
+TimeoutStartSec=30

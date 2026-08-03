@@ -1,0 +1,8 @@
+[Unit]
+Description=Poll subscription usage every 60s for the token governor
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=usage-monitor.service
+[Install]
+WantedBy=timers.target
