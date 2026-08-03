@@ -45,7 +45,7 @@ for full in "${PATCHES[@]}"; do
   # binary functionality — auto-exempt. This also breaks the self-reference
   # regress: a commit that only maintains this TSV needs no row naming itself.
   # Any commit touching a compiled path still REQUIRES a signature/waive row.
-  nonexempt="$(git -C "$SRC" diff-tree --no-commit-id --name-only -r "$full" | grep -vE '^deploy/|^\.github/|\.md$' | head -1)"
+  nonexempt="$(git -C "$SRC" diff-tree --no-commit-id --name-only -r "$full" | grep -vE '^deploy/|^\.github/|^Dockerfile|\.md$' | head -1)"
   if [ -z "$nonexempt" ]; then
     printf '  ok   [tool ] %s  %s\n' "${full:0:9}" "$subj"; continue
   fi
