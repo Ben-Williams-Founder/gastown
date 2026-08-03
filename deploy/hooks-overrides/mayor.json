@@ -1,0 +1,36 @@
+{
+  "SessionStart": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/home/dev/gt/mayor/scripts/dispatch-selfheal.sh"
+        },
+        {
+          "type": "command",
+          "command": "/home/dev/.local/bin/gt prime --hook"
+        },
+        {
+          "type": "command",
+          "command": "/home/dev/gt/bin/provenance-assert-units.sh"
+        }
+      ]
+    }
+  ],
+  "UserPromptSubmit": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/home/dev/.local/bin/gt mail check --inject"
+        },
+        {
+          "type": "command",
+          "command": "/home/dev/gt/bin/provenance-inject.sh"
+        }
+      ]
+    }
+  ]
+}
