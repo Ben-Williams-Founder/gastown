@@ -25,10 +25,6 @@
         {
           "type": "command",
           "command": "/home/dev/gt/bin/provenance-inject.sh"
-        },
-        {
-          "type": "command",
-          "command": "/home/dev/gt/bin/usage-inject.sh"
         }
       ]
     }

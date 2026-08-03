@@ -73,4 +73,29 @@ status={
 }
 tmp=out+".tmp"; json.dump(status,open(tmp,"w"),indent=2); os.replace(tmp,out)
 PY
+
+# ── Edge-triggered alert: the ROUTINE injects ONCE when a threshold is crossed ──
+# (Not a per-turn hook — that re-injected every turn while above threshold, wasteful.)
+# Founder-set 2026-08-03 (less conservative): throttle 95, halt 99.
+GOV_THROTTLE="${GOV_THROTTLE:-95}"; GOV_HALT="${GOV_HALT:-99}"
+GT="${GT:-$HOME/.local/bin/gt}"; LEVELFILE="$STATE/.usage-gov-level"
+read -r lvl pct pool reset < <(python3 - "$OUT" "$GOV_THROTTLE" "$GOV_HALT" <<'PY2' 2>/dev/null
+import json,sys
+d=json.load(open(sys.argv[1])); thr=float(sys.argv[2]); halt=float(sys.argv[3])
+p=d.get('binding_pct') or 0
+print('halt' if p>=halt else 'throttle' if p>=thr else 'ok', p, (d.get('binding_pool') or '?'), (d.get('binding_resets_at') or '?'))
+PY2
+)
+lvl="${lvl:-ok}"; prev="$(cat "$LEVELFILE" 2>/dev/null || echo ok)"
+rank(){ case "$1" in halt) echo 2;; throttle) echo 1;; *) echo 0;; esac; }
+if [ "$(rank "$lvl")" -gt "$(rank "$prev")" ]; then    # crossing UP only
+  case "$lvl" in
+    halt)     m="🛑 BUDGET HALT: pool '$pool' at ${pct}% (>=${GOV_HALT}%, resets $reset). Stop new dispatch + sub-agent fan-outs; land/commit in-flight work only." ;;
+    throttle) m="⚠️ BUDGET THROTTLE: pool '$pool' at ${pct}% (>=${GOV_THROTTLE}%, resets $reset). Finish+commit over starting new; no new fan-outs on this pool." ;;
+  esac
+  "$GT" nudge --mode=queue mayor  "$m" >/dev/null 2>&1 || true   # one-shot, best-effort
+  "$GT" nudge --mode=queue deacon "$m" >/dev/null 2>&1 || true
+  printf '%s\n' "$m" > "$STATE/USAGE-ALERT"                       # durable record
+fi
+printf '%s\n' "$lvl" > "$LEVELFILE"    # record level; re-arms when it drops after reset
 exit 0
