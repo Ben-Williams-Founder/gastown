@@ -1,0 +1,15 @@
+[Unit]
+Description=Dolt SQL-liveness watchdog (deterministic; catches alive-but-deadlocked wedge systemd cannot see)
+After=dolt.service
+Wants=dolt.service
+
+[Service]
+Type=simple
+ExecStart=/home/dev/gt/daemon/dolt-sql-watchdog.sh
+Restart=always
+RestartSec=10
+# bd lives in ~/.local/bin and systemd user services do NOT inherit the shell PATH
+Environment="PATH=/home/dev/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+[Install]
+WantedBy=default.target
