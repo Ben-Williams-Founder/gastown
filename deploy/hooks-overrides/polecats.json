@@ -1,0 +1,13 @@
+{
+  "PreToolUse": [
+    {
+      "matcher": "Agent|Task",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "/home/dev/gt/bin/usage-gate-fanout.sh || true"
+        }
+      ]
+    }
+  ]
+}
