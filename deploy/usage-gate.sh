@@ -162,8 +162,33 @@ if not isinstance(d, dict):
     emit("ADMIT", "fail-open:unparseable", tier=tier)
 
 if d.get("stale") is True:
-    emit("ADMIT", "fail-open:stale", tier=tier,
-         stale_reason=d.get("stale_reason"), binding_pct=d.get("binding_pct"))
+    # DEFAULT (ratified): stale ⇒ fail-open, full stop.
+    #
+    # OBSERVED CAVEAT, 2026-08-04: the producer keeps its 60s cadence but individual
+    # polls fail intermittently ("fetch/parse failed"), so `stale` flickers true/false
+    # and the gates flicker armed/inert with it. The body still carries the LAST-GOOD
+    # numbers, so a 60s-old reading is not really "no signal".
+    #
+    # GOV_HONOUR_LAST_GOOD_SEC=N (default 0 = OFF, i.e. exactly the ratified behaviour)
+    # opts in to riding through a blip: if the last SUCCESSFUL poll (`fetched_at`, not
+    # `checked_at`) is younger than N seconds, judge on the last-good numbers instead of
+    # admitting blind. Beyond N — or if fetched_at is missing/unparseable — fail open, so
+    # a genuinely dead endpoint still cannot freeze the town. Left OFF because turning it
+    # on changes WHEN the gates bite, which is a founder call.
+    honour = float(os.environ.get("GOV_HONOUR_LAST_GOOD_SEC") or 0)
+    ride_through = False
+    if honour > 0:
+        try:
+            from datetime import datetime, timezone
+            fa = datetime.fromisoformat(str(d.get("fetched_at")).replace("Z", "+00:00"))
+            if fa.tzinfo is None:
+                fa = fa.replace(tzinfo=timezone.utc)
+            ride_through = (datetime.now(timezone.utc) - fa).total_seconds() <= honour
+        except Exception:
+            ride_through = False
+    if not ride_through:
+        emit("ADMIT", "fail-open:stale", tier=tier,
+             stale_reason=d.get("stale_reason"), binding_pct=d.get("binding_pct"))
 
 # A wedged producer leaves a fresh-looking body forever — age it out on mtime too.
 try:
