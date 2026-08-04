@@ -140,6 +140,19 @@ func executeSling(params SlingParams) (*SlingResult, error) {
 		return result, fmt.Errorf("bead %s is %s (work already completed)", params.BeadID, info.Status)
 	}
 
+	// BLOCKED guard (hq-vcg3): mirrors the runSling guard (sling.go) on the unified
+	// dispatch path, so batch sling, the scheduler/queue admit path (capacity_dispatch
+	// dispatchSingleBead, scheduler_epic, scheduler_convoy) and any auto-dispatcher
+	// cannot land a bead that an operator has explicitly blocked. Applied to ALL
+	// targets, not just rig workers: unlike a control-plane bead — which is legitimate
+	// work for a dog/control agent and only wrong on a worker — a BLOCKED bead is not
+	// ready work for ANYONE. NOT --force-overridable (the deacon redispatch path
+	// forces). Clear the block (bd update <id> --status open) to dispatch.
+	if beads.IsBlockedStatus(info.Status) {
+		result.ErrMsg = "blocked"
+		return result, fmt.Errorf("refusing to dispatch BLOCKED bead %s to rig %q: status=%q — the bead is on an explicit block/hold and must not be worked. Clear the block first (bd update %s --status open); --force does not override this guard", params.BeadID, params.RigName, info.Status, params.BeadID)
+	}
+
 	// Control-plane guard (hq-ku7i): a rig dispatch spawns/feeds a worker polecat.
 	// Refuse control-plane/container beads (molecule/gate/epic/convoy/decision/
 	// message/event/...) here so that batch sling, the scheduler queue, and any

@@ -286,6 +286,18 @@ func runHook(_ *cobra.Command, args []string) error {
 		if convoy.IsControlPlaneBead(hookInfo.IssueType, hookInfo.Labels) {
 			return fmt.Errorf("refusing to hook %s onto rig worker %s: it is a control-plane bead (issue_type=%q labels=%v) and must not execute on a worker — control-plane beads are run by the control plane, not a worker", beadID, agentID, hookInfo.IssueType, hookInfo.Labels)
 		}
+		// BLOCKED guard (hq-vcg3): gt hook is a separate raw bd-update path that can
+		// put work on a worker's hook without going through sling, so the blocked
+		// predicate is enforced here too. Scoped to RIG WORKERS (same scoping as the
+		// control-plane guard above) on purpose: `gt hook` is also the low-level
+		// primitive control agents use to hold/track a bead they are NOT executing —
+		// e.g. a mayor hooking a blocked tracker to keep it in view — and blocking
+		// that would be an over-block with no safety payoff. The waste this closes is
+		// specifically a worker being handed blocked work. Reuses the hookInfo read
+		// above, which already fails CLOSED on a read error.
+		if beads.IsBlockedStatus(hookInfo.Status) {
+			return fmt.Errorf("refusing to dispatch BLOCKED bead %s onto rig worker %s: status=%q — the bead is on an explicit block/hold and must not be worked. Clear the block first (bd update %s --status open)", beadID, agentID, hookInfo.Status, beadID)
+		}
 	}
 
 	// Resolve the beads directory for the target agent.

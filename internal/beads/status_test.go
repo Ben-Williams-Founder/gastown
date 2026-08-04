@@ -154,3 +154,42 @@ func TestIssueStatusConstants(t *testing.T) {
 		}
 	}
 }
+
+// TestIsBlockedStatus verifies the fail-closed BLOCKED dispatch predicate
+// (hq-vcg3). bd does NOT normalize the status on write, so casing/whitespace
+// variants must all classify as blocked; and the match must be exact so that
+// look-alike statuses are not swept up (a strings.Contains implementation would
+// wrongly refuse "unblocked").
+func TestIsBlockedStatus(t *testing.T) {
+	t.Parallel()
+	blocked := []string{
+		"blocked",
+		"BLOCKED",
+		"Blocked",
+		"  blocked  ",
+		"\tblocked\n",
+	}
+	notBlocked := []string{
+		"", // unset status must not read as blocked here — callers fail closed on unreadable info separately
+		"open",
+		"closed",
+		"in_progress",
+		"tombstone",
+		"deferred",
+		"pinned",
+		"hooked",
+		"unblocked", // substring trap
+		"blocker",   // substring trap
+		"blocked_by",
+	}
+	for _, s := range blocked {
+		if !IsBlockedStatus(s) {
+			t.Errorf("IsBlockedStatus(%q) = false, want true (fail-open: a BLOCKED bead would be dispatched)", s)
+		}
+	}
+	for _, s := range notBlocked {
+		if IsBlockedStatus(s) {
+			t.Errorf("IsBlockedStatus(%q) = true, want false (over-block: dispatchable work would be refused)", s)
+		}
+	}
+}

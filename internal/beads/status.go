@@ -6,6 +6,8 @@
 // See gt-4d7p.
 package beads
 
+import "strings"
+
 // AgentState represents the lifecycle state of an agent bead.
 // These values are stored in the agent_state field and used by the witness,
 // polecat manager, and sling for lifecycle decisions.
@@ -108,4 +110,25 @@ func (s IssueStatus) IsAssigned() bool {
 	default:
 		return false
 	}
+}
+
+// IsBlockedStatus reports whether a RAW bead status string means the bead is
+// BLOCKED and therefore must NOT be dispatched to any agent (hq-vcg3).
+//
+// A BLOCKED bead is one an operator/witness explicitly halted (a do-not-resling
+// hold) or whose blockers are unresolved. Dispatching one burns a full agent
+// spawn that can only refuse and close — pure waste — and it silently defeats
+// the operator's hold.
+//
+// FAIL-CLOSED by construction:
+//   - The comparison is normalized (trimmed + lower-cased). bd does NOT normalize
+//     the status on write, so "BLOCKED", " Blocked " and "blocked" are the same
+//     state; a casing variant must never read as dispatchable.
+//   - Callers must treat an UNREADABLE status as blocking too (refuse rather than
+//     dispatch); this function only classifies a status it was actually given.
+//
+// Takes a raw string (not IssueStatus) because every dispatch call site reads
+// the status off a JSON payload as a plain string.
+func IsBlockedStatus(status string) bool {
+	return strings.TrimSpace(strings.ToLower(status)) == string(StatusBlocked)
 }

@@ -849,13 +849,62 @@ func detectCloneRoot() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// detectActor returns the current agent's actor string for event logging.
+// detectActor returns the current agent's actor string for event logging and for
+// the bead's dispatched_by field.
+//
+// hq-vcg3 (observability): this used to return a bare "unknown" whenever
+// GetRole() failed. GetRole() resolves the town via workspace.FindFromCwd(), which
+// walks up from the CWD only — so any dispatcher running with a cwd outside the
+// town tree (the daemon/systemd services, a detached redispatch, a polecat
+// worktree that is not under the town root) lost its identity and stamped
+// `dispatched_by: unknown` on the bead EVEN THOUGH GT_ROLE was exported in its
+// environment. That is exactly the state observed on the live nca-c6d bead, and it
+// makes mis-dispatch RCA guesswork.
+//
+// The env identity is the authoritative role signal in Gas Town (GT_ROLE overrides
+// cwd detection inside GetRoleWithContext anyway), so fall back to it rather than
+// discarding it. Only when there is genuinely no identity to report do we return
+// "unknown".
 func detectActor() string {
-	roleInfo, err := GetRole()
-	if err != nil {
-		return "unknown"
+	if roleInfo, err := GetRole(); err == nil {
+		if actor := roleInfo.ActorString(); actor != "" && actor != string(RoleUnknown) {
+			return actor
+		}
 	}
-	return roleInfo.ActorString()
+	if actor := actorFromEnv(); actor != "" {
+		return actor
+	}
+	return "unknown"
+}
+
+// actorFromEnv reconstructs the actor string from the environment identity
+// (GT_ROLE, plus GT_RIG / GT_CREW / GT_POLECAT for the compound roles), without
+// requiring the CWD to resolve to a town. Returns "" when the environment carries
+// no usable identity, so callers can fall through to their own default.
+//
+// Mirrors the env branch of GetRoleWithContext so both agree on how a GT_ROLE
+// string maps to an actor.
+func actorFromEnv() string {
+	envRole := strings.TrimSpace(os.Getenv(EnvGTRole))
+	if envRole == "" {
+		return ""
+	}
+	role, rig, worker := parseRoleString(envRole)
+	if rig == "" {
+		rig = strings.TrimSpace(os.Getenv("GT_RIG"))
+	}
+	if worker == "" {
+		if crew := strings.TrimSpace(os.Getenv("GT_CREW")); crew != "" {
+			worker = crew
+		} else {
+			worker = strings.TrimSpace(os.Getenv("GT_POLECAT"))
+		}
+	}
+	actor := RoleInfo{Role: role, Rig: rig, Polecat: worker}.ActorString()
+	if actor == "" || actor == string(RoleUnknown) {
+		return ""
+	}
+	return actor
 }
 
 // agentIDToBeadID converts an agent ID to its corresponding agent bead ID.

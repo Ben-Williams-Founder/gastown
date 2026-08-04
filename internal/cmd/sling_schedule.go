@@ -97,6 +97,23 @@ func scheduleBead(beadID, rigName string, opts ScheduleOptions) error {
 		return fmt.Errorf("checking bead status: %w", err)
 	}
 
+	// BLOCKED guard (hq-vcg3). THIS is the gate that matters in the live config:
+	// with scheduler.max_polecats > 0 the town runs in DEFERRED dispatch mode, and
+	// runSling returns into scheduleBead well BEFORE its own eligibility gates — so
+	// `gt sling <blocked-bead> <rig>` reaches the queue without ever meeting the
+	// runSling guard. Refusing at enqueue also keeps a blocked bead out of the queue
+	// entirely, rather than letting it sit there re-failing at dispatch and burning
+	// the maxDispatchFailures circuit breaker (queue selection,
+	// isScheduledWorkBeadReady, requires status=="open", so a blocked context is
+	// admitted and then never dispatched).
+	//
+	// Placed ahead of the idempotency/closed checks below on purpose: a fail-closed
+	// eligibility predicate should run before any early-return path can skip it.
+	// Not bypassed by --force — the deacon redispatch path shells `gt sling --force`.
+	if beads.IsBlockedStatus(info.Status) {
+		return fmt.Errorf("refusing to dispatch BLOCKED bead %s to rig %q: status=%q — the bead is on an explicit block/hold and must not be queued for work. Clear the block first (bd update %s --status open); --force does not override this guard", beadID, rigName, info.Status, beadID)
+	}
+
 	// Idempotency: check for existing open sling context for this work bead.
 	// Fail fast on errors to avoid creating duplicate contexts on transient DB failures.
 	//

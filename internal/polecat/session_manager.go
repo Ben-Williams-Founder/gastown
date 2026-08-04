@@ -888,6 +888,16 @@ func (m *SessionManager) validateIssue(issueID, workDir string) error {
 	if beads.IssueStatus(issues[0].Status).IsTerminal() {
 		return fmt.Errorf("%w: %s has terminal status %s", ErrIssueInvalid, issueID, issues[0].Status)
 	}
+	// BLOCKED guard (hq-vcg3). `gt session start <rig>/<polecat> --issue <bead>`
+	// reaches hookIssue() below, which writes `bd update --status=hooked
+	// --assignee=<rig>/polecats/<name>` DIRECTLY — it never goes through gt sling or
+	// gt hook, so it bypasses every eligibility guard on those paths. Enforcing here
+	// (the pre-hook validation Start() already calls) closes that bypass under the
+	// same fail-closed contract: a bead an operator has BLOCKED must not be handed
+	// to a worker. Clear the block first (bd update <id> --status open).
+	if beads.IsBlockedStatus(issues[0].Status) {
+		return fmt.Errorf("%w: refusing to dispatch BLOCKED bead %s to a polecat (status=%s) — the bead is on an explicit block/hold; clear it first (bd update %s --status open)", ErrIssueInvalid, issueID, issues[0].Status, issueID)
+	}
 	return nil
 }
 

@@ -632,6 +632,26 @@ func runSling(cmd *cobra.Command, args []string) (retErr error) {
 		return fmt.Errorf("bead %s is %s (work already completed)", beadID, info.Status)
 	}
 
+	// BLOCKED guard (hq-vcg3). A BLOCKED bead is one an operator/witness explicitly
+	// halted (a do-not-resling hold) or whose blockers are unresolved. Re-dispatching
+	// one spawns an agent that can only refuse and close — pure waste — and silently
+	// defeats the hold. Verified live: nca-c6d (status=blocked + do-not-resling note)
+	// was re-dispatched to a rig polecat repeatedly with a witness containing it by
+	// hand each time, because NO sling path had a blocked predicate.
+	//
+	// Deliberately placed BEFORE resolveTarget(), which spawns/hooks a polecat as a
+	// side effect — refusing here costs zero spawns (unlike the control-plane guard
+	// below, which must roll a spawn back).
+	//
+	// NOT --force-overridable, mirroring the closed/tombstone and control-plane
+	// guards. This is load-bearing, not stylistic: the deacon redispatch path shells
+	// `gt sling <bead> <rig> --force` (internal/deacon/redispatch.go slingBead), so a
+	// force-overridable gate would not close the hole it exists for. To dispatch,
+	// clear the block first (`bd update <id> --status open`).
+	if beads.IsBlockedStatus(info.Status) {
+		return fmt.Errorf("refusing to dispatch BLOCKED bead %s to %v: status=%q — the bead is on an explicit block/hold and must not be worked. Clear the block first (bd update %s --status open); --force does not override this guard", beadID, args[1:], info.Status, beadID)
+	}
+
 	// Guard against slinging deferred beads (gt-1326mw).
 	// Deferred work (e.g., "deferred to post-launch") should not consume polecat slots.
 	// Use --force to override when intentionally re-activating deferred work.
