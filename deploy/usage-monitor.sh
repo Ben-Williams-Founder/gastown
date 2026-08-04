@@ -35,8 +35,18 @@ PY
 fi
 
 BODY_FILE="$(mktemp)"; trap 'rm -f "$BODY_FILE"' EXIT
-curl -s --max-time 15 https://api.anthropic.com/api/oauth/usage \
-  -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" -H "anthropic-version: 2023-06-01" 2>/dev/null > "$BODY_FILE"
+# The usage endpoint is ITSELF rate-limited (measured 2026-08-04: 9/10 rapid probes -> 429).
+# A monitor that gets 429'd reports 'stale', and stale => fail-open => gates disarmed.
+# So: bounded retry with backoff on non-200, and record the http code for diagnosis.
+code=""
+for attempt in 1 2 3; do
+  code="$(curl -s -o "$BODY_FILE" -w '%{http_code}' --max-time 15 \
+    https://api.anthropic.com/api/oauth/usage \
+    -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" -H "anthropic-version: 2023-06-01" 2>/dev/null)"
+  [ "$code" = "200" ] && break
+  [ "$attempt" -lt 3 ] && sleep $((attempt * 5))   # 5s, 10s backoff
+done
+[ "$code" = "200" ] || printf '' > "$BODY_FILE"    # non-200 => empty => parse fails => stale (fail-open, as ratified)
 
 python3 - "$OUT" "$now" "$BODY_FILE" <<'PY' 2>/dev/null
 import json,sys,os
