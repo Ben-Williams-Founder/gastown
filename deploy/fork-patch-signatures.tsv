@@ -41,3 +41,4 @@ fb380d75	sym	IsControlPlaneBead	feat(sling): control-plane dispatch guard (hq-ku
 b26551a19	sym	printProvenance	provenance stamp + gated deploy tooling (Stage-1)
 9a7283090	str	SCOPE GUARD (read first	fix(boot): scope-guard mol-boot-triage to deacon-health only
 34e6fa92e	waive	-	build(deps): grpc 1.82.1 + x/text 0.39.0 CVE bumps — verified by govulncheck-clean deploy gate + G1 superset
+5f551f11	str	refusing to dispatch BLOCKED bead	feat(sling): fail-closed BLOCKED dispatch predicate (hq-vcg3)
