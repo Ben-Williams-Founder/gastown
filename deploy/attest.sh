@@ -52,20 +52,42 @@ MISSLIST="$OUT/g1-missing.txt"
 comm -23 \
   <("$GO" tool nm "$LIVE_BIN"  2>/dev/null | awk '{print $NF}' | LC_ALL=C sort -u) \
   <("$GO" tool nm "$CAND"      2>/dev/null | awk '{print $NF}' | LC_ALL=C sort -u) > "$MISSLIST"
-# Three-way triage (run-5 lesson: strict-0 is the wrong contract under dep bumps,
+# Four-way triage (run-5 lesson: strict-0 is the wrong contract under dep bumps,
 # but loosening silently would be a false-green vector):
 #   gastown symbols  — fork functionality: missing => ALWAYS FATAL.
+#   stamp artifacts  — the 7 -X ldflags provenance vars: counted, never fatal (see below).
 #   compiler noise   — $f32./$f64./..stmp_N numbering churn: counted, never fatal.
 #   dependency syms  — FATAL unless the operator explicitly declares the churn
 #                      via --allow-dep-churn "<reason>"; declaration + counts are
 #                      recorded in the attestation (auditable, fail-closed default).
-GAST_MISS="$(grep -c "steveyegge/gastown" "$MISSLIST" || true)"
+#
+# STAMP-ARTIFACT CLASS (added during the hq-vcg3 run): once the FIRST attested
+# binary went live, G1 began self-blocking EVERY subsequent attestation.
+# deploy-gt.sh links the live binary with `-X internal/cmd.<Var>=<value>` for the 7
+# provenance vars, which are declared `= ""` in source. The linker emits a `.str`
+# data symbol for an injected value but NOT for an empty default — so the LIVE
+# (stamped) binary permanently carries 7 `.str` symbols that the attest candidate
+# (built plain, by design, so symbols are compared pre-stamp) can never have. Those
+# were counted as gastown-loss => ALWAYS FATAL: a permanent false RED unrelated to
+# any code change. Empirically confirmed by rebuilding the SAME tree WITH the stamp
+# and re-running this comparison: total=0 missing, so no functionality is involved.
+#
+# Fail-closed by construction: this is an ANCHORED, EXPLICITLY ENUMERATED 7-symbol
+# allowlist — exact package, exact var names, exact `.str` suffix. Any other gastown
+# symbol loss stays fatal, including any other symbol on these same vars. A deleted
+# or renamed stamp var cannot sneak through either: deploy-gt.sh's self-check
+# refuses unless the stamped binary actually reports attested=true plus the expected
+# verifiedBase / patchSetHash / attestationId.
+STAMP_RE='^github\.com/steveyegge/gastown/internal/cmd\.(VerifiedBase|PatchSetHash|AttestationID|Version|Commit|Branch|Build)\.str$'
+GAST_ALL="$(grep -c "steveyegge/gastown" "$MISSLIST" || true)"
+STAMP_MISS="$(grep -cE "$STAMP_RE" "$MISSLIST" || true)"
+GAST_MISS=$((GAST_ALL - STAMP_MISS))
 ART_MISS="$(grep -cE '^\$f(32|64)\.|\.\.stmp_[0-9]+$|^go:itab\.' "$MISSLIST" || true)"   # go:itab = linker-generated (run-5 evidence)
 TOT_MISS="$(wc -l < "$MISSLIST")"
-DEP_MISS=$((TOT_MISS - GAST_MISS - ART_MISS))
-echo "   missing: total=$TOT_MISS gastown=$GAST_MISS dep=$DEP_MISS compiler-artifact=$ART_MISS"
+DEP_MISS=$((TOT_MISS - GAST_ALL - ART_MISS))
+echo "   missing: total=$TOT_MISS gastown=$GAST_MISS dep=$DEP_MISS compiler-artifact=$ART_MISS stamp-artifact=$STAMP_MISS"
 if [ "$GAST_MISS" -ne 0 ]; then
-  grep "steveyegge/gastown" "$MISSLIST" | head -10
+  grep "steveyegge/gastown" "$MISSLIST" | grep -vE "$STAMP_RE" | head -10
   echo "FAIL G1: $GAST_MISS gastown symbols MISSING — fork functionality would be dropped. DO NOT DEPLOY." >&2
   exit 1
 fi
@@ -102,7 +124,7 @@ cat > "$OUT/attestation.json" <<EOF
   "commit": "$HEAD_COMMIT",
   "verifiedBase": "$LIVE_COMMIT",
   "patchSetSha256": "$PATCHSET_HASH",
-  "gates": { "supersetGastownMissing": 0, "supersetDepMissing": $DEP_MISS, "supersetArtifactMissing": $ART_MISS, "depChurnDeclared": "${ALLOW_DEP_CHURN:-none}", "forkPatches": "PASS" },
+  "gates": { "supersetGastownMissing": 0, "supersetDepMissing": $DEP_MISS, "supersetArtifactMissing": $ART_MISS, "supersetStampArtifactMissing": $STAMP_MISS, "depChurnDeclared": "${ALLOW_DEP_CHURN:-none}", "forkPatches": "PASS" },
   "builder": "attest.sh",
   "buildFinishedOn": "$TS"
 }
