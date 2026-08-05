@@ -169,7 +169,7 @@ The Dog uses this to understand the state before deciding what to reap.`,
 				continue
 			}
 
-			result, err := reaper.Scan(db, dbName, maxAge, purgeAge, mailAge, staleAge)
+			result, err := reaper.Scan(db, dbName, maxAge, purgeAge, mailAge, staleAge, reaperDryRun)
 			db.Close()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s: scan error: %v\n", dbName, err)
@@ -533,7 +533,7 @@ Normally the daemon dispatches a Dog to execute the mol-dog-reaper formula.`,
 			}
 
 			// Scan
-			scanResult, err := reaper.Scan(db, dbName, maxAge, purgeAge, mailAge, staleAge)
+			scanResult, err := reaper.Scan(db, dbName, maxAge, purgeAge, mailAge, staleAge, reaperDryRun)
 			if err != nil {
 				fmt.Printf("%s: scan error: %v\n", dbName, err)
 				db.Close()

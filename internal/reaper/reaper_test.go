@@ -389,7 +389,7 @@ func TestClosedMoleculeStepReapBehavior(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 
 	maxAge := 24 * time.Hour
-	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour)
+	scan, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour, false)
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
@@ -609,6 +609,44 @@ func (s *fakeReaperState) hasOpenParentLocked(id string) bool {
 	return false
 }
 
+// danglingDepsLocked models the scan's dangling-parent detection query: a
+// parent-child dependency row that points at a concrete parent id (not an
+// external ref) whose parent exists in neither wisps nor issues. The fake models
+// no issues table (COUNT(*) FROM issues returns 0), so "parent absent from
+// wisps" is the dangling condition here.
+func (s *fakeReaperState) danglingDepsLocked() []fakeDep {
+	var out []fakeDep
+	for _, dep := range s.deps {
+		if dep.depType != "parent-child" || dep.dependsOnExternal != "" || dep.dependsOnID == "" {
+			continue
+		}
+		if _, ok := s.wisps[dep.dependsOnID]; ok {
+			continue
+		}
+		out = append(out, dep)
+	}
+	return out
+}
+
+// deleteDanglingDepsLocked models cleanDanglingParentRefs' DELETE: it drops
+// exactly the rows danglingDepsLocked counts and returns the number removed, so
+// a subsequent re-scan sees them gone.
+func (s *fakeReaperState) deleteDanglingDepsLocked() int64 {
+	kept := make([]fakeDep, 0, len(s.deps))
+	var removed int64
+	for _, dep := range s.deps {
+		if dep.depType == "parent-child" && dep.dependsOnExternal == "" && dep.dependsOnID != "" {
+			if _, ok := s.wisps[dep.dependsOnID]; !ok {
+				removed++
+				continue
+			}
+		}
+		kept = append(kept, dep)
+	}
+	s.deps = kept
+	return removed
+}
+
 func (s *fakeReaperState) openCountLocked() int {
 	count := 0
 	for _, w := range s.wisps {
@@ -671,7 +709,7 @@ func (c *fakeReaperConn) QueryContext(_ context.Context, query string, args []dr
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM issues"):
 		return fakeCountRows(0), nil
 	case strings.Contains(normalized, "SELECT COUNT(*) FROM wisp_dependencies wd"):
-		return fakeCountRows(0), nil
+		return fakeCountRows(len(c.state.danglingDepsLocked())), nil
 	case strings.Contains(normalized, "SELECT w.id FROM wisps w") && strings.Contains(normalized, "created_at <"):
 		if err := validateStaleWispQuery(normalized); err != nil {
 			return nil, err
@@ -704,6 +742,8 @@ func (c *fakeReaperConn) ExecContext(_ context.Context, query string, args []dri
 			}
 		}
 		return fakeReaperResult(affected), nil
+	case strings.HasPrefix(normalized, "DELETE wd FROM wisp_dependencies wd"):
+		return fakeReaperResult(c.state.deleteDanglingDepsLocked()), nil
 	case normalized == "SET @@autocommit = 0" || normalized == "SET @@autocommit = 1" || normalized == "ROLLBACK" || normalized == "COMMIT" || strings.HasPrefix(normalized, "CALL DOLT_COMMIT"):
 		return fakeReaperResult(0), nil
 	default:
@@ -822,4 +862,86 @@ func assertOpsContainInOrder(t *testing.T, ops []string, want ...string) {
 		}
 	}
 	t.Fatalf("ops missing ordered sequence %v in %v", want[next:], ops)
+}
+
+// TestScanAutoCleansDanglingParentRefs is the regression guard for the fork
+// patch (hq-mnc1, d2459014) that was dropped by the 2026-06-22 upstream sync
+// (wkb-pg9o) and re-integrated here. It asserts the *behavior contract*, not the
+// source text: on a NON-dry scan, a dangling parent-child dependency row (parent
+// present in neither wisps nor issues) must be DELETED and must NOT escalate a
+// dangling_parent_ref anomaly; on a dry-run scan it must be COUNTED (anomaly
+// surfaced) but NOT mutated. If the auto-clean is ever dropped again, the
+// non-dry sub-test fails: the row survives and the anomaly reappears.
+func TestScanAutoCleansDanglingParentRefs(t *testing.T) {
+	now := time.Now().UTC()
+	newState := func() *fakeReaperState {
+		return &fakeReaperState{
+			wisps: map[string]*fakeWisp{
+				"mol-open": {id: "mol-open", status: "open", issueType: "molecule", createdAt: now},
+				"step-a":   {id: "step-a", status: "open", issueType: "task", createdAt: now},
+			},
+			deps: []fakeDep{
+				// Healthy edge: parent exists → never dangling.
+				{issueID: "step-a", dependsOnID: "mol-open", depType: "parent-child"},
+				// Dangling edge: parent "mol-purged" exists in neither wisps nor issues.
+				{issueID: "step-a", dependsOnID: "mol-purged", depType: "parent-child"},
+			},
+			ops: map[int][]string{},
+		}
+	}
+
+	hasDanglingAnomaly := func(res *ScanResult) bool {
+		for _, a := range res.Anomalies {
+			if a.Type == "dangling_parent_ref" {
+				return true
+			}
+		}
+		return false
+	}
+	danglingRowCount := func(s *fakeReaperState) int {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return len(s.danglingDepsLocked())
+	}
+
+	maxAge := 24 * time.Hour
+
+	// Non-dry scan: auto-clean, no escalation.
+	t.Run("non-dry auto-cleans and does not escalate", func(t *testing.T) {
+		state := newState()
+		if danglingRowCount(state) != 1 {
+			t.Fatalf("precondition: want 1 dangling row, got %d", danglingRowCount(state))
+		}
+		db := openFakeReaperDB(t, state)
+		t.Cleanup(func() { _ = db.Close() })
+
+		res, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour, false)
+		if err != nil {
+			t.Fatalf("Scan: %v", err)
+		}
+		if hasDanglingAnomaly(res) {
+			t.Fatalf("non-dry scan escalated a dangling_parent_ref anomaly; the auto-clean fix was dropped. anomalies=%v", res.Anomalies)
+		}
+		if got := danglingRowCount(state); got != 0 {
+			t.Fatalf("non-dry scan did not delete the dangling row; %d remain", got)
+		}
+	})
+
+	// Dry-run scan: detect/count only, never mutate.
+	t.Run("dry-run counts but does not mutate", func(t *testing.T) {
+		state := newState()
+		db := openFakeReaperDB(t, state)
+		t.Cleanup(func() { _ = db.Close() })
+
+		res, err := Scan(db, "testdb", maxAge, 7*24*time.Hour, 7*24*time.Hour, 30*24*time.Hour, true)
+		if err != nil {
+			t.Fatalf("Scan (dry-run): %v", err)
+		}
+		if !hasDanglingAnomaly(res) {
+			t.Fatalf("dry-run scan should surface a dangling_parent_ref anomaly; got %v", res.Anomalies)
+		}
+		if got := danglingRowCount(state); got != 1 {
+			t.Fatalf("dry-run scan mutated state: want 1 dangling row remaining, got %d", got)
+		}
+	})
 }
