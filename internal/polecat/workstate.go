@@ -8,6 +8,7 @@ const (
 	WorkstateVerdictPendingMR     = "PENDING_MR"
 	WorkstateVerdictNeedsRecovery = "NEEDS_RECOVERY"
 	WorkstateVerdictNeedsMQSubmit = "NEEDS_MQ_SUBMIT"
+	WorkstateVerdictDoneLocal     = "DONE_LOCAL"
 )
 
 // WorkstateInput contains the lifecycle, git, and merge-queue facts needed to
@@ -45,6 +46,13 @@ type WorkstateInput struct {
 	AssignedBeadTerminal           bool
 	MRSubmitted                    bool
 	MQLookupFailed                 bool
+	// MergeStrategyLocal is true when the polecat's source convoy/issue declares
+	// merge_strategy=local (approval-gated). Completion under this strategy means
+	// work is held for the source-bead right-holder's disposition: no MQ submit
+	// is expected (so NEEDS_MQ_SUBMIT is a misclassification) and the polecat
+	// must not be auto-reaped as SAFE_TO_NUKE while the disposition is pending
+	// (ICD-OPS-convoy-merge-strategy, Rider 1).
+	MergeStrategyLocal             bool
 }
 
 // WorkstateDisposition is the canonical polecat lifecycle decision. It is pure
@@ -192,6 +200,22 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 		d.CountsTowardCapacity = capacityBlocked
 		d.ReuseStatus = "idle-recovery-needed"
 		return d
+	}
+
+	// A blocker-free completed merge=local polecat is DONE_LOCAL: work is
+	// pushed/clean and held for the right-holder's disposition. Skip the MQ
+	// section entirely — no submit is expected under this strategy, so the
+	// NEEDS_MQ_SUBMIT branch below would be the Rider-1 misclassification. Not
+	// SafeToNuke: the auto-reaper only collects SAFE_TO_NUKE, and reaping a
+	// held approval-gated polecat discards the only disposition context
+	// (EXP-approval-gated-reap-repro). Mirrors PENDING_MR: held, non-anomalous,
+	// capacity-free.
+	if in.MergeStrategyLocal {
+		return WorkstateDisposition{
+			Verdict:     WorkstateVerdictDoneLocal,
+			Reason:      "merge-local-held",
+			ReuseStatus: "idle-local-hold",
+		}
 	}
 
 	if in.MQCheckRequired {

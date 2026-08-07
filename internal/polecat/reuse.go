@@ -33,6 +33,9 @@ type SlotReuseInput struct {
 	// WorkBeadClosed: the work bead (assigned/source/hook) is terminal, so
 	// unpushed pre-squash checkpoint commits are not at-risk work.
 	WorkBeadClosed bool
+	// MergeStrategyLocal: source declares merge_strategy=local (approval-gated);
+	// completion is a held DONE_LOCAL disposition, not a reusable slot.
+	MergeStrategyLocal bool
 }
 
 // SlotReuseDecision explains whether a polecat can be reused and why not.
@@ -67,6 +70,7 @@ func DecideSlotReuse(in SlotReuseInput) SlotReuseDecision {
 		MRSubmitted:          in.MRSubmitted,
 		MQLookupFailed:       in.MQLookupFailed,
 		WorkBeadClosed:       in.WorkBeadClosed,
+		MergeStrategyLocal:   in.MergeStrategyLocal,
 	})
 	return SlotReuseDecision{Reusable: d.Reusable, Reason: d.Reason}
 }

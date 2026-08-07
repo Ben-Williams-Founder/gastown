@@ -213,3 +213,52 @@ func TestDecideWorkstateCanonicalFields(t *testing.T) {
 		})
 	}
 }
+
+// Rider-1 (ICD-OPS-convoy-merge-strategy): completed merge=local polecats are
+// DONE_LOCAL holds — never NEEDS_MQ_SUBMIT (no MQ expected) and never
+// SAFE_TO_NUKE (the auto-reaper must not collect held approval-gated work).
+// Regression base: every merge=local completion previously classified
+// NEEDS_MQ_SUBMIT (EXP-1 3/3), and MQNotRequired alone fell through to
+// SAFE_TO_NUKE (the reap that discarded held work).
+func TestDecideWorkstateMergeLocalRider1(t *testing.T) {
+	tests := []struct {
+		name string
+		in   WorkstateInput
+		want WorkstateDisposition
+	}{
+		{
+			name: "completed merge=local clean pushed is DONE_LOCAL, not NEEDS_MQ_SUBMIT",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", MQCheckRequired: true, HasSubmittableWork: true, MergeStrategyLocal: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictDoneLocal, Reason: "merge-local-held", ReuseStatus: "idle-local-hold"},
+		},
+		{
+			name: "state=done merge=local is DONE_LOCAL",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/test", MQCheckRequired: true, HasSubmittableWork: true, MergeStrategyLocal: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictDoneLocal, Reason: "merge-local-held", ReuseStatus: "idle-local-hold"},
+		},
+		{
+			name: "merge=local with dirty tree still needs recovery",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", GitDirty: true, GitDirtyReason: "git_state=has_uncommitted uncommitted_files=1", MergeStrategyLocal: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "git-dirty", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"git_state=has_uncommitted uncommitted_files=1"}},
+		},
+		{
+			name: "merge=local with unpushed commits on open bead still needs recovery",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", UnpushedCommits: 2, MergeStrategyLocal: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "git-unpushed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"git_state=has_unpushed unpushed_commits=2"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DecideWorkstate(tt.in)
+			if got.Verdict != tt.want.Verdict || got.Reason != tt.want.Reason ||
+				got.Reusable != tt.want.Reusable || got.SafeToNuke != tt.want.SafeToNuke ||
+				got.NeedsRecovery != tt.want.NeedsRecovery || got.NeedsMQSubmit != tt.want.NeedsMQSubmit ||
+				got.CountsTowardCapacity != tt.want.CountsTowardCapacity || got.ReuseStatus != tt.want.ReuseStatus {
+				t.Errorf("DecideWorkstate() = %+v, want %+v", got, tt.want)
+			}
+			if got.Verdict == WorkstateVerdictDoneLocal && got.SafeToNuke {
+				t.Error("DONE_LOCAL must never be SafeToNuke (auto-reaper collects SafeToNuke)")
+			}
+		})
+	}
+}
