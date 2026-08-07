@@ -3820,3 +3820,46 @@ func TestBranchPushedToRemote_NoPushURL(t *testing.T) {
 		t.Errorf("BranchPushedToRemote unpushed = %d, want >= 1", unpushed)
 	}
 }
+
+// hq-xjpe 3rd variant (ICD-OPS-convoy-merge-strategy / wkb-0rfj): a pushed
+// branch whose exact-remote lookup is unavailable must be judged against its
+// own upstream (@{u}), not against an explicit target like origin/main —
+// comparing a pushed-and-held branch to the integration target counts every
+// held commit as unpushed and manufactures a false has_unpushed/NEEDS_RECOVERY.
+func TestBranchPreservationStatusPrefersUpstreamOverTargets(t *testing.T) {
+	localDir, _, mainBranch := initTestRepoWithRemote(t)
+	g := NewGit(localDir)
+	branch := "held/approval-gated-work"
+
+	if err := g.CreateBranch(branch); err != nil {
+		t.Fatalf("CreateBranch: %v", err)
+	}
+	if err := g.Checkout(branch); err != nil {
+		t.Fatalf("Checkout: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(localDir, "held.txt"), []byte("held work\n"), 0644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := g.Add("held.txt"); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := g.Commit("held commit"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	// Push under a DIFFERENT remote name and set it as upstream, so the
+	// exact-remote-branch lookup (same-name) finds nothing and the decision
+	// falls to candidate ordering: upstream must outrank the origin/main target.
+	runGit(t, localDir, "push", "origin", branch+":custody/held-work")
+	runGit(t, localDir, "branch", "--set-upstream-to=origin/custody/held-work", branch)
+
+	status, err := g.BranchPreservationStatus(branch, "origin", []string{"origin/" + mainBranch})
+	if err != nil {
+		t.Fatalf("BranchPreservationStatus: %v", err)
+	}
+	if !status.Preserved || status.UnpreservedPatchCount != 0 {
+		t.Fatalf("BranchPreservationStatus = %+v, want preserved via upstream (not counted against origin/%s)", status, mainBranch)
+	}
+	if status.ComparisonBase != "origin/custody/held-work" {
+		t.Fatalf("ComparisonBase = %q, want upstream origin/custody/held-work (3rd-variant ordering)", status.ComparisonBase)
+	}
+}

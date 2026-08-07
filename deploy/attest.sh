@@ -79,15 +79,30 @@ comm -23 \
 # refuses unless the stamped binary actually reports attested=true plus the expected
 # verifiedBase / patchSetHash / attestationId.
 STAMP_RE='^github\.com/steveyegge/gastown/internal/cmd\.(VerifiedBase|PatchSetHash|AttestationID|Version|Commit|Branch|Build)\.str$'
+# GASTOWN-PACKAGE COMPILER TEMPORARIES (added during the hq-ud8e run): Go emits
+# `..stmp_N` static-temporary data symbols inside the owning package's namespace,
+# so they carry the gastown path prefix and were double-counted — matched by the
+# compiler-artifact class below ("counted, never fatal" per the run-5 triage) AND
+# by the gastown-fatal class (which only exempted stamp vars). Net effect: ANY
+# source edit in a gastown package renumbers its temporaries and G1 self-blocks
+# with a false "gastown symbols MISSING" (observed: 118 misses, dep=-118 from the
+# same double-count). Empirical confirmation, mirroring the stamp-class method:
+# a candidate built from the UNCHANGED live tree shows 0 ..stmp misses (only the
+# 7 stamp vars), while the edited tree's candidate GAINS matching renumbered
+# temporaries (118 old -> 121 new) — numbering churn, no functionality involved.
+# Fail-closed by construction: the exemption is the anchored `..stmp_N` suffix
+# class ONLY — every named gastown function/data symbol remains ALWAYS FATAL.
+GAST_TMP_RE='^github\.com/steveyegge/gastown/.*\.\.stmp_[0-9]+$'
 GAST_ALL="$(grep -c "steveyegge/gastown" "$MISSLIST" || true)"
 STAMP_MISS="$(grep -cE "$STAMP_RE" "$MISSLIST" || true)"
-GAST_MISS=$((GAST_ALL - STAMP_MISS))
+GAST_TMP_MISS="$(grep -cE "$GAST_TMP_RE" "$MISSLIST" || true)"
+GAST_MISS=$((GAST_ALL - STAMP_MISS - GAST_TMP_MISS))
 ART_MISS="$(grep -cE '^\$f(32|64)\.|\.\.stmp_[0-9]+$|^go:itab\.' "$MISSLIST" || true)"   # go:itab = linker-generated (run-5 evidence)
 TOT_MISS="$(wc -l < "$MISSLIST")"
-DEP_MISS=$((TOT_MISS - GAST_ALL - ART_MISS))
-echo "   missing: total=$TOT_MISS gastown=$GAST_MISS dep=$DEP_MISS compiler-artifact=$ART_MISS stamp-artifact=$STAMP_MISS"
+DEP_MISS=$((TOT_MISS - GAST_ALL - (ART_MISS - GAST_TMP_MISS)))
+echo "   missing: total=$TOT_MISS gastown=$GAST_MISS dep=$DEP_MISS compiler-artifact=$ART_MISS (gastown-pkg-tmp=$GAST_TMP_MISS) stamp-artifact=$STAMP_MISS"
 if [ "$GAST_MISS" -ne 0 ]; then
-  grep "steveyegge/gastown" "$MISSLIST" | grep -vE "$STAMP_RE" | head -10
+  grep "steveyegge/gastown" "$MISSLIST" | grep -vE "$STAMP_RE" | grep -vE "$GAST_TMP_RE" | head -10
   echo "FAIL G1: $GAST_MISS gastown symbols MISSING — fork functionality would be dropped. DO NOT DEPLOY." >&2
   exit 1
 fi

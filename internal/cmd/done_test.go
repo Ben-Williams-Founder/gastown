@@ -2247,3 +2247,29 @@ func testRunGit(t *testing.T, dir string, args ...string) {
 		t.Fatalf("git %v in %s: %v\n%s", args, dir, err, out)
 	}
 }
+
+// Defect (c), ICD-OPS-convoy-merge-strategy: when no convoy resolves and the
+// source issue's attachment carries no merge strategy, gt done must fail
+// CLOSED (hold + notify witness), never fall through to the push+MQ default —
+// the fail-open that created and merged PRs for merge=local work (PR #593;
+// wkb-dmfa PR #618).
+func TestDoneStrategyUnresolvable(t *testing.T) {
+	tests := []struct {
+		name  string
+		issue *beads.Issue
+		want  bool
+	}{
+		{name: "nil issue is unresolvable", issue: nil, want: true},
+		{name: "no attachment fields is unresolvable", issue: &beads.Issue{Description: "plain work description"}, want: true},
+		{name: "attachment without merge_strategy is unresolvable", issue: &beads.Issue{Description: "attached_molecule: gt-wisp-1\nmode: ralph"}, want: true},
+		{name: "merge_strategy=pr resolves", issue: &beads.Issue{Description: "merge_strategy: pr"}, want: false},
+		{name: "merge_strategy=local resolves", issue: &beads.Issue{Description: "merge_strategy: local"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := doneStrategyUnresolvable(tt.issue); got != tt.want {
+				t.Errorf("doneStrategyUnresolvable() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

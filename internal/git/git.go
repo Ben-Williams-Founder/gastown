@@ -2732,8 +2732,9 @@ type BranchPreservationStatus struct {
 
 // BranchPreservationStatus checks whether HEAD is safe relative to the actual
 // custody target for the branch. It prefers proof from the exact pushed source
-// branch, then explicit target branches, then upstream. It only falls back to the
-// remote default branch when no target/custody/upstream evidence exists.
+// branch, then the branch's own upstream, then explicit target branches. It only
+// falls back to the remote default branch when no target/custody/upstream
+// evidence exists.
 func (g *Git) BranchPreservationStatus(localBranch, remote string, targets []string) (BranchPreservationStatus, error) {
 	return g.branchPreservationStatus(localBranch, remote, targets, true)
 }
@@ -2768,17 +2769,26 @@ func (g *Git) branchPreservationStatus(localBranch, remote string, targets []str
 		}
 	}
 
-	for _, target := range nonEmptyUnique(targets) {
-		if ref, ok := g.resolveComparisonRef(target, remote); ok {
-			candidates = append(candidates, ref)
-		}
-	}
-
+	// The branch's own upstream outranks explicit target refs (hq-xjpe 3rd
+	// variant): a pushed branch whose exact-remote lookup failed must be judged
+	// against the ref it actually pushes to (@{u}), not against origin/main —
+	// comparing a pushed-and-held branch to the integration target counts every
+	// held commit as "unpushed" and manufactures a false NEEDS_RECOVERY/
+	// has_unpushed verdict (observed on wkb-0rfj: branch pushed, ls-remote
+	// verified, still flagged). Self-upstream remains excluded for target/custody
+	// checks (includeExactBranch=false), where the question is "is the work on
+	// the integration ref", not "is it preserved".
 	if upstream, err := g.run("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"); err == nil && strings.TrimSpace(upstream) != "" {
 		upstream = strings.TrimSpace(upstream)
 		if includeExactBranch || !isPolecatSelfUpstream(localBranch, remote, upstream) {
 			hasEvidence = true
 			candidates = append(candidates, upstream)
+		}
+	}
+
+	for _, target := range nonEmptyUnique(targets) {
+		if ref, ok := g.resolveComparisonRef(target, remote); ok {
+			candidates = append(candidates, ref)
 		}
 	}
 

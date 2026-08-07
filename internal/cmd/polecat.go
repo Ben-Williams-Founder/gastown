@@ -1203,6 +1203,12 @@ func runPolecatCheckRecovery(cmd *cobra.Command, args []string) error {
 		fmt.Printf("  Verdict:         %s\n", style.Warning.Render("PENDING_MR"))
 		fmt.Println()
 		fmt.Println("  Work is waiting on an active merge request; preserve this polecat until it lands.")
+	case "DONE_LOCAL":
+		fmt.Printf("  Verdict:         %s\n", style.Success.Render("DONE_LOCAL"))
+		fmt.Println()
+		fmt.Println("  Approval-gated (merge=local) work is complete and held on its branch.")
+		fmt.Println("  Disposition belongs to the source-bead right-holder; do not submit to the")
+		fmt.Println("  merge queue or reap until they decide.")
 	case "NEEDS_RECOVERY":
 		fmt.Printf("  Verdict:         %s\n", style.Error.Render("NEEDS_RECOVERY"))
 		fmt.Println()
@@ -1267,6 +1273,7 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 	input.WorkBeadClosed = beadTerminal
 	input.HasSubmittableWork = hasSubmittableWorkForRecovery(worktreePath, targetRefs, gitState, gitErr)
 	input.MQNotRequired = isMQNotRequiredSource(bd, status.Issue)
+	input.MergeStrategyLocal = isMergeLocalSource(bd, status.Issue)
 	if targetRefLookupFailed {
 		input.MQLookupFailed = true
 	}
@@ -1614,6 +1621,25 @@ func isMQNotRequiredSource(bd issueShower, issueID string) bool {
 	}
 	if attachment.NoMerge || attachment.ReviewOnly {
 		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local")
+}
+
+// isMergeLocalSource reports whether the source issue declares
+// merge_strategy=local specifically (approval-gated hold), as opposed to the
+// broader isMQNotRequiredSource (which also covers no_merge/review_only —
+// classes with no held-disposition semantics).
+func isMergeLocalSource(bd issueShower, issueID string) bool {
+	if issueID == "" || bd == nil {
+		return false
+	}
+	issue, err := bd.Show(issueID)
+	if err != nil || issue == nil {
+		return false
+	}
+	attachment := beads.ParseAttachmentFields(issue)
+	if attachment == nil {
+		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local")
 }

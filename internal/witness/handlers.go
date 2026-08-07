@@ -1082,6 +1082,7 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 		input.IgnoreCleanupStatus = true
 	}
 	input.MQNotRequired = witnessMQNotRequiredSource(rigBeads, issueID)
+	input.MergeStrategyLocal = witnessMergeLocalSource(rigBeads, issueID)
 	if input.MQCheckRequired && input.HasSubmittableWork && !input.AssignedBeadTerminal && !input.MQNotRequired {
 		mr, err := rigBeads.FindMRForBranchAny(input.Branch)
 		if err != nil {
@@ -1221,6 +1222,24 @@ func witnessMQNotRequiredSource(bd *beads.Beads, issueID string) bool {
 		return false
 	}
 	return attachment.NoMerge || attachment.ReviewOnly || strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local")
+}
+
+// witnessMergeLocalSource reports merge_strategy=local specifically: the
+// approval-gated class whose completed polecats are DONE_LOCAL holds (Rider 1,
+// ICD-OPS-convoy-merge-strategy), distinct from no_merge/review_only.
+func witnessMergeLocalSource(bd *beads.Beads, issueID string) bool {
+	if bd == nil || issueID == "" {
+		return false
+	}
+	issue, err := bd.Show(issueID)
+	if err != nil || issue == nil {
+		return false
+	}
+	attachment := beads.ParseAttachmentFields(issue)
+	if attachment == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(attachment.MergeStrategy), "local")
 }
 
 func witnessHasSubmittableWork(worktreePath string, targetRefs []string) bool {

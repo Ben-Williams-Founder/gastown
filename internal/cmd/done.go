@@ -93,6 +93,22 @@ func shouldUpdateAgentStateOnDone(pushFailed, mrFailed bool) bool {
 	return !pushFailed && !mrFailed
 }
 
+// doneStrategyUnresolvable reports whether the merge strategy for a completing
+// issue is UNKNOWN: the caller found no convoy, and the issue's attachment
+// fields carry no merge_strategy either. Per ICD-OPS-convoy-merge-strategy the
+// reader must then fail CLOSED (hold + notify witness), never fall through to
+// the push+MQ default — the fail-open that merged approval-gated work.
+func doneStrategyUnresolvable(sourceIssue *beads.Issue) bool {
+	if sourceIssue == nil {
+		return true
+	}
+	af := beads.ParseAttachmentFields(sourceIssue)
+	if af == nil {
+		return true
+	}
+	return strings.TrimSpace(af.MergeStrategy) == ""
+}
+
 func shouldRetirePolecatSessionAfterDone(exitType, mergeStrategy string, pushFailed, mrFailed bool) bool {
 	if exitType != ExitCompleted || pushFailed || mrFailed {
 		return false
@@ -1183,6 +1199,23 @@ func runDone(cmd *cobra.Command, args []string) (retErr error) {
 			fmt.Printf("  Issue: %s\n", issueID)
 			fmt.Println()
 			fmt.Printf("%s\n", style.Dim.Render("Work stays on local feature branch."))
+			goto notifyWitness
+		}
+
+		// Fail CLOSED on an unresolvable strategy (ICD-OPS-convoy-merge-strategy,
+		// defect c): no convoy resolved and the source issue's attachment carries
+		// no merge strategy, so the strategy is UNKNOWN. Falling through to the
+		// MQ default here is the fail-open that pushed and merged approval-gated
+		// work whose convoy said local (PR #593; wkb-dmfa PR #618). Hold the
+		// branch, notify the witness, and let a right-holder decide — never
+		// assume the MQ path.
+		if convoyInfo == nil && doneStrategyUnresolvable(sourceIssueForNoMerge) {
+			mrFailed = true
+			{
+				errMsg := fmt.Sprintf("merge strategy unresolvable for %s (no convoy resolved, no attachment strategy) — failing CLOSED per ICD-OPS-convoy-merge-strategy: branch %s held, not pushed, no MR created", issueID, branch)
+				doneErrors = append(doneErrors, errMsg)
+				style.PrintWarning("%s\nWitness will be notified for right-holder disposition.", errMsg)
+			}
 			goto notifyWitness
 		}
 
