@@ -43,3 +43,4 @@ b26551a19	sym	printProvenance	provenance stamp + gated deploy tooling (Stage-1)
 34e6fa92e	waive	-	build(deps): grpc 1.82.1 + x/text 0.39.0 CVE bumps — verified by govulncheck-clean deploy gate + G1 superset
 5f551f11	str	refusing to dispatch BLOCKED bead	feat(sling): fail-closed BLOCKED dispatch predicate (hq-vcg3)
 792e88ae	str	merge-local-held	feat(done): DONE_LOCAL held verdict + fail-closed strategy resolution + upstream-first base (hq-ud8e Phase-B Rider-1)
+833bf3a9	str	go.opentelemetry.io/otel@v1.44.0	deps: hygiene bumps otel 1.44.0 + compress 1.18.7 (hq-noob)
