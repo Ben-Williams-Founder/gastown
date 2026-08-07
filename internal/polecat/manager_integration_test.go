@@ -23,7 +23,9 @@ func initBeadsDBWithPrefix(t *testing.T, dir, prefix string) {
 	t.Helper()
 	testutil.RequireDoltContainer(t)
 
-	args := []string{"init", "--quiet", "--prefix", prefix, "--server-port", testutil.DoltContainerPort()}
+	// --server is required: the pinned bd is CGO_ENABLED=0 (no embedded Dolt);
+	// --server-port alone falls back to embedded mode and hard-errors.
+	args := []string{"init", "--quiet", "--server", "--prefix", prefix, "--server-port", testutil.DoltContainerPort()}
 	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {

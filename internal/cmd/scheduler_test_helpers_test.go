@@ -48,7 +48,8 @@ func writeJSONFile(t *testing.T, path string, v interface{}) {
 // --- Scheduler config helpers ---
 
 // configureScheduler writes a TownSettings file with the given scheduler configuration.
-// maxPolecats > 0 enables deferred dispatch; -1 means direct dispatch.
+// Per DEC-OPS-cap-semantics (fork patch bd5891d2): >0 and -1 (governed-unbounded)
+// route deferred; 0 = truly direct dispatch (operator escape hatch, gate bypassed).
 func configureScheduler(t *testing.T, hqPath string, maxPolecats, batchSize int) {
 	t.Helper()
 	settings := config.NewTownSettings()

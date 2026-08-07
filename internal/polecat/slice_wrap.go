@@ -15,7 +15,7 @@ import (
 //
 // Design (deliberately conservative — this is the daemon spawn path):
 //   - INERT BY DEFAULT. Unset => the command is returned byte-identical, so the
-//     binary ships with zero behaviour change; activation is a reversible daemon-env
+//     binary ships with zero behavior change; activation is a reversible daemon-env
 //     flip (add Environment=GT_POLECAT_SLICE=polecat.slice to gastown-daemon.service,
 //     restart) — no binary swap needed to enable or disable.
 //   - FAIL-OPEN. On a non-Linux host or where systemd-run is absent, the command is

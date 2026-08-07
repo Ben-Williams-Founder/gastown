@@ -1406,13 +1406,15 @@ func TestSchedulerDeferredAcceptsDogTarget(t *testing.T) {
 	}
 }
 
-// TestSchedulerDirectEpicDispatch verifies that gt sling <epic-id> --dry-run
-// with max_polecats=-1 (direct mode) routes to the direct dispatch path.
+// TestSchedulerDirectEpicDispatch verifies epic dry-run routing under
+// DEC-OPS-cap-semantics: max_polecats=0 is the operator's true-direct escape
+// hatch (direct dispatch path), while -1 is governed-unbounded and MUST route
+// through the deferred/scheduled path (fork patch bd5891d2, wkb-3l4t).
 func TestSchedulerDirectEpicDispatch(t *testing.T) {
 	hqPath, rig1Path, rig2Path, gtBinary, env := setupMultiRigSchedulerTown(t)
 
-	// Reconfigure to direct dispatch mode
-	configureScheduler(t, hqPath, -1, 1)
+	// 0 = truly direct (gate bypassed by operator choice)
+	configureScheduler(t, hqPath, 0, 1)
 
 	// Create an epic with cross-rig children.
 	epicID := createTestBeadOfType(t, rig1Path, "Direct dispatch epic", "epic")
@@ -1433,9 +1435,23 @@ func TestSchedulerDirectEpicDispatch(t *testing.T) {
 	if !strings.Contains(out, child2) {
 		t.Errorf("direct epic dry-run should mention child2 %s\noutput: %s", child2, out)
 	}
-	// Direct dispatch uses "Would sling" not "Would schedule"
+	// Direct dispatch uses "Would dispatch" not "Would schedule"
+	if !strings.Contains(out, "Would dispatch") {
+		t.Errorf("direct mode (cap=0) should show 'Would dispatch'\noutput: %s", out)
+	}
 	if strings.Contains(out, "Would schedule") {
 		t.Errorf("direct mode should NOT show 'Would schedule'\noutput: %s", out)
+	}
+
+	// Sibling assertion protecting the fork patch (bd5891d2): -1 is
+	// governed-unbounded and must take the deferred/scheduled path.
+	configureScheduler(t, hqPath, -1, 1)
+	out = runGTCmdOutput(t, gtBinary, hqPath, env, "sling", epicID, "--dry-run")
+	if !strings.Contains(out, "Would schedule") {
+		t.Errorf("governed-unbounded (-1) must route deferred and show 'Would schedule' (DEC-OPS-cap-semantics)\noutput: %s", out)
+	}
+	if strings.Contains(out, "Would dispatch") {
+		t.Errorf("governed-unbounded (-1) must NOT take the direct path\noutput: %s", out)
 	}
 }
 
@@ -1686,13 +1702,15 @@ func TestSchedulerDispatchFailureRecordedInContextSourceDB(t *testing.T) {
 	}
 }
 
-// TestSchedulerDirectConvoyDispatch verifies that gt sling <convoy-id> --dry-run
-// with max_polecats=-1 (direct mode) routes to the direct dispatch path.
+// TestSchedulerDirectConvoyDispatch verifies convoy dry-run routing under
+// DEC-OPS-cap-semantics: max_polecats=0 is the operator's true-direct escape
+// hatch (direct dispatch path), while -1 is governed-unbounded and MUST route
+// through the deferred/scheduled path (fork patch bd5891d2, wkb-3l4t).
 func TestSchedulerDirectConvoyDispatch(t *testing.T) {
 	hqPath, rig1Path, rig2Path, gtBinary, env := setupMultiRigSchedulerTown(t)
 
-	// Reconfigure to direct dispatch mode
-	configureScheduler(t, hqPath, -1, 1)
+	// 0 = truly direct (gate bypassed by operator choice)
+	configureScheduler(t, hqPath, 0, 1)
 
 	// Create a convoy in HQ tracking beads in different rigs.
 	convoyID := createTestBeadOfType(t, hqPath, "Direct dispatch convoy", "convoy")
@@ -1721,9 +1739,23 @@ func TestSchedulerDirectConvoyDispatch(t *testing.T) {
 	if !strings.Contains(out, bead2) {
 		t.Errorf("direct convoy dry-run should mention bead2 %s\noutput: %s", bead2, out)
 	}
-	// Direct dispatch uses "Would sling" not "Would schedule"
+	// Direct dispatch uses "Would dispatch" not "Would schedule"
+	if !strings.Contains(out, "Would dispatch") {
+		t.Errorf("direct mode (cap=0) should show 'Would dispatch'\noutput: %s", out)
+	}
 	if strings.Contains(out, "Would schedule") {
 		t.Errorf("direct mode should NOT show 'Would schedule'\noutput: %s", out)
+	}
+
+	// Sibling assertion protecting the fork patch (bd5891d2): -1 is
+	// governed-unbounded and must take the deferred/scheduled path.
+	configureScheduler(t, hqPath, -1, 1)
+	out = runGTCmdOutput(t, gtBinary, hqPath, env, "sling", convoyID, "--dry-run")
+	if !strings.Contains(out, "Would schedule") {
+		t.Errorf("governed-unbounded (-1) must route deferred and show 'Would schedule' (DEC-OPS-cap-semantics)\noutput: %s", out)
+	}
+	if strings.Contains(out, "Would dispatch") {
+		t.Errorf("governed-unbounded (-1) must NOT take the direct path\noutput: %s", out)
 	}
 }
 
