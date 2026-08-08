@@ -25,6 +25,10 @@ var (
 	mqSubmitNoCleanup bool
 	mqSubmitSkipDeps  bool
 	mqSubmitResubmit  bool
+	// Escalation past the L1 branch guards. Kept together so a forced submit
+	// always carries its recorded reason (DEC-OPS-mq-cycle-branch-binding).
+	mqSubmitForce       bool
+	mqSubmitForceReason string
 
 	// Retry flags
 	mqRetryNow bool
@@ -312,6 +316,8 @@ func init() {
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitNoCleanup, "no-cleanup", false, "Don't auto-cleanup after submit (for polecats)")
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitSkipDeps, "skip-deps", false, "Skip molecule step dependency check")
 	mqSubmitCmd.Flags().BoolVar(&mqSubmitResubmit, "resubmit", false, "Resubmit after a fix (skips dependency check)")
+	mqSubmitCmd.Flags().BoolVar(&mqSubmitForce, "force", false, "Submit despite a branch guard refusal (requires --force-reason)")
+	mqSubmitCmd.Flags().StringVar(&mqSubmitForceReason, "force-reason", "", "Why the branch guard is being overridden; recorded on the MR bead")
 
 	// Retry flags
 	mqRetryCmd.Flags().BoolVar(&mqRetryNow, "now", false, "Immediately process instead of waiting for refinery loop")

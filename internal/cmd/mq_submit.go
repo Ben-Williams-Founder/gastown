@@ -26,6 +26,80 @@ type branchInfo struct {
 	Worker string // Worker name (polecat name)
 }
 
+// A bead accumulates one polecat branch per dispatch cycle (redispatch,
+// crash-recovery respawn, model-degrade respawn). Nothing at this boundary used
+// to distinguish the live cycle's branch from a dead one, so a caller could
+// submit an empty or foreign branch and only learn about it a refinery cycle
+// later, as a MERGE_FAILED that looks like a content failure.
+//
+// These are the L1 predicates of DEC-OPS-mq-cycle-branch-binding: two
+// structural facts checked before an MR is registered. They do not answer "is
+// this the current cycle?" for two non-empty branches — that needs the cycle
+// pointer (L2) and is deliberately out of scope here.
+type mqRefusalReason string
+
+const (
+	// mqRefuseEmptyBranch: the branch has no commits against its merge target,
+	// so there is nothing to merge (a dead cycle, or a branch reset to base).
+	mqRefuseEmptyBranch mqRefusalReason = "empty-branch"
+	// mqRefuseBranchIssueMismatch: --issue disagrees with the bead id parsed
+	// from the branch name. Previously --issue silently won, which is how a
+	// branch belonging to one bead got submitted under another's id.
+	mqRefuseBranchIssueMismatch mqRefusalReason = "branch-issue-mismatch"
+)
+
+// mqRefusal is a refused submit. Its message leads with a stable key=value
+// prefix so callers and log scrapers can match on the reason without parsing
+// prose.
+type mqRefusal struct {
+	Reason     mqRefusalReason
+	Branch     string
+	Detail     string
+	Candidates []mqBranchCandidate // sibling branches for the same bead, if known
+}
+
+// mqBranchCandidate is a sibling branch offered in a refusal message, with the
+// fact that distinguishes it: how many commits it carries against the target.
+type mqBranchCandidate struct {
+	Branch string
+	Ahead  int
+}
+
+func (r *mqRefusal) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "mq-submit-refused: reason=%s branch=%s\n\n%s", r.Reason, r.Branch, r.Detail)
+	if len(r.Candidates) > 0 {
+		b.WriteString("\n\nOther branches for this bead:")
+		for _, c := range r.Candidates {
+			fmt.Fprintf(&b, "\n  %-52s %d commit(s) ahead", c.Branch, c.Ahead)
+		}
+	}
+	fmt.Fprintf(&b, "\n\nTo submit anyway: --force --force-reason \"<why>\" (the reason is recorded on the MR).")
+	return b.String()
+}
+
+// mqBranchIssueDisagreement reports whether an explicit --issue contradicts the
+// bead id in the branch name. An unparsed branch (issue "") is not a
+// disagreement: plenty of legitimate branches carry no bead id.
+func mqBranchIssueDisagreement(parsedIssue, explicitIssue string) bool {
+	if parsedIssue == "" || explicitIssue == "" {
+		return false
+	}
+	return parsedIssue != explicitIssue
+}
+
+// mqBranchIsEmpty reports whether a branch carries nothing against its target.
+func mqBranchIsEmpty(aheadOfTarget int) bool {
+	return aheadOfTarget == 0
+}
+
+// supersededBranchIsAhead reports whether a superseded branch holds commits the
+// superseding branch lacks — in which case deleting it would destroy the only
+// remote copy of that work (L1b).
+func supersededBranchIsAhead(oldAheadOfNew int) bool {
+	return oldAheadOfNew > 0
+}
+
 // issuePattern matches issue IDs in branch names (e.g., "gt-xyz" or "gt-abc.1")
 var issuePattern = regexp.MustCompile(`([a-z]+-[a-z0-9]+(?:\.[0-9]+)?)`)
 
@@ -128,7 +202,26 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	// Parse branch info
 	info := parseBranchName(branch)
 
-	// Override with explicit flags
+	// Override with explicit flags.
+	// L1: an explicit --issue that contradicts the branch's own bead id is a
+	// refusal, not an override — that silent override is how a dead cycle's
+	// branch got submitted under a live bead's id.
+	if err := mqSubmitCheckForceUsage(); err != nil {
+		return err
+	}
+	if mqBranchIssueDisagreement(info.Issue, mqSubmitIssue) {
+		refusal := &mqRefusal{
+			Reason: mqRefuseBranchIssueMismatch,
+			Branch: branch,
+			Detail: fmt.Sprintf("branch %q belongs to bead %s, but --issue says %s.\nSubmitting it would register the branch under a bead that did not produce it.",
+				branch, info.Issue, mqSubmitIssue),
+		}
+		if !mqSubmitForce {
+			return refusal
+		}
+		style.PrintWarning("%s\n\nProceeding under --force (reason: %s)", refusal.Error(), mqSubmitForceReason)
+	}
+
 	issueID := mqSubmitIssue
 	if issueID == "" {
 		issueID = info.Issue
@@ -215,6 +308,26 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 		style.PrintWarning("could not resolve submitted branch SHA: %v (falling back to branch-only dedup)", shaErr)
 	}
 
+	// L1: a branch with nothing against its target has nothing to merge. This
+	// fires before the MR is registered so a dead cycle never consumes a queue
+	// slot. A count that cannot be taken is not treated as a refusal — the
+	// predicate must not turn a git hiccup into a stalled queue.
+	if ahead, aheadErr := g.CommitsAhead(target, branch); aheadErr != nil {
+		style.PrintWarning("could not count commits on %s against %s: %v (skipping empty-branch check)", branch, target, aheadErr)
+	} else if mqBranchIsEmpty(ahead) {
+		refusal := &mqRefusal{
+			Reason: mqRefuseEmptyBranch,
+			Branch: branch,
+			Detail: fmt.Sprintf("branch %q has 0 commits against target %q — there is nothing to merge.\nThis is the signature of a dead dispatch cycle: the bead was redispatched and the work is on a later branch.",
+				branch, target),
+			Candidates: mqSiblingBranchCandidates(g, branch, issueID, target),
+		}
+		if !mqSubmitForce {
+			return refusal
+		}
+		style.PrintWarning("%s\n\nProceeding under --force (reason: %s)", refusal.Error(), mqSubmitForceReason)
+	}
+
 	// Build MR bead title and description
 	title := fmt.Sprintf("Merge: %s", issueID)
 	description := fmt.Sprintf("branch: %s\ntarget: %s\nsource_issue: %s\nrig: %s",
@@ -224,6 +337,11 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 	}
 	if worker != "" {
 		description += fmt.Sprintf("\nworker: %s", worker)
+	}
+	// A forced submit records why on the MR itself, so the escalation is
+	// visible to the refinery and auditable afterwards.
+	if mqSubmitForce && strings.TrimSpace(mqSubmitForceReason) != "" {
+		description += fmt.Sprintf("\nforced: true\nforce_reason: %s", strings.TrimSpace(mqSubmitForceReason))
 	}
 
 	// Verify before either an idempotent success or a new MR registration.
@@ -304,10 +422,24 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 					oldFields := beads.ParseMRFields(old)
 					if oldFields != nil && strings.HasPrefix(oldFields.Branch, "polecat/") {
 						g := git.NewGit(cwd)
-						if err := g.DeleteRemoteBranch("origin", oldFields.Branch); err != nil {
-							style.PrintWarning("could not delete superseded branch %s: %v", oldFields.Branch, err)
-						} else {
-							fmt.Printf("  %s Deleted remote branch: %s\n", style.Dim.Render("○"), oldFields.Branch)
+						// L1b: never delete a superseded branch that holds commits
+						// the superseding branch lacks. A stale submit supersedes
+						// the live MR, and deleting its branch would destroy the
+						// only remote copy of that cycle's work. Refuse loudly and
+						// keep the ref; branch hygiene is never worth lost work.
+						oldAhead, aheadErr := g.CommitsAhead(branch, "origin/"+oldFields.Branch)
+						switch {
+						case aheadErr != nil:
+							style.PrintWarning("keeping superseded branch %s: could not compare it against %s (%v)", oldFields.Branch, branch, aheadErr)
+						case supersededBranchIsAhead(oldAhead):
+							style.PrintWarning("keeping superseded branch %s: it holds %d commit(s) that %s does not.\nDeleting it could destroy the only remote copy of that work — delete it by hand if you are sure.",
+								oldFields.Branch, oldAhead, branch)
+						default:
+							if err := g.DeleteRemoteBranch("origin", oldFields.Branch); err != nil {
+								style.PrintWarning("could not delete superseded branch %s: %v", oldFields.Branch, err)
+							} else {
+								fmt.Printf("  %s Deleted remote branch: %s\n", style.Dim.Render("○"), oldFields.Branch)
+							}
 						}
 					}
 				}
@@ -345,6 +477,49 @@ func runMqSubmit(cmd *cobra.Command, args []string) error {
 
 func resolveMQSubmitCommitSHA(g *git.Git, branch string) (string, error) {
 	return g.Rev(fmt.Sprintf("refs/heads/%s^{commit}", branch))
+}
+
+// mqSubmitCheckForceUsage enforces that an escalation is recorded, not silent.
+// --force exists so a wrong predicate can never deadlock the queue, but an
+// unexplained override would just relocate the original problem.
+func mqSubmitCheckForceUsage() error {
+	if mqSubmitForce && strings.TrimSpace(mqSubmitForceReason) == "" {
+		return fmt.Errorf("mq-submit-refused: reason=force-without-reason\n\n--force requires --force-reason \"<why>\"; the reason is recorded on the MR bead so the escalation stays auditable")
+	}
+	if !mqSubmitForce && strings.TrimSpace(mqSubmitForceReason) != "" {
+		return fmt.Errorf("--force-reason given without --force")
+	}
+	return nil
+}
+
+// mqSiblingBranchCandidates lists the other branches carrying this bead's id,
+// with the commits each holds against the target. This is the one thing the
+// mayor-side wrapper did better than gt: on a refusal, show the operator which
+// branch they probably meant instead of making them go hunting.
+//
+// Best-effort and advisory: it reads remote-tracking refs (no network), so a
+// stale fetch can omit a branch. It is a hint inside an error message, never an
+// authority — nothing decides on its output.
+func mqSiblingBranchCandidates(g *git.Git, submitted, issueID, target string) []mqBranchCandidate {
+	if issueID == "" {
+		return nil
+	}
+	names, err := g.ListRemoteBranches("origin", "*"+issueID+"*")
+	if err != nil || len(names) == 0 {
+		return nil
+	}
+	var out []mqBranchCandidate
+	for _, n := range names {
+		if n == submitted || n == "" {
+			continue
+		}
+		ahead, err := g.CommitsAhead(target, "origin/"+n)
+		if err != nil {
+			continue
+		}
+		out = append(out, mqBranchCandidate{Branch: n, Ahead: ahead})
+	}
+	return out
 }
 
 func verifyMQSubmitPushedBranch(g *git.Git, branch, commitSHA string) error {
