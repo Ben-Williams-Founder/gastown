@@ -1,6 +1,8 @@
 //go:build integration
 
-package doltserver
+// External test package: breaks the test-only import cycle
+// doltserver -> testutil -> doltserver (nightly -tags=integration matrix).
+package doltserver_test
 
 import (
 	"database/sql"
@@ -13,6 +15,8 @@ import (
 
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/steveyegge/gastown/internal/testutil"
+
+	"github.com/steveyegge/gastown/internal/doltserver"
 )
 
 // setupBdWorkDir creates a beads-compatible working directory pointing at an
@@ -73,19 +77,19 @@ func TestMigrateWisps_TableCreation(t *testing.T) {
 	workDir := setupBdWorkDir(t, port)
 
 	// Verify we can talk to the database.
-	err := bdSQL(workDir, "SELECT 1")
+	err := doltserver.BdSQLForTest(workDir, "SELECT 1")
 	if err != nil {
 		t.Skipf("bd sql not working against isolated server: %v", err)
 	}
 
 	// Test table existence check.
-	exists := bdTableExists(workDir, "issues")
+	exists := doltserver.BdTableExistsForTest(workDir, "issues")
 	if !exists {
 		t.Skip("issues table not found in isolated database")
 	}
 
 	// If wisps table already exists, just verify it works.
-	if bdTableExists(workDir, "wisps") {
+	if doltserver.BdTableExistsForTest(workDir, "wisps") {
 		t.Log("wisps table already exists — verifying bd mol wisp list works")
 		cmd := exec.Command("bd", "mol", "wisp", "list")
 		cmd.Dir = workDir
@@ -110,7 +114,7 @@ func TestBdSQLCount(t *testing.T) {
 	port, _ := strconv.Atoi(portStr)
 	workDir := setupBdWorkDir(t, port)
 
-	cnt, err := bdSQLCount(workDir, "SELECT COUNT(*) as cnt FROM issues")
+	cnt, err := doltserver.BdSQLCountForTest(workDir, "SELECT COUNT(*) as cnt FROM issues")
 	if err != nil {
 		t.Skipf("bd sql not working against isolated server: %v", err)
 	}
