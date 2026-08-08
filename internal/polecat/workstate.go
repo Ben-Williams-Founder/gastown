@@ -140,7 +140,17 @@ func DecideWorkstate(in WorkstateInput) WorkstateDisposition {
 	if in.PushFailed {
 		block("push-failed", "push_failed=true", true)
 	}
-	if in.MRFailed {
+	// mr_failed records an MR-creation failure at `gt done` time, and mr_failed
+	// implies the push SUCCEEDED (the flag's own contract: "branch is pushed but
+	// MR bead not created/trusted"). It is therefore SUPERSEDED — not at-risk —
+	// when reality contradicts it: an MR for this branch exists in the queue
+	// (MRSubmitted: e.g. the right-holder submitted out-of-band after a
+	// merge=local hold, and a later done re-run stamped the flag against the MR
+	// it didn't create), or the work bead is closed (MR merged; nothing is
+	// stranded on a pushed branch). Same override rationale as WorkBeadClosed
+	// on pre-squash unpushed checkpoints (fork patch M). An uncontradicted
+	// failure still blocks. (hq-4on0)
+	if in.MRFailed && !in.MRSubmitted && !in.WorkBeadClosed {
 		block("mr-failed", "mr_failed=true", true)
 	}
 	if in.ActiveWorkBlocker != "" {

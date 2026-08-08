@@ -1083,7 +1083,12 @@ func slotOpenDecision(workDir, townRoot, rigName, polecatName, exitType string) 
 	}
 	input.MQNotRequired = witnessMQNotRequiredSource(rigBeads, issueID)
 	input.MergeStrategyLocal = witnessMergeLocalSource(rigBeads, issueID)
-	if input.MQCheckRequired && input.HasSubmittableWork && !input.AssignedBeadTerminal && !input.MQNotRequired {
+	// The mr_failed arm mirrors check-recovery (hq-4on0): a stamped mr_failed
+	// needs the supersede fact — an out-of-band-submitted (queued) MR for the
+	// branch contradicts the flag — even when no MQ check is otherwise
+	// required. Only the flagged case pays the extra lookup.
+	if (input.MQCheckRequired && input.HasSubmittableWork && !input.AssignedBeadTerminal && !input.MQNotRequired) ||
+		(input.MRFailed && input.Branch != "") {
 		mr, err := rigBeads.FindMRForBranchAny(input.Branch)
 		if err != nil {
 			input.MQLookupFailed = true
