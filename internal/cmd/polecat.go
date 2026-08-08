@@ -1278,7 +1278,14 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 		input.MQLookupFailed = true
 	}
 	if !input.HasSubmittableWork || input.MQNotRequired || input.AssignedBeadTerminal {
-		return
+		// A stamped mr_failed still needs the supersede fact even when no MQ
+		// check is otherwise required: an out-of-band-submitted (queued) MR for
+		// this branch must be able to contradict the flag, or check-recovery
+		// pins a NEEDS_RECOVERY/mr_failed=true on work that is genuinely in the
+		// queue (hq-4on0). Only the flagged case pays the extra lookup.
+		if !input.MRFailed || status.Branch == "" {
+			return
+		}
 	}
 	mr, mrErr := bd.FindMRForBranchAny(status.Branch)
 	if mrErr != nil {
@@ -1286,6 +1293,12 @@ func applyMQFactsToWorkstateInput(input *polecat.WorkstateInput, status *Recover
 		return
 	}
 	input.MRSubmitted = mr != nil
+	// Name the supersession so the operator sees WHY a stamped mr_failed did
+	// not block (hq-4on0), mirroring the ignored_stale_cleanup_status pattern.
+	if input.MRFailed && (input.MRSubmitted || input.WorkBeadClosed) {
+		status.Diagnostics = append(status.Diagnostics,
+			fmt.Sprintf("mr_failed_superseded mr_submitted=%t work_bead_closed=%t", input.MRSubmitted, input.WorkBeadClosed))
+	}
 }
 
 func applyWorkstateDispositionToRecoveryStatus(status *RecoveryStatus, disposition polecat.WorkstateDisposition) {

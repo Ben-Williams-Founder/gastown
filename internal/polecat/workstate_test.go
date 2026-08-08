@@ -262,3 +262,51 @@ func TestDecideWorkstateMergeLocalRider1(t *testing.T) {
 		})
 	}
 }
+
+// TestDecideWorkstateMRFailedSupersession reproduces hq-4on0: check-recovery
+// showed NEEDS_RECOVERY/mr_failed=true while the work's MR was GENUINELY
+// QUEUED (wkb-qx1k, wkb-fyq3 2026-08-07/08 — the right-holder submitted
+// out-of-band after a merge=local hold and a later `gt done` re-run stamped
+// mr_failed against the MR it didn't create), and kept reading failed after
+// the MR merged. Reality must supersede the flag; an uncontradicted failure
+// must still block.
+func TestDecideWorkstateMRFailedSupersession(t *testing.T) {
+	tests := []struct {
+		name string
+		in   WorkstateInput
+		want WorkstateDisposition
+	}{
+		{
+			name: "mr_failed superseded by queued MR under merge=local is DONE_LOCAL (the hq-4on0 misread)",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", MRFailed: true, MRSubmitted: true, MQCheckRequired: true, HasSubmittableWork: true, MergeStrategyLocal: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictDoneLocal, Reason: "merge-local-held", ReuseStatus: "idle-local-hold"},
+		},
+		{
+			name: "mr_failed superseded by closed work bead under merge=local is DONE_LOCAL",
+			in:   WorkstateInput{State: StateDone, CleanupStatus: CleanupClean, Branch: "polecat/test", MRFailed: true, WorkBeadClosed: true, AssignedBeadTerminal: true, MQCheckRequired: true, MergeStrategyLocal: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictDoneLocal, Reason: "merge-local-held", ReuseStatus: "idle-local-hold"},
+		},
+		{
+			name: "mr_failed superseded by queued MR on the mq path reads submitted, reap-eligible",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", MRFailed: true, MRSubmitted: true, MQCheckRequired: true, HasSubmittableWork: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictSafeToNuke, Reason: "reusable", Reusable: true, SafeToNuke: true, MQStatus: "submitted", ReuseStatus: "idle-preserved"},
+		},
+		{
+			name: "uncontradicted mr_failed still blocks (real-failure semantics preserved)",
+			in:   WorkstateInput{State: StateIdle, CleanupStatus: CleanupClean, Branch: "polecat/test", MRFailed: true, MQCheckRequired: true, HasSubmittableWork: true},
+			want: WorkstateDisposition{Verdict: WorkstateVerdictNeedsRecovery, Reason: "mr-failed", NeedsRecovery: true, CountsTowardCapacity: true, ReuseStatus: "idle-recovery-needed", Blockers: []string{"mr_failed=true"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := DecideWorkstate(tt.in)
+			if got.Verdict != tt.want.Verdict || got.Reason != tt.want.Reason ||
+				got.Reusable != tt.want.Reusable || got.SafeToNuke != tt.want.SafeToNuke ||
+				got.NeedsRecovery != tt.want.NeedsRecovery || got.NeedsMQSubmit != tt.want.NeedsMQSubmit ||
+				got.CountsTowardCapacity != tt.want.CountsTowardCapacity || got.ReuseStatus != tt.want.ReuseStatus ||
+				got.MQStatus != tt.want.MQStatus {
+				t.Errorf("DecideWorkstate() = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
