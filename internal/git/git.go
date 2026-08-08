@@ -2178,6 +2178,35 @@ func (g *Git) ListBranches(pattern string) ([]string, error) {
 	return strings.Split(out, "\n"), nil
 }
 
+// ListRemoteBranches lists remote-tracking branches for a remote, with the
+// "<remote>/" prefix stripped. Pattern is a glob matched against the short
+// name (e.g. "*wkb-abc*"). Reads local refs only — no network — so results are
+// as fresh as the last fetch.
+func (g *Git) ListRemoteBranches(remote, pattern string) ([]string, error) {
+	args := []string{"branch", "-r", "--list", "--format=%(refname:short)"}
+	if pattern != "" {
+		args = append(args, remote+"/"+pattern)
+	} else {
+		args = append(args, remote+"/*")
+	}
+	out, err := g.run(args...)
+	if err != nil {
+		return nil, err
+	}
+	if out == "" {
+		return nil, nil
+	}
+	var names []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.Contains(line, "->") { // skip origin/HEAD -> origin/main
+			continue
+		}
+		names = append(names, strings.TrimPrefix(line, remote+"/"))
+	}
+	return names, nil
+}
+
 // ResetBranch force-updates a branch to point to a ref.
 // This is useful for resetting stale polecat branches to main.
 // NOTE: This uses `git branch -f` which fails on the currently checked-out branch.

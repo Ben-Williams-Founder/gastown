@@ -211,3 +211,165 @@ func TestValidateMoleculePrereqs(t *testing.T) {
 		})
 	}
 }
+
+// The L1/L1b guards of DEC-OPS-mq-cycle-branch-binding, exercised against the
+// three mis-submits that motivated them (2026-08-07/08). The inputs are the
+// real branch names from experiments/mq-branch-selection-probe/.
+//
+// I2 is the honest negative: two non-empty branches for one bead are
+// indistinguishable at this boundary, and L1 is not claimed to catch it. That
+// class needs the cycle pointer (L2). If a later change makes this case refuse,
+// the assertion below should be revisited deliberately, not deleted.
+func TestMQSubmitL1GuardsAgainstHistoricalIncidents(t *testing.T) {
+	tests := []struct {
+		name          string
+		branch        string
+		parsedIssue   string
+		explicitIssue string
+		aheadOfTarget int
+		wantRefusal   mqRefusalReason
+	}{
+		{
+			name:          "I1 wkb-dmfa: foreign bead's branch submitted under --issue",
+			branch:        "polecat/furiosa/wkb-03lk+msdy2crb",
+			parsedIssue:   "wkb-03lk",
+			explicitIssue: "wkb-dmfa",
+			aheadOfTarget: 3,
+			wantRefusal:   mqRefuseBranchIssueMismatch,
+		},
+		{
+			name:          "I3 wkb-rs0a: dead cycle with nothing against target",
+			branch:        "polecat/furiosa/wkb-rs0a+mskhyay7",
+			parsedIssue:   "wkb-rs0a",
+			explicitIssue: "wkb-rs0a",
+			aheadOfTarget: 0,
+			wantRefusal:   mqRefuseEmptyBranch,
+		},
+		{
+			name:          "I2 wkb-rtxe: pre-review branch, non-empty and correctly named - L1 cannot see it",
+			branch:        "polecat/furiosa/wkb-rtxe+mskdatv6",
+			parsedIssue:   "wkb-rtxe",
+			explicitIssue: "wkb-rtxe",
+			aheadOfTarget: 2,
+			wantRefusal:   "",
+		},
+		{
+			name:          "live cycle submitted normally is accepted",
+			branch:        "polecat/furiosa/wkb-rs0a+mskn62qd",
+			parsedIssue:   "wkb-rs0a",
+			explicitIssue: "wkb-rs0a",
+			aheadOfTarget: 1,
+			wantRefusal:   "",
+		},
+		{
+			name:          "no --issue given: branch id is authoritative, not a disagreement",
+			branch:        "polecat/furiosa/wkb-rs0a+mskn62qd",
+			parsedIssue:   "wkb-rs0a",
+			explicitIssue: "",
+			aheadOfTarget: 1,
+			wantRefusal:   "",
+		},
+		{
+			name:          "unparsable branch with explicit issue is not a disagreement",
+			branch:        "hotfix/manual-patch",
+			parsedIssue:   "",
+			explicitIssue: "wkb-rs0a",
+			aheadOfTarget: 1,
+			wantRefusal:   "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got mqRefusalReason
+			switch {
+			case mqBranchIssueDisagreement(tt.parsedIssue, tt.explicitIssue):
+				got = mqRefuseBranchIssueMismatch
+			case mqBranchIsEmpty(tt.aheadOfTarget):
+				got = mqRefuseEmptyBranch
+			}
+			if got != tt.wantRefusal {
+				t.Errorf("branch %s: got refusal %q, want %q", tt.branch, got, tt.wantRefusal)
+			}
+		})
+	}
+}
+
+// L1b: a superseded branch holding commits the superseding branch lacks must
+// survive. This is the fail-dangerous path the guard removes — a stale submit
+// superseding the live MR and deleting the live cycle's only remote copy.
+func TestSupersededBranchDeletionGuard(t *testing.T) {
+	tests := []struct {
+		name        string
+		oldAhead    int
+		wantKeep    bool
+		description string
+	}{
+		{"superseded branch is ahead - keep it", 2, true, "stale submit superseding the live MR"},
+		{"superseded branch has nothing extra - safe to delete", 0, false, "ordinary redispatch cleanup"},
+		{"superseded branch far ahead - keep it", 17, true, "long-running cycle superseded by an empty one"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := supersededBranchIsAhead(tt.oldAhead); got != tt.wantKeep {
+				t.Errorf("%s: supersededBranchIsAhead(%d) = %v, want %v", tt.description, tt.oldAhead, got, tt.wantKeep)
+			}
+		})
+	}
+}
+
+// The escalation must stay auditable: --force without a reason is itself a
+// refusal, so an override can never be silent.
+func TestMQSubmitForceRequiresReason(t *testing.T) {
+	origForce, origReason := mqSubmitForce, mqSubmitForceReason
+	t.Cleanup(func() { mqSubmitForce, mqSubmitForceReason = origForce, origReason })
+
+	tests := []struct {
+		name    string
+		force   bool
+		reason  string
+		wantErr bool
+	}{
+		{"force with reason is accepted", true, "live cycle unpushed, verified by hand", false},
+		{"force without reason is refused", true, "", true},
+		{"force with blank reason is refused", true, "   ", true},
+		{"reason without force is refused", false, "why", true},
+		{"neither flag is the normal path", false, "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mqSubmitForce, mqSubmitForceReason = tt.force, tt.reason
+			err := mqSubmitCheckForceUsage()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("mqSubmitCheckForceUsage() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// Refusals lead with a stable key=value prefix so callers can match on the
+// reason without parsing prose, and they name the sibling branches.
+func TestMQRefusalMessageIsMachineReadable(t *testing.T) {
+	r := &mqRefusal{
+		Reason: mqRefuseEmptyBranch,
+		Branch: "polecat/furiosa/wkb-rs0a+mskhyay7",
+		Detail: "nothing to merge",
+		Candidates: []mqBranchCandidate{
+			{Branch: "polecat/furiosa/wkb-rs0a+mskn62qd", Ahead: 1},
+		},
+	}
+	msg := r.Error()
+	for _, want := range []string{
+		"mq-submit-refused: reason=empty-branch",
+		"branch=polecat/furiosa/wkb-rs0a+mskhyay7",
+		"polecat/furiosa/wkb-rs0a+mskn62qd",
+		"1 commit(s) ahead",
+		"--force-reason",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("refusal message missing %q\ngot: %s", want, msg)
+		}
+	}
+}
